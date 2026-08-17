@@ -187,7 +187,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             human = f"landed {land_result.commit} on {land_result.target}"
         elif args.command == "wal" and args.recover:
+            # Exit codes differ between the two `wal` modes on purpose. Inspection
+            # is a report: 1 means "I looked and the state is not clean", the way
+            # a diff reports difference. Recovery is an action: a divergence it
+            # cannot repair raises, and a raised OnetreeError exits 2, because the
+            # command it was asked to complete did not complete.
             recovery_result = coordinator.recover()
+            return_code = 0 if recovery_result.consistent else 1
             payload = {
                 "ok": True,
                 "recovery": {
@@ -195,10 +201,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "pending": recovery_result.pending,
                     "repaired": recovery_result.repaired,
                     "refused": recovery_result.refused,
-                    "diverged": recovery_result.diverged,
+                    "locks": list(recovery_result.locks),
                 },
             }
-            human = f"recovery complete; pending={recovery_result.pending}"
+            human = (
+                f"recovery: repaired={recovery_result.repaired}, "
+                f"refused={recovery_result.refused}, pending={recovery_result.pending}"
+            )
+            if recovery_result.pending:
+                human += " (landing(s) still in flight, left alone)"
+            if recovery_result.locks:
+                human += (
+                    f"; {len(recovery_result.locks)} ref lock(s) held, "
+                    f"remove by hand if no process holds them: "
+                    f"{', '.join(recovery_result.locks)}"
+                )
         elif args.command == "wal":
             wal_result = coordinator.inspect_wal()
             return_code = 0 if wal_result.consistent else 1
@@ -217,7 +234,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "events": [_event_payload(event) for event in wal_result.events],
                 },
             }
-            human = f"WAL {wal_result.head or '(empty)'}: {len(wal_result.events)} event(s)"
+            # The verdict leads. A human line that reads identically for a healthy
+            # WAL and for the commonest post-crash state -- an exposed intent,
+            # which is what exit 1 and `consistent: false` are reporting -- tells
+            # the only reader who sees it nothing at all.
+            human = (
+                f"WAL {wal_result.head or '(empty)'}: {len(wal_result.events)} event(s); "
+                f"{'consistent' if wal_result.consistent else 'INCONSISTENT'}"
+            )
+            if wal_result.pending_intents:
+                human += f"; {wal_result.pending_intents} pending intent(s)"
             if wal_result.divergences:
                 human += f"; DIVERGED on {len(wal_result.divergences)} record(s)"
             # Residue is not inconsistency -- a ref lock is held for milliseconds

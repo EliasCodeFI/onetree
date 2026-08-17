@@ -71,6 +71,15 @@ In every window `inspect_wal().divergences` is empty: no crash can put a broker
 landing on the branch that the WAL has no record of. That is the property the
 write-ahead order buys, and it is asserted in each of the six.
 
+Scope, corrected by Round AF2 D3: the write-ahead *order* is what makes such a
+commit impossible to produce, and that is unconditional. Whether an
+already-present one is still *reported* was not — the branch-side audit skipped
+history below every position the WAL had seen, so a crash-left commit went
+unreported as soon as anyone registered on top of it or landed above it, and a
+chain deeper than the scan cap was never walked to. AF2 bounds the audit by the
+WAL's first recorded position for the target instead, and reports a cut-short
+walk as `scan_truncated` rather than reading it as clean.
+
 The de-ordered control (`test_inv7_de_ordered_protocol_leaves_an_unrecorded_
 landing_that_is_detected`) is the unsafe half of the pair, in the style
 ROUND-A.md tabulates: it moves the branch before the intent exists and then
@@ -85,8 +94,8 @@ order in the shipped code (mutation M4) turns the six-window fixture red.
 | --- | --- | --- |
 | F1 | Two-ref transaction is not crash-atomic | Closed. Write-ahead protocol above; `update_refs_atomically` deleted; six crash windows fixtured with in-subprocess kills. |
 | F2 | INV7 fixture kills only at Python checkpoints | Closed. `tests/conftest.py` ships the PATH-shim kill wrapper; the fixture asserts `-SIGKILL` and covers every window of the new protocol. |
-| F3 | `inspect_wal`/`recover` blind to branch-vs-WAL divergence | Closed. `_divergences` reports `target_missing`, `landed_not_on_target`, `refused_candidate_on_target` and `unrecorded_landing`; `recover()` records a `refused` event (`branch_diverged`) and raises `WalDivergedError`; `onetree wal` exits 1 on divergence. |
-| F4 | `resolve_ref` reads a corrupt ref as absent | Closed. `resolve_ref` is three-way — oid, absent, or `RefCorruptError` — discriminated by a second `rev-parse` probe rather than by matching git's message text. `Wal.head()` translates it to `WalCorruptError`, so every read path surfaces corruption; `recover()` refuses loudly. Fixtured over four corrupt shapes: blob, tree, dangling oid, unreadable ref file. |
+| F3 | `inspect_wal`/`recover` blind to branch-vs-WAL divergence | Closed. `_divergences` reports `target_missing`, `landed_not_on_target`, `refused_candidate_on_target` and `unrecorded_landing`; `recover()` records a `refused` event (`branch_diverged`) and raises `WalDivergedError`; `onetree wal` exits 1 on divergence. Reopened as Round AF2 D3 and D8: the branch-side scan's floor let routine use mask an unrecorded landing, and the refusal was re-appended on every probe. |
+| F4 | `resolve_ref` reads a corrupt ref as absent | Closed for the object-shape half only; the storage half reopened as Round AF2 D2. `resolve_ref` is three-way — oid, absent, or `RefCorruptError`. The caret-probe pair discriminates blob, tree and dangling refs without reading git's message text, but the fourth arm did match that text, and matching it is what made a genuinely unreadable ref file read as absent. Fixtured over four shapes: blob, tree, dangling oid, and a ref file holding readable garbage text — which is not the unreadable-file case the row originally claimed. Round AF2 replaces the text match with a direct probe of ref storage and fixtures `EACCES` and `EISDIR`. |
 | F5 | Landing-moment `_session_alive` sub-term is mutation-dead | Closed. `test_inv2_session_death_between_audit_and_fence_refuses` kills the session between the audit and the fence and asserts the `session_died_at_fence` refusal; the in-suite unsafe control shows the dead session's payload landing when the sub-term is reduced to expiry. Mutation M1 is red. ROUND-A.md line 100 corrected. |
 | F6 | Temp-index residue leaks unbounded | Closed. Temp indexes carry an owner tag (`index-<pid>-<start>-<12hex>`); `inspect_wal` reports residue; `gc` sweeps only residue whose owning incarnation is gone, recording the swept names in the WAL event before unlinking. |
 | F7 | `.git`-internal paths accepted as claim targets | Closed. Typed `InvalidPathError` with `reason="git_internal"`, via two independent arms — containment in the resolved git dir, and a `.git` path component. |
@@ -107,7 +116,11 @@ genuine git failure. During a real race the loser can instead be told the ref
 is locked for a few milliseconds. `update_ref` now separates three outcomes:
 the expected value moved (a lost race, `False`, caller re-audits), a lock is
 held (bounded retry, then `RefLockedError`), or git failed for its own reasons
-(`GitError`, never retried).
+(`GitError`). Round AF2 corrects the last of these: the lock probe runs *after*
+the failed invocation, so a peer that releases its lock in that window leaves
+contention indistinguishable from a hard failure. Every failure that did not
+move the ref is now retried within the same bounded window, and only the last
+observation decides which error names the exhausted attempt.
 
 **A crash inside a branch update can leave `HEAD.lock`, not the branch lock.**
 Moving the branch `HEAD` points at also writes the HEAD reflog, so git takes
@@ -142,7 +155,10 @@ a live peer holds would corrupt exactly the update the lock protects. Recovery
 therefore refuses with `RefLockedError` naming the lock path and leaves the file
 in place; removing it is a deliberate operator act. The cost is that a crash
 requires one manual step before recovery can proceed, and that is the intended
-trade.
+trade. Round AF2 D4 extends the report to locks on the *target* branches: a WAL
+lock still refuses recovery outright, and a target lock — which recovery does
+not need but the next landing does — is named in `RecoveryResult.locks` and in
+both CLI output modes rather than passed over in an all-clear.
 
 **Liveness without `/proc` degrades to bare PID existence (F8).** A session
 records its PID and, when the kernel exposes one, that PID's birth tick. Where

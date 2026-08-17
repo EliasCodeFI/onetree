@@ -146,7 +146,8 @@ def test_cli_reports_divergence_liveness_warnings_and_swept_residue(
     assert gc["gc"]["removed_temp_indexes"] == 0
     code, recovery = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
     assert code == 0
-    assert recovery["recovery"]["diverged"] == 0
+    assert (recovery["recovery"]["repaired"], recovery["recovery"]["refused"]) == (0, 0)
+    assert recovery["recovery"]["locks"] == []
 
     # Residue is reported to the human reader too: it is what makes the next
     # land refuse, and a JSON-only report is one an operator never sees.

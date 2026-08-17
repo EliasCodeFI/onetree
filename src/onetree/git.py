@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -25,8 +26,10 @@ _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
 #: Upper bound on the history walked when looking for unrecorded broker
-#: commits. The walk is normally bounded by the WAL's known target positions;
-#: this cap only matters when the WAL records a position Git no longer has.
+#: commits. The walk is bounded below by the WAL's first sight of the target,
+#: so this cap is reached only when a target moved further than that since the
+#: WAL was created. Hitting it truncates the audit, which is reported rather
+#: than silently reading as a clean branch.
 DIVERGENCE_SCAN_LIMIT = 4096
 
 
@@ -62,6 +65,20 @@ class MarkedCommit:
 
 
 @dataclass(frozen=True)
+class TrailerScan:
+    """The result of one branch-side trailer walk, and whether it was complete.
+
+    ``truncated`` is the difference between "no unrecorded landing is on this
+    branch" and "the walk stopped before it could tell", which is the whole
+    value of scanning at all.
+    """
+
+    commits: tuple[MarkedCommit, ...]
+    truncated: bool
+    limit: int
+
+
+@dataclass(frozen=True)
 class GitResult:
     """Captured output from one non-raising Git call."""
 
@@ -93,7 +110,8 @@ class Repository:
         self.object_format = object_format
         self.oid_length = 40 if object_format == "sha1" else 64
         self.zero_oid = "0" * self.oid_length
-        self._lock_paths: dict[str, Path] = {}
+        self._git_paths: dict[str, Path] = {}
+        self._valid_branch_refs: set[str] = set()
 
     @staticmethod
     def _environment(index: Path | None = None) -> dict[str, str]:
@@ -191,6 +209,68 @@ class Repository:
             return None
         return result.stdout.decode("ascii", errors="replace").strip() or None
 
+    def git_path(self, name: str) -> Path:
+        """Absolute on-disk path Git would use for ``name`` inside this repository."""
+
+        cached = self._git_paths.get(name)
+        if cached is None:
+            text = self.git_text("rev-parse", "--git-path", name)
+            candidate = Path(text)
+            cached = candidate if candidate.is_absolute() else self.root / candidate
+            self._git_paths[name] = cached
+        return cached
+
+    @staticmethod
+    def _packed_refs_names(content: bytes) -> set[bytes]:
+        names: set[bytes] = set()
+        for line in content.splitlines():
+            if not line or line.startswith((b"#", b"^")):
+                continue
+            _, separator, name = line.partition(b" ")
+            if separator and name.strip():
+                names.add(name.strip())
+        return names
+
+    def ref_storage_state(self, reference: str) -> str | None:
+        """Why Git could not read ``reference``, or None when it is truly absent.
+
+        Git reports "this ref does not exist" and "this ref exists and I cannot
+        read it" through the same exit status with, on some shapes, the same
+        empty stderr: a ref file that is ``chmod 000`` and a ref path that is a
+        directory both come back indistinguishable from absent (measured on Git
+        2.53.0). Matching the message text therefore cannot carry the
+        distinction, so it is taken from ref storage directly. Anything this
+        cannot decide resolves to "unreadable", never to absent -- an absent WAL
+        answers every claim question with a clean bill of health.
+        """
+
+        loose = self.git_path(reference)
+        try:
+            status: os.stat_result | None = loose.lstat()
+        except FileNotFoundError:
+            status = None
+        except OSError as error:
+            return f"the ref path cannot be examined: {error.strerror}"
+        if status is not None:
+            if stat.S_ISDIR(status.st_mode):
+                return "the ref path is a directory"
+            try:
+                with loose.open("rb") as handle:
+                    handle.read(1)
+            except OSError as error:
+                return f"the ref file cannot be opened: {error.strerror}"
+            return "the ref file is present but Git cannot resolve it"
+        packed = self.git_path("packed-refs")
+        try:
+            content = packed.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            return f"packed-refs cannot be read: {error.strerror}"
+        if reference.encode("utf-8", errors="replace") in self._packed_refs_names(content):
+            return "packed-refs names the ref but Git cannot resolve it"
+        return None
+
     def resolve_ref(self, reference: str, *, missing_ok: bool = False) -> str | None:
         """Resolve to a commit, distinguishing absent from present-but-corrupt.
 
@@ -220,13 +300,14 @@ class Repository:
                 oid=stored,
                 object_type=self.object_type(stored),
             )
-        broken = probe.stderr.decode("utf-8", errors="replace").strip()
-        if reference in broken:
+        unreadable = self.ref_storage_state(reference)
+        if unreadable is not None:
             raise RefCorruptError(
-                f"{reference} cannot be read: {broken}",
+                f"{reference} cannot be read: {unreadable}",
                 reference=reference,
                 oid=None,
                 object_type=None,
+                reason=unreadable,
             )
         if missing_ok:
             return None
@@ -265,11 +346,17 @@ class Repository:
         return reference
 
     def validate_branch_ref(self, reference: str) -> str:
+        if reference in self._valid_branch_refs:
+            return reference
         if not reference.startswith("refs/heads/"):
             raise GitError("landing target must be a refs/heads ref", reference=reference)
         result = self.git("check-ref-format", reference, check=False)
         if result.returncode != 0:
             raise GitError("invalid landing target ref", reference=reference)
+        # Validity is a property of the name alone, and replay validates the
+        # same handful of names once per event; the answer is cached so folding
+        # a long WAL does not spawn one subprocess per landing record.
+        self._valid_branch_refs.add(reference)
         return reference
 
     def index_path(self, actor: str) -> Path:
@@ -415,13 +502,7 @@ class Repository:
         return tuple(parents)
 
     def ref_lock_path(self, reference: str) -> Path:
-        cached = self._lock_paths.get(reference)
-        if cached is None:
-            text = self.git_text("rev-parse", "--git-path", f"{reference}.lock")
-            candidate = Path(text)
-            cached = candidate if candidate.is_absolute() else self.root / candidate
-            self._lock_paths[reference] = cached
-        return cached
+        return self.git_path(f"{reference}.lock")
 
     def symbolic_head(self) -> str | None:
         """The ref HEAD points at, or None when HEAD is detached."""
@@ -459,12 +540,20 @@ class Repository:
         retryable at all). Collapsing the last two into "lost race" turns one bad
         invocation into a retry storm that ends in an unrelated error, so each is
         separated here and only the first returns False.
+
+        The lock probe runs after the failed invocation, so a peer that releases
+        its lock in between leaves contention looking like a hard Git failure.
+        Every failure that did not move the ref is therefore retried within the
+        bounded window; only the last observation decides which error names the
+        exhausted attempt, and a genuine failure is unaffected by being asked
+        again -- a refused update has no effect to repeat.
         """
 
         expected = self.zero_oid if old is None else old
         candidates = self.ref_lock_paths(reference)
         detail = ""
         held: tuple[Path, ...] = ()
+        contended = False
         for attempt in range(_LOCK_ATTEMPTS):
             result = self.git(
                 "update-ref", "--create-reflog", reference, new, expected, check=False
@@ -475,16 +564,22 @@ class Repository:
                 return False
             detail = result.stderr.decode("utf-8", errors="replace").strip()
             held = tuple(lock for lock in candidates if lock.exists())
-            if not held:
-                raise GitError(f"cannot update ref {reference}: {detail}", reference=reference)
+            contended = contended or bool(held)
             if attempt + 1 < _LOCK_ATTEMPTS:
                 time.sleep(_LOCK_BACKOFF_SECONDS * (attempt + 1))
-        raise RefLockedError(
-            f"cannot update ref {reference}: it is locked by another process",
+        if held:
+            raise RefLockedError(
+                f"cannot update ref {reference}: it is locked by another process",
+                reference=reference,
+                lock=str(held[0]),
+                locks=[str(lock) for lock in held],
+                detail=detail,
+            )
+        raise GitError(
+            f"cannot update ref {reference}: {detail}",
             reference=reference,
-            lock=str(held[0]),
-            locks=[str(lock) for lock in held],
-            detail=detail,
+            attempts=_LOCK_ATTEMPTS,
+            contended=contended,
         )
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
@@ -510,13 +605,21 @@ class Repository:
         target: str,
         excludes: Sequence[str] = (),
         *,
-        limit: int = DIVERGENCE_SCAN_LIMIT,
-    ) -> tuple[MarkedCommit, ...]:
-        """List commits on ``target`` above ``excludes`` and their landing trailer."""
+        limit: int | None = None,
+    ) -> TrailerScan:
+        """List commits on ``target`` above ``excludes`` and their landing trailer.
 
+        One record more than the cap is requested so a walk that reached the cap
+        is distinguishable from one that ran out of history: the caller has to
+        be able to say "the audit was cut short" instead of "the branch is
+        clean". ``limit`` is read from the module constant at call time so a
+        fixture can shrink the window without rebuilding thousands of commits.
+        """
+
+        bound = DIVERGENCE_SCAN_LIMIT if limit is None else limit
         arguments = [
             "log",
-            f"--max-count={limit}",
+            f"--max-count={bound + 1}",
             "--format=%H%x1f%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)%x1e",
             target,
             *(f"^{oid}" for oid in excludes),
@@ -537,4 +640,4 @@ class Repository:
                 raise GitError("malformed commit listing record", reference=target)
             operation = trailer.strip() or None
             commits.append(MarkedCommit(self.validate_oid(oid.strip(), label="target"), operation))
-        return tuple(commits)
+        return TrailerScan(tuple(commits[:bound]), len(commits) > bound, bound)

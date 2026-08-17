@@ -43,6 +43,17 @@ class WalCorruptError(OnetreeError):
     kind = "wal_corrupt"
 
 
+class WalAppendRefusedError(OnetreeError):
+    """A prepared append would not fold, so it was refused instead of written.
+
+    This is the opposite of :class:`WalCorruptError`: nothing is wrong with the
+    WAL. A write that would have made it unreadable was stopped at the door, so
+    the state it names is a live-protocol interleave, not corruption.
+    """
+
+    kind = "wal_append_refused"
+
+
 class RefCorruptError(OnetreeError):
     """A ref exists but does not resolve to a commit (blob, tree, or dangling)."""
 

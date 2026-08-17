@@ -209,6 +209,7 @@ def test_a_refused_candidate_on_the_branch_is_reported_as_divergence(
             "candidate": candidate,
             "tree": tree,
             "session_generation": session.generation,
+            "lander": {"pid": 999_999_999, "start": 1},
             "fences": [{"path": "a.txt", "claim_generation": claim.generation}],
             "payload": [{"path": "a.txt", "old": entry, "new": new_entry}],
         },

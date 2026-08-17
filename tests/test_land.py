@@ -381,7 +381,8 @@ def test_inv7_kill_inside_each_ref_update_recovers_to_consistent_refs(
     assert report.pending_intents == 0
     assert report.divergences == ()
     assert kinds.count("landed") == 1
-    assert git_repo.git("rev-list", "--count", f"{git_repo.base}..{git_repo.oid()}").stdout.strip()
+    counted = git_repo.git("rev-list", "--count", f"{git_repo.base}..{git_repo.oid()}")
+    assert counted.stdout.strip() == "1"
     assert git_repo.git("show", f"{git_repo.oid()}:a.txt").stdout == "a1\n"
 
 

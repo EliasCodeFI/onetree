@@ -190,6 +190,10 @@ def _expose_intent(
             "candidate": candidate,
             "tree": tree,
             "session_generation": session.generation,
+            # The lander this intent names is gone -- a pid no process holds --
+            # which is what makes the intent recoverable at all. Round AF2 asks
+            # liveness of the landing, not of the session that started it.
+            "lander": {"pid": 999_999_999, "start": 1},
             "fences": [
                 {"path": "a.txt", "claim_generation": claim.generation},
             ],
