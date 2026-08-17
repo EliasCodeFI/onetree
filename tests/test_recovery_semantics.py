@@ -12,21 +12,23 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import GitFixture, install_kill_git
 
+from onetree import core as core_module
 from onetree import git as git_module
 from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import (
     GitError,
+    RefCorruptError,
     RefLockedError,
     ReleaseRefusedError,
     WalAppendRefusedError,
@@ -38,6 +40,49 @@ from onetree.wal import WAL_REF
 
 #: A pid no process on this machine holds, with a birth tick that cannot match.
 DEAD_LANDER = {"pid": 999_999_999, "start": 1}
+_GIT_EXECUTABLE = shutil.which("git") or "git"
+
+
+def _repository_with_ref_backend(tmp_path: Path, ref_format: str) -> GitFixture:
+    """Build the same committed repository over either supported ref backend."""
+
+    root = tmp_path / ref_format
+    subprocess.run(
+        [
+            _GIT_EXECUTABLE,
+            "init",
+            "--quiet",
+            f"--ref-format={ref_format}",
+            "--initial-branch=main",
+            root,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fixture = GitFixture(root=root, base="")
+    fixture.git("config", "user.name", "Round AF3 Tests")
+    fixture.git("config", "user.email", "round-af3@example.invalid")
+    fixture.write("a.txt", "a0\n")
+    fixture.write("b.txt", "b0\n")
+    fixture.git("add", "--", "a.txt", "b.txt")
+    fixture.git("commit", "--quiet", "-m", "baseline")
+    return GitFixture(root=root, base=fixture.oid())
+
+
+def _advance_with_ordinary_commits(
+    coordinator: Coordinator,
+    start: str,
+    count: int,
+) -> str:
+    """Advance main with tree-identical, non-broker commits."""
+
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", start)
+    head = start
+    for index in range(count):
+        head = coordinator.repo.commit_tree(tree, f"ordinary {index}", (head,))
+    assert coordinator.repo.update_ref("refs/heads/main", head, start)
+    return head
 
 
 def _register(coordinator: Coordinator, git_repo: GitFixture, actor: str, relative: str) -> Any:
@@ -376,6 +421,96 @@ def test_ref_storage_answers_present_or_absent_from_storage_not_from_git_text(
         packed.chmod(0o644)
 
 
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+def test_both_ref_backends_refuse_unreadable_wal_storage_and_report_their_lock(
+    tmp_path: Path,
+    ref_format: str,
+) -> None:
+    """The files arm is the control; reftable must carry the same guarantees."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    coordinator = Coordinator(git_repo.root)
+    repository = coordinator.repo
+    assert repository.resolve_ref("refs/heads/unborn", missing_ok=True) is None
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
+
+    if ref_format == "files":
+        storage = [repository.git_path(WAL_REF)]
+        expected_lock = repository.git_path(f"{WAL_REF}.lock")
+    else:
+        reftable = repository.git_dir / "reftable"
+        storage = [reftable / "tables.list", *sorted(reftable.glob("*.ref"))]
+        expected_lock = reftable / "tables.list.lock"
+    for path in storage:
+        path.chmod(0o000)
+    try:
+        assert all(not os.access(path, os.R_OK) for path in storage)
+        with pytest.raises(RefCorruptError, match="cannot be read"):
+            repository.resolve_ref(WAL_REF, missing_ok=True)
+        for call in (
+            coordinator.inspect_wal,
+            coordinator.recover,
+            lambda: coordinator.check("beta", str(git_repo.root / "a.txt")),
+        ):
+            with pytest.raises(WalCorruptError, match="cannot be read"):
+                call()
+    finally:
+        for path in storage:
+            path.chmod(0o644)
+
+    assert repository.ref_lock_path(WAL_REF) == expected_lock
+    expected_lock.write_text("", encoding="utf-8")
+    try:
+        wal_head = repository.resolve_ref(WAL_REF)
+        assert wal_head is not None
+        with pytest.raises(RefLockedError, match="locked") as refused:
+            repository.update_ref(WAL_REF, wal_head, wal_head)
+        assert refused.value.details["lock"] == str(expected_lock)
+        assert str(expected_lock) in coordinator.inspect_wal().ref_locks
+    finally:
+        expected_lock.unlink()
+
+
+def test_a_ref_created_after_both_probes_is_retried_not_called_corrupt(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy peer may create the WAL between rev-parse and storage inspection."""
+
+    repository = Repository(git_repo.root)
+    reference = "refs/onetree/racing"
+    original = repository.ref_storage_state
+
+    def create_before_storage_observation(observed: str) -> str | None:
+        assert observed == reference
+        git_repo.git("update-ref", reference, git_repo.base)
+        return original(observed)
+
+    monkeypatch.setattr(repository, "ref_storage_state", create_before_storage_observation)
+    assert repository.resolve_ref(reference, missing_ok=True) == git_repo.base
+
+
+def test_readable_but_malformed_reftable_storage_is_not_read_as_absent(
+    tmp_path: Path,
+) -> None:
+    git_repo = _repository_with_ref_backend(tmp_path, "reftable")
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    table_list = coordinator.repo.git_dir / "reftable" / "tables.list"
+    table_name = table_list.read_text(encoding="utf-8").splitlines()[0]
+    table = table_list.parent / table_name
+    original = table.read_bytes()
+    table.write_bytes(b"garbage")
+    try:
+        with pytest.raises(RefCorruptError, match="cannot be read"):
+            coordinator.repo.resolve_ref(WAL_REF, missing_ok=True)
+        with pytest.raises(WalCorruptError, match="cannot be read"):
+            coordinator.inspect_wal()
+    finally:
+        table.write_bytes(original)
+
+
 # --------------------------------------------------------------------------
 # D3 -- the branch-side audit is bounded by the WAL, not retired by use
 # --------------------------------------------------------------------------
@@ -431,11 +566,11 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
     assert coordinator.recover().consistent
 
 
-def test_a_truncated_branch_audit_is_reported_instead_of_reading_as_clean(
+def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
     git_repo: GitFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The scan cap truncates from the newest side, hiding the oldest commits."""
+    """A page boundary bounds one Git result, never the audit's correctness."""
 
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
@@ -446,30 +581,44 @@ def test_a_truncated_branch_audit_is_reported_instead_of_reading_as_clean(
 
     report = coordinator.inspect_wal()
     kinds = [item.kind for item in report.divergences]
-    assert kinds == ["scan_truncated"]
+    assert kinds == ["unrecorded_landing"]
     assert not report.consistent
-    assert "2 commits" in report.divergences[0].detail
+    assert report.divergences[0].commit == unrecorded
     with pytest.raises(WalDivergedError):
         coordinator.recover()
 
-    # The commit the walk never reached is really there: the report is not a
-    # false alarm, it is the audit saying it could not finish.
+    # The marked commit is below the first page and really is on the target.
     assert git_repo.git(
         "merge-base", "--is-ancestor", unrecorded, git_repo.oid(), check=False
     ).returncode == 0
 
-    # RED control (mutation M17): drop the truncation flag, which is what the
-    # shipped `--max-count` walk reported, and the cut-short audit answers
-    # "consistent" over the commit it never looked at.
-    original = Repository.marked_commits
-    monkeypatch.setattr(
-        Repository,
-        "marked_commits",
-        lambda self, target, excludes=(), *, limit=None: replace(
-            original(self, target, excludes, limit=limit), truncated=False
-        ),
+
+def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    _advance_with_ordinary_commits(
+        coordinator,
+        git_repo.base,
+        git_module.DIVERGENCE_SCAN_LIMIT + 4,
     )
+
     assert coordinator.inspect_wal().consistent
+    assert coordinator.recover().consistent
+
+
+def test_the_commit_immediately_below_first_sight_stays_inside_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+    git_repo.external_commit("b.txt", "hand\n", "permitted hand commit")
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+
+    report = coordinator.inspect_wal()
+    assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
+    assert report.divergences[0].commit == unrecorded
 
 
 # --------------------------------------------------------------------------
@@ -568,7 +717,133 @@ def test_recovery_reports_an_in_flight_landing_as_pending_and_exits_one(
     assert code == 1
     assert "pending=1" in human
     assert "still in flight" in human
+    code, out, err = _cli("wal", "--repo", str(git_repo.root), "--recover", "--json")
+    assert err == ""
+    payload = json.loads(out)
+    assert (code, payload["ok"], payload["recovery"]["divergences"]) == (1, False, [])
     assert coordinator.inspect_wal().pending_intents == 1
+
+
+def test_a_live_landing_defers_repair_but_never_defers_the_divergence_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "landed then removed\n")
+    landed = coordinator.land("alpha", message="recorded landing")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    _pending_intent(
+        git_repo,
+        coordinator,
+        session,
+        operation="d" * 32,
+        lander={"pid": os.getpid(), "start": None},
+    )
+
+    report = coordinator.inspect_wal()
+    assert report.pending_intents == 1
+    assert [item.kind for item in report.divergences] == ["landed_not_on_target"]
+    with pytest.raises(WalDivergedError) as refused:
+        coordinator.recover()
+    assert refused.value.details["pending"] == 1
+    assert refused.value.details["divergences"][0]["kind"] == "landed_not_on_target"
+
+    code, out, err = _cli("wal", "--repo", str(git_repo.root), "--recover")
+    assert (code, out) == (2, "")
+    assert "branch and the WAL disagree" in err
+    assert "pending=1 landing(s) still in flight" in err
+
+    code, out, err = _cli(
+        "wal",
+        "--repo",
+        str(git_repo.root),
+        "--recover",
+        "--json",
+    )
+    assert err == ""
+    payload = json.loads(out)
+    assert code == 2
+    assert payload["ok"] is False
+    assert payload["recovery"]["pending"] == 1
+    assert payload["recovery"]["divergences"][0]["kind"] == "landed_not_on_target"
+
+
+def test_lander_birth_tick_is_part_of_the_in_flight_bar(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "birth tick\n")
+    _pending_intent(
+        git_repo,
+        coordinator,
+        session,
+        lander={"pid": os.getpid(), "start": 12345},
+    )
+    observed: list[tuple[int, int | None]] = []
+
+    def alive_only_for_the_recorded_incarnation(pid: int, start: int | None) -> bool:
+        observed.append((pid, start))
+        return pid == os.getpid() and start == 12345
+
+    monkeypatch.setattr(core_module, "_pid_alive", alive_only_for_the_recorded_incarnation)
+    result = coordinator.recover()
+    assert result.pending == 1
+    assert observed == [(os.getpid(), 12345)]
+
+    # RED control: the bare-pid mutation revives the wrong process incarnation
+    # as live and changes recovery's measured outcome.
+    monkeypatch.setattr(
+        Coordinator,
+        "_landing_in_flight",
+        staticmethod(
+            lambda _state, intent, _now: core_module._pid_alive(
+                int(intent.data["lander"]["pid"]), None
+            )
+        ),
+    )
+    mutated = coordinator.recover()
+    assert mutated.pending == 0
+    assert mutated.refused == 1
+
+
+def test_a_degraded_lander_surfaces_the_same_warning_as_a_degraded_session(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "degraded lander\n")
+    monkeypatch.setattr(core_module, "_pid_start", lambda _pid: None)
+
+    landed = coordinator.land("alpha")
+    assert landed.warnings == (core_module.DEGRADED_LIVENESS,)
+    intent = next(event for event in coordinator.wal.read().events if event.kind == "land_intent")
+    assert intent.data["lander"]["warnings"] == [core_module.DEGRADED_LIVENESS]
+
+
+def test_a_pruned_landed_object_names_the_restore_path_before_recovery_can_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "pruned object\n")
+    landed = coordinator.land("alpha")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    object_path = git_repo.root / ".git" / "objects" / landed.commit[:2] / landed.commit[2:]
+    compressed = object_path.read_bytes()
+    object_path.unlink()
+
+    for call in (coordinator.inspect_wal, coordinator.recover):
+        with pytest.raises(WalCorruptError, match="restore") as refused:
+            call()
+        assert refused.value.details["commit"] == landed.commit
+
+    object_path.write_bytes(compressed)
+    assert [item.kind for item in coordinator.inspect_wal().divergences] == [
+        "landed_not_on_target"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +927,47 @@ def test_a_locked_target_branch_closes_the_intent_written_ahead_of_it(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", "refs/tags/not-a-branch"),
+        ("expected_head", "not-an-oid"),
+        ("candidate", "not-an-oid"),
+        ("tree", "not-an-oid"),
+    ],
+)
+def test_all_four_git_validators_refuse_an_unreplayable_append_at_the_wal_door(
+    git_repo: GitFixture,
+    field: str,
+    value: str,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    claim = coordinator.claim("alpha", [str(git_repo.root / "a.txt")]).claims[0]
+    index = coordinator.repo.ensure_index("alpha", git_repo.base)
+    tree = coordinator.repo.write_tree(index)
+    candidate = coordinator.repo.commit_tree(tree, "candidate", (git_repo.base,))
+    entry = coordinator.repo.tree_entries(git_repo.base)["a.txt"].payload()
+    data: dict[str, Any] = {
+        "operation": "9" * 32,
+        "attempt": 1,
+        "target": "refs/heads/main",
+        "expected_head": git_repo.base,
+        "candidate": candidate,
+        "tree": tree,
+        "session_generation": session.generation,
+        "lander": dict(DEAD_LANDER),
+        "fences": [{"path": "a.txt", "claim_generation": claim.generation}],
+        "payload": [{"path": "a.txt", "old": entry, "new": entry}],
+    }
+    data[field] = value
+    document = coordinator.wal.document("land_intent", "alpha", data)
+    snapshot = coordinator.wal.read()
+
+    with pytest.raises(WalAppendRefusedError, match="cannot replay"):
+        coordinator._try_append(coordinator._fold(snapshot), snapshot, (document,))
+
+
 def _flaky_git(directory: Path, failures: int) -> Path:
     """A git shim that fails the first N ``update-ref`` calls without a lock file."""
 
@@ -729,7 +1045,7 @@ def test_lock_contention_that_clears_is_retried_rather_than_misattributed(
     process.join(timeout=30)
     assert process.exitcode == 0
     outcome = results.get(timeout=5)
-    assert {key: outcome[key] for key in expected} == expected
+    assert {key: outcome.get(key) for key in expected} == expected
     # No lock file was ever present: the shim refuses without taking one, which
     # is exactly the window the old discrimination could not see.
     assert not coordinator_lock_exists(git_repo)

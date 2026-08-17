@@ -8,7 +8,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ from onetree.errors import (
     WalCorruptError,
     WalDivergedError,
 )
-from onetree.git import Repository, TempIndex, TreeEntry
+from onetree.git import MarkedCommit, Repository, TempIndex, TreeEntry
 from onetree.proc import process_alive as _pid_alive
 from onetree.proc import process_start as _pid_start
 from onetree.wal import WAL_REF, EventRecord, Wal, WalSnapshot
@@ -121,6 +121,7 @@ class LandResult:
     payload: tuple[str, ...]
     operation: str
     intent: str
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -324,7 +325,10 @@ def _validate_lander(value: Any, event: EventRecord) -> None:
 
     if value is None:
         return
-    if not isinstance(value, dict) or frozenset(value) != {"pid", "start"}:
+    if not isinstance(value, dict) or frozenset(value) not in (
+        {"pid", "start"},
+        {"pid", "start", "warnings"},
+    ):
         raise WalCorruptError("land_intent.lander is invalid", oid=event.oid)
     pid = value.get("pid")
     start = value.get("start")
@@ -332,6 +336,10 @@ def _validate_lander(value: Any, event: EventRecord) -> None:
         raise WalCorruptError("land_intent.lander is invalid", oid=event.oid)
     if start is not None and (isinstance(start, bool) or not isinstance(start, int) or start <= 0):
         raise WalCorruptError("land_intent.lander is invalid", oid=event.oid)
+    if "warnings" in value:
+        warnings = value.get("warnings")
+        if not isinstance(warnings, list) or tuple(warnings) != _liveness_warnings(start):
+            raise WalCorruptError("land_intent.lander.warnings is invalid", oid=event.oid)
 
 
 def _divergence_key(value: Any, event: EventRecord) -> tuple[tuple[str, ...], ...]:
@@ -450,7 +458,7 @@ class Coordinator:
             record = EventRecord(oid="(unwritten)", parents=(), document=dict(document))
             try:
                 self._apply(probe, record)
-            except WalCorruptError as error:
+            except (GitError, WalCorruptError) as error:
                 raise WalAppendRefusedError(
                     f"refusing to append a {record.kind} event that the WAL cannot replay: {error}",
                     event=record.kind,
@@ -1102,6 +1110,8 @@ class Coordinator:
             )
             context["candidate"] = commit
             payload_paths = [change.path for change in changes]
+            lander_start = _pid_start(os.getpid())
+            lander_warnings = _liveness_warnings(lander_start)
             intent = self.wal.document(
                 "land_intent",
                 actor,
@@ -1117,7 +1127,11 @@ class Coordinator:
                     # session body: a CLI invocation can die with its session
                     # still running, and recovery must be able to tell "this
                     # landing is in flight" from "its owner is still logged in".
-                    "lander": {"pid": os.getpid(), "start": _pid_start(os.getpid())},
+                    "lander": {
+                        "pid": os.getpid(),
+                        "start": lander_start,
+                        "warnings": list(lander_warnings),
+                    },
                     "fences": list(fences),
                     "payload": [change.event_payload() for change in changes],
                 },
@@ -1211,6 +1225,7 @@ class Coordinator:
                 tuple(payload_paths),
                 operation,
                 intent_id,
+                lander_warnings,
             )
         raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
 
@@ -1315,7 +1330,12 @@ class Coordinator:
                 # Only Git's own answer -- "this object is not a commit I have" --
                 # is WAL corruption. A GitError here is the plumbing failing, and
                 # blaming the WAL for it sends the reader to the wrong repair.
-                raise WalCorruptError("landed commit does not resolve", oid=event.oid) from error
+                raise WalCorruptError(
+                    "landed commit does not resolve; restore or fetch the recorded commit "
+                    "object before running recovery again",
+                    oid=event.oid,
+                    commit=commit,
+                ) from error
             expected_parent = _string(event.data, "expected_head", event)
             if self.repo.commit_parents(commit) != (expected_parent,):
                 raise WalCorruptError("landed commit parent differs from WAL", oid=event.oid)
@@ -1387,19 +1407,7 @@ class Coordinator:
                             operation=operation,
                         )
                     )
-            scan = self.repo.marked_commits(target, self._scan_floor(state, target))
-            if scan.truncated:
-                found.append(
-                    Divergence(
-                        "scan_truncated",
-                        target,
-                        "the branch-side audit stopped at the scan limit "
-                        f"({scan.limit} commits) before reaching the WAL's first recorded "
-                        "position, so an unrecorded landing below it is neither confirmed "
-                        "nor ruled out",
-                    )
-                )
-            for marked in scan.commits:
+            for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
                 operation = marked.operation or ""
                 if not operation:
                     continue
@@ -1420,19 +1428,43 @@ class Coordinator:
                 )
         return tuple(found)
 
-    def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
-        """History the branch-side audit may skip: below the WAL's first sight.
+    def _audit_marked_commits(
+        self,
+        head: str,
+        excludes: Sequence[str],
+    ) -> Iterator[MarkedCommit]:
+        """Read a stable branch head in bounded pages until its audit is complete."""
 
-        The floor is the parents of that first position rather than the position
-        itself, so the position is inside the walk. It has to be: when a session
-        registers on top of a crash-left commit, that commit *is* the WAL's first
-        position, and excluding it is exactly how the finding disappeared.
+        skip = 0
+        while True:
+            page = self.repo.marked_commits(head, excludes, skip=skip)
+            yield from page.commits
+            if not page.truncated:
+                return
+            if not page.commits:
+                raise GitError("branch audit page made no progress", reference=head, skip=skip)
+            skip += len(page.commits)
+
+    def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
+        """History the branch-side audit may skip: safely below first sight.
+
+        The floor is the grandparents of that first position, so both the first
+        position and its immediate parents stay inside the walk. The parent can
+        be a crash-left landing hidden by one permitted hand commit before the
+        WAL first observes the branch. In a shallow clone an unavailable parent
+        still degrades to no floor, preserving the complete visible-history scan.
         """
 
         origin = state.target_origin.get(target)
         if origin is None or not self.repo.existing_commits((origin,)):
             return ()
-        return self.repo.existing_commits(self.repo.commit_parents(origin))
+        parents = self.repo.existing_commits(self.repo.commit_parents(origin))
+        grandparents = (
+            ancestor
+            for parent in parents
+            for ancestor in self.repo.commit_parents(parent)
+        )
+        return self.repo.existing_commits(grandparents)
 
     def inspect_wal(self) -> WalReport:
         snapshot = self.wal.read()
@@ -1585,11 +1617,11 @@ class Coordinator:
             # next landing -- including on the target branch, which recovery used
             # to leave unexamined while reporting an all-clear.
             locks = self._held_locks(state)
-            if in_flight:
-                return RecoveryResult(False, in_flight, repaired, refused, locks)
             self._verify_landed(state)
             divergences = self._divergences(state)
             if not divergences:
+                if in_flight:
+                    return RecoveryResult(False, in_flight, repaired, refused, locks)
                 return RecoveryResult(True, 0, repaired, refused, locks)
             payloads = [item.payload() for item in divergences]
             document = self.wal.document(
@@ -1611,6 +1643,7 @@ class Coordinator:
             raise WalDivergedError(
                 "the branch and the WAL disagree about what the broker landed",
                 divergences=payloads,
+                pending=in_flight,
                 repaired=repaired,
                 refused=refused,
                 locks=list(locks),

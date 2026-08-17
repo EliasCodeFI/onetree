@@ -11,7 +11,7 @@ from typing import Any
 
 from onetree import __version__
 from onetree.core import Coordinator
-from onetree.errors import IdentityError, OnetreeError
+from onetree.errors import IdentityError, OnetreeError, WalDivergedError
 
 
 def _add_output(parser: argparse.ArgumentParser) -> None:
@@ -183,9 +183,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "payload": list(land_result.payload),
                     "operation": land_result.operation,
                     "intent": land_result.intent,
+                    "warnings": list(land_result.warnings),
                 },
             }
             human = f"landed {land_result.commit} on {land_result.target}"
+            if land_result.warnings:
+                human += f" [warning: {', '.join(land_result.warnings)}]"
         elif args.command == "wal" and args.recover:
             # Exit codes differ between the two `wal` modes on purpose. Inspection
             # is a report: 1 means "I looked and the state is not clean", the way
@@ -195,13 +198,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             recovery_result = coordinator.recover()
             return_code = 0 if recovery_result.consistent else 1
             payload = {
-                "ok": True,
+                "ok": recovery_result.consistent,
                 "recovery": {
                     "consistent": recovery_result.consistent,
                     "pending": recovery_result.pending,
                     "repaired": recovery_result.repaired,
                     "refused": recovery_result.refused,
                     "locks": list(recovery_result.locks),
+                    "divergences": [],
                 },
             }
             human = (
@@ -274,10 +278,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AssertionError("unreachable: subparser is required")
     except OnetreeError as error:
         payload = {"ok": False, "error": error.payload()}
+        pending_divergence = 0
+        if args.command == "wal" and args.recover and isinstance(error, WalDivergedError):
+            pending_divergence = int(error.details.get("pending", 0))
+            payload["recovery"] = {
+                "consistent": False,
+                "pending": pending_divergence,
+                "repaired": error.details.get("repaired", 0),
+                "refused": error.details.get("refused", 0),
+                "locks": error.details.get("locks", []),
+                "divergences": error.details.get("divergences", []),
+            }
         if json_output:
             _emit(payload, True, "")
         else:
-            sys.stderr.write(f"onetree: {error}\n")
+            suffix = (
+                f"; pending={pending_divergence} landing(s) still in flight"
+                if pending_divergence
+                else ""
+            )
+            sys.stderr.write(f"onetree: {error}{suffix}\n")
         return error.exit_code
 
     _emit(payload, json_output, human)

@@ -25,11 +25,9 @@ _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
-#: Upper bound on the history walked when looking for unrecorded broker
-#: commits. The walk is bounded below by the WAL's first sight of the target,
-#: so this cap is reached only when a target moved further than that since the
-#: WAL was created. Hitting it truncates the audit, which is reported rather
-#: than silently reading as a clean branch.
+#: Upper bound on one page of the history walk that looks for unrecorded broker
+#: commits. A complete audit may consume more than one page; this bounds each
+#: Git result, not the amount of honest history the repository may accumulate.
 DIVERGENCE_SCAN_LIMIT = 4096
 
 
@@ -110,6 +108,10 @@ class Repository:
         self.object_format = object_format
         self.oid_length = 40 if object_format == "sha1" else 64
         self.zero_oid = "0" * self.oid_length
+        ref_format = self.git_text("rev-parse", "--show-ref-format")
+        if ref_format not in {"files", "reftable"}:
+            raise GitError("unsupported Git ref format", ref_format=ref_format)
+        self.ref_format = ref_format
         self._git_paths: dict[str, Path] = {}
         self._valid_branch_refs: set[str] = set()
 
@@ -239,10 +241,22 @@ class Repository:
         empty stderr: a ref file that is ``chmod 000`` and a ref path that is a
         directory both come back indistinguishable from absent (measured on Git
         2.53.0). Matching the message text therefore cannot carry the
-        distinction, so it is taken from ref storage directly. Anything this
-        cannot decide resolves to "unreadable", never to absent -- an absent WAL
-        answers every claim question with a clean bill of health.
+        distinction, so it is taken from the active ref backend directly. A
+        backend-wide table must be readable before reftable can answer that one
+        name is absent.
         """
+
+        if self.ref_format == "reftable":
+            existence = self.git("show-ref", "--exists", reference, check=False)
+            if existence.returncode == 2:
+                return None
+            if existence.returncode == 0:
+                return "reftable names the ref but Git cannot resolve it"
+            storage_error = self._reftable_storage_state()
+            if storage_error is not None:
+                return storage_error
+            detail = existence.stderr.decode("utf-8", errors="replace").strip()
+            return f"reftable cannot determine whether the ref exists: {detail or 'unknown error'}"
 
         loose = self.git_path(reference)
         try:
@@ -269,6 +283,42 @@ class Repository:
             return f"packed-refs cannot be read: {error.strerror}"
         if reference.encode("utf-8", errors="replace") in self._packed_refs_names(content):
             return "packed-refs names the ref but Git cannot resolve it"
+        return None
+
+    def _reftable_storage_state(self) -> str | None:
+        """Why reftable cannot decide a ref, or None when its tables are readable."""
+
+        directory = self.git_path("reftable")
+        try:
+            status = directory.lstat()
+        except OSError as error:
+            return f"the reftable directory cannot be examined: {error.strerror}"
+        if not stat.S_ISDIR(status.st_mode):
+            return "the reftable path is not a directory"
+        table_list = directory / "tables.list"
+        try:
+            first = table_list.read_bytes()
+        except OSError as error:
+            return f"reftable tables.list cannot be read: {error.strerror}"
+        try:
+            names = first.decode("utf-8", errors="strict").splitlines()
+        except UnicodeDecodeError:
+            return "reftable tables.list is not UTF-8"
+        for name in names:
+            candidate = Path(name)
+            if not name or candidate.name != name or not name.endswith(".ref"):
+                return "reftable tables.list names an invalid table"
+            try:
+                with (directory / candidate).open("rb") as handle:
+                    handle.read(1)
+            except OSError as error:
+                return f"reftable table {name} cannot be read: {error.strerror}"
+        try:
+            second = table_list.read_bytes()
+        except OSError as error:
+            return f"reftable tables.list cannot be re-read: {error.strerror}"
+        if second != first:
+            return "reftable tables.list changed while it was examined"
         return None
 
     def resolve_ref(self, reference: str, *, missing_ok: bool = False) -> str | None:
@@ -302,13 +352,39 @@ class Repository:
             )
         unreadable = self.ref_storage_state(reference)
         if unreadable is not None:
-            raise RefCorruptError(
-                f"{reference} cannot be read: {unreadable}",
-                reference=reference,
-                oid=None,
-                object_type=None,
-                reason=unreadable,
-            )
+            # Storage was observed after both Git probes. A peer may have
+            # created or deleted the ref in that window, so classify only after
+            # one fresh pair of probes and one fresh storage observation.
+            retry = self._rev_parse(f"{reference}^{{commit}}")
+            if retry.returncode == 0:
+                try:
+                    oid = retry.stdout.decode("ascii", errors="strict").strip().lower()
+                except UnicodeDecodeError as error:
+                    raise GitError(
+                        "resolved object ID is not ASCII", reference=reference
+                    ) from error
+                return self.validate_oid(oid, label="resolved")
+            if retry.returncode != 1:
+                detail = retry.stderr.decode("utf-8", errors="replace").strip()
+                raise GitError(f"cannot resolve ref {reference}: {detail}", reference=reference)
+            retry_probe = self._rev_parse(reference)
+            if retry_probe.returncode == 0:
+                stored = retry_probe.stdout.decode("ascii", errors="replace").strip().lower()
+                raise RefCorruptError(
+                    f"{reference} exists but does not resolve to a commit",
+                    reference=reference,
+                    oid=stored,
+                    object_type=self.object_type(stored),
+                )
+            unreadable = self.ref_storage_state(reference)
+            if unreadable is not None:
+                raise RefCorruptError(
+                    f"{reference} cannot be read: {unreadable}",
+                    reference=reference,
+                    oid=None,
+                    object_type=None,
+                    reason=unreadable,
+                )
         if missing_ok:
             return None
         detail = result.stderr.decode("utf-8", errors="replace").strip()
@@ -502,6 +578,8 @@ class Repository:
         return tuple(parents)
 
     def ref_lock_path(self, reference: str) -> Path:
+        if self.ref_format == "reftable":
+            return self.git_path("reftable/tables.list.lock")
         return self.git_path(f"{reference}.lock")
 
     def symbolic_head(self) -> str | None:
@@ -529,7 +607,7 @@ class Repository:
         paths = [self.ref_lock_path(reference)]
         if reference.startswith("refs/heads/") and self.symbolic_head() == reference:
             paths.append(self.ref_lock_path("HEAD"))
-        return tuple(paths)
+        return tuple(dict.fromkeys(paths))
 
     def update_ref(self, reference: str, new: str, old: str | None) -> bool:
         """Compare-and-swap one ref; True on win, False only on a genuine CAS loss.
@@ -606,6 +684,7 @@ class Repository:
         excludes: Sequence[str] = (),
         *,
         limit: int | None = None,
+        skip: int = 0,
     ) -> TrailerScan:
         """List commits on ``target`` above ``excludes`` and their landing trailer.
 
@@ -620,6 +699,7 @@ class Repository:
         arguments = [
             "log",
             f"--max-count={bound + 1}",
+            f"--skip={skip}",
             "--format=%H%x1f%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)%x1e",
             target,
             *(f"^{oid}" for oid in excludes),

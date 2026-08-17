@@ -44,16 +44,18 @@ the red controls use to produce the poisoned states they assert against.
 **Ref storage decides absent-versus-unreadable.** Git answers "no such ref" and
 "this ref exists and I cannot read it" with the same exit status and, for
 `EACCES` and `EISDIR`, the same empty stderr (measured on Git 2.53.0). The new
-`Repository.ref_storage_state` reads the loose ref path with `lstat`/`open` and
-then `packed-refs`, and returns `None` only when storage holds nothing.
-Anything it cannot decide is a reason string, never absent.
+`Repository.ref_storage_state` reads storage belonging to the active backend:
+the loose ref plus `packed-refs` for `files`, or the backend-aware existence
+probe plus `tables.list` and every named table for `reftable`. It returns `None`
+only when that backend can say the name is absent. This paragraph corrects
+AF2's files-only claim; AF3 measured and closed the reftable gap.
 
-**The branch-side audit is bounded by the WAL, not retired by use.** The scan
-floor is the parents of the WAL's *first* recorded position for the target
-(`_FoldedState.target_origin`), so a crash-left commit stays inside the walk
-however many sessions register on top of it. A walk that hits
-`DIVERGENCE_SCAN_LIMIT` before reaching the floor reports `scan_truncated`
-rather than reading clean.
+**The branch-side audit is paged, not retired by use.** The scan floor is below
+the immediate parents of the WAL's *first* recorded position for the target
+(`_FoldedState.target_origin`), so a crash-left commit hidden by one hand commit
+stays inside the walk. `DIVERGENCE_SCAN_LIMIT` bounds one Git result; the audit
+continues from the same resolved head until it reaches the floor. This corrects
+AF2's permanent `scan_truncated` refusal.
 
 **Recovery reports what it found.** `RecoveryResult` carries measured
 `repaired`, `refused`, `pending` and `locks`; the `diverged` field, which was
@@ -65,8 +67,8 @@ and names pending intents.
 | ID | Severity | Finding | Disposition |
 | --- | --- | --- | --- |
 | D1 | critical | `recover()` during a live landing bricks the WAL; both parties told success | Closed by the guard pair above. `_landing_in_flight` gates the refusal; `_try_append` gates every write. `_mark_landed` treats an already-recorded landing as success — field for field, so a mark that disagrees on any pinned field is still refused — and otherwise raises a typed `WalAppendRefusedError` naming `onetree wal --recover`, distinct from `WalCorruptError`. Red: M15, M19, M28, M31. |
-| D2 | critical | An unreadable WAL ref reads as an empty healthy WAL | Closed. `ref_storage_state` decides from storage, not from git's message text; `resolve_ref` raises `RefCorruptError` with the reason, `Wal.head()` translates to `WalCorruptError`, and all five entry points refuse. Fixtured `EACCES` and `EISDIR`, plus the packed-refs path. Red: M20. |
-| D3 | major | Unrecorded-landing detection disarmed by routine use | Closed. Scan floor is the WAL's first recorded position for the target, fixtured in both masking orders (later registration, later landing) and in the first-sight order where the crash-left commit *is* that position. Depth cap handled by reporting `scan_truncated`. Red: M16, M17. |
+| D2 | critical | An unreadable WAL ref reads as an empty healthy WAL | AF2 closed the files backend. AF3 corrected the backend scope and applies the same refusal to reftable storage and its global lock. Red: M20 plus AF3's two-backend fixture. |
+| D3 | major | Unrecorded-landing detection disarmed by routine use | AF2 fixed later registration/landing masking. AF3 moved the floor below the immediate parent and replaced the permanent truncation verdict with complete, bounded-page scanning. Red: M16, M17 plus AF3's below-first-sight and beyond-one-page fixtures. |
 | D4 | major | `recover()` declares all-clear over target-branch locks | Closed. `_held_locks` enumerates the WAL ref and every target the WAL knows, with the `HEAD` association `ref_lock_paths` already carried; reported in `RecoveryResult.locks` and both CLI modes; still never deleted. Red: M21. |
 | D5 | medium | `onetree wal` human line contradicts its exit code and JSON | Closed. The line leads with `consistent`/`INCONSISTENT` and names pending intents. Exit-code asymmetry settled and documented below. Red: M22. |
 | D6 | medium | `RecoveryResult` fields are constants surfaced as measurements | Closed. `repaired`/`refused` are counted per batch and printed; `pending` counts intents deliberately left in flight; `diverged` removed. Red: M23. |
@@ -96,10 +98,10 @@ because the command did not do what it was asked to do. `--recover` therefore
 exits 0 when it left the repository consistent, 1 when landings are still in
 flight (nothing to do yet, come back), and 2 when it refused.
 
-**A truncated audit is a divergence, not a silent success.** The alternative —
-raising, or walking without bound — either fails healthy repositories with deep
-history or hands an attacker an unbounded walk. `scan_truncated` names the
-target, the limit, and what is neither confirmed nor ruled out.
+**An audit page boundary is not a repository verdict.** AF3 corrected this
+decision after measuring that `scan_truncated` permanently refused a healthy
+repository. Each Git result remains bounded, but the audit consumes subsequent
+pages from a pinned target OID until it reaches the WAL-derived floor.
 
 **Locks are residue, not inconsistency.** A ref lock is held for milliseconds
 during every healthy append, so folding held locks into `consistent` would fail
@@ -193,12 +195,11 @@ claims.
 
 ## Known limitations
 
-**The scan cap is a reported blind spot, not a closed one.** A target whose
-history above the WAL's first recorded position exceeds
-`DIVERGENCE_SCAN_LIMIT` is not audited to the floor. AF2 reports that as
-`scan_truncated` instead of reading it as clean, which converts a silent gap
-into a visible one; it does not walk further. Raising the cap trades latency for
-depth and is a Gate 2 decision.
+**The former scan cap was a permanent refusal, not merely a blind spot.** AF3
+measured a healthy register-before repository becoming inconsistent after 4,100
+ordinary commits and corrected the mechanism. `DIVERGENCE_SCAN_LIMIT` is now a
+page size; history is audited to the floor without emitting `scan_truncated`,
+and a real unrecorded landing below the first page is still reported.
 
 **An intent written before this round has no lander tag.** It falls back to
 session liveness, so on such an intent recovery is exactly as conservative — and
