@@ -18,17 +18,25 @@ from onetree.errors import (
     IdentityError,
     InvalidPathError,
     LandingRefusedError,
+    RefCorruptError,
+    RefLockedError,
     ReleaseRefusedError,
     WalCorruptError,
+    WalDivergedError,
 )
-from onetree.git import Repository, TreeEntry
+from onetree.git import Repository, TempIndex, TreeEntry
+from onetree.proc import process_alive as _pid_alive
+from onetree.proc import process_start as _pid_start
 from onetree.wal import WAL_REF, EventRecord, Wal, WalSnapshot
 
 DEFAULT_TTL = 24 * 60 * 60.0
 MAX_CAS_RETRIES = 32
 _ACTOR_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+#: Liveness degrades to bare pid existence when the kernel exposes no birth
+#: tick; a recycled pid then keeps a dead session fencing its peers.
+DEGRADED_LIVENESS = "degraded_liveness"
 
-Checkpoint = Callable[[str], None]
+Checkpoint = Callable[[str, Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,7 @@ class SessionInfo:
     base: str
     target: str
     index_path: Path
+    warnings: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -52,6 +61,7 @@ class SessionInfo:
             "base": self.base,
             "target": self.target,
             "index": str(self.index_path),
+            "warnings": list(self.warnings),
         }
 
 
@@ -98,6 +108,27 @@ class LandResult:
     attempts: int
     payload: tuple[str, ...]
     operation: str
+    intent: str
+
+
+@dataclass(frozen=True)
+class Divergence:
+    """One disagreement between a target branch and the WAL's landing record."""
+
+    kind: str
+    target: str
+    detail: str
+    commit: str | None = None
+    operation: str | None = None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "detail": self.detail,
+            "commit": self.commit,
+            "operation": self.operation,
+        }
 
 
 @dataclass(frozen=True)
@@ -108,6 +139,9 @@ class WalReport:
     pending_intents: int
     active_sessions: tuple[str, ...]
     active_claims: tuple[str, ...]
+    divergences: tuple[Divergence, ...] = ()
+    ref_locks: tuple[str, ...] = ()
+    temp_indexes: tuple[TempIndex, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -116,6 +150,7 @@ class RecoveryResult:
     pending: int
     repaired: int
     refused: int
+    diverged: int = 0
 
 
 @dataclass(frozen=True)
@@ -123,6 +158,7 @@ class GcResult:
     event: str
     removed_claims: int
     removed_sessions: int
+    removed_temp_indexes: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,6 +181,19 @@ class _FoldedState:
     claims: dict[str, ClaimInfo]
     pending: dict[str, EventRecord]
     landed: list[EventRecord]
+    #: Operations the WAL has closed as landed, keyed by operation id.
+    landed_operations: dict[str, EventRecord]
+    #: Intents the WAL has closed as refused, keyed by operation id. Their
+    #: candidates must never appear on the target branch.
+    refused_intents: dict[str, EventRecord]
+    #: Every operation a ``refused`` event named, whether or not it had an intent.
+    refused_operations: set[str]
+    #: Positions the WAL has observed for each target ref. They bound the
+    #: history a divergence scan has to walk.
+    target_positions: dict[str, set[str]]
+
+    def terminal(self, operation: str) -> bool:
+        return operation in self.landed_operations or operation in self.refused_operations
 
     def session_active(self, actor: str, now: float) -> bool:
         session = self.sessions.get(actor)
@@ -196,29 +245,8 @@ def _string_list(data: Mapping[str, Any], name: str, event: EventRecord) -> tupl
     return tuple(value)
 
 
-def _pid_start(pid: int) -> int | None:
-    """Return Linux's process-birth tick, or None where the kernel does not expose it."""
-
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        closing = text.rfind(")")
-        if closing < 0:
-            return None
-        fields = text[closing + 2 :].split()
-        return int(fields[19])
-    except (FileNotFoundError, IndexError, OSError, UnicodeError, ValueError):
-        return None
-
-
-def _pid_alive(pid: int, expected_start: int | None) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass
-    current_start = _pid_start(pid)
-    return expected_start is None or current_start == expected_start
+def _liveness_warnings(pid_start: int | None) -> tuple[str, ...]:
+    return () if pid_start is not None else (DEGRADED_LIVENESS,)
 
 
 def _session_alive(session: SessionInfo, now: float) -> bool:
@@ -262,6 +290,13 @@ class Coordinator:
                 path=raw_path,
                 reason="unresolvable",
             ) from error
+        git_dir = self.repo.git_dir
+        if resolved == git_dir or git_dir in resolved.parents:
+            raise InvalidPathError(
+                "claim path is Git's own metadata, not repository content",
+                path=raw_path,
+                reason="git_internal",
+            )
         try:
             relative = resolved.relative_to(self.repo.root)
         except ValueError as error:
@@ -270,6 +305,12 @@ class Coordinator:
                 path=raw_path,
                 reason="outside_repository",
             ) from error
+        if ".git" in relative.parts:
+            raise InvalidPathError(
+                "claim path is Git's own metadata, not repository content",
+                path=raw_path,
+                reason="git_internal",
+            )
         return relative.as_posix()
 
     @staticmethod
@@ -280,8 +321,16 @@ class Coordinator:
         return deadline if limit is None else min(deadline, limit)
 
     def _fold(self, snapshot: WalSnapshot) -> _FoldedState:
-        state = _FoldedState(sessions={}, claims={}, pending={}, landed=[])
-        terminal_operations: set[str] = set()
+        state = _FoldedState(
+            sessions={},
+            claims={},
+            pending={},
+            landed=[],
+            landed_operations={},
+            refused_intents={},
+            refused_operations=set(),
+            target_positions={},
+        )
         event_ids: set[str] = set()
         session_generations: set[str] = set()
         claim_generations: set[str] = set()
@@ -318,7 +367,9 @@ class Coordinator:
                     base=base,
                     target=target,
                     index_path=self.repo.index_path(event.actor),
+                    warnings=_liveness_warnings(pid_start),
                 )
+                state.target_positions.setdefault(target, set()).add(base)
             elif event.kind == "claim":
                 generation = _string(data, "generation", event)
                 if generation in claim_generations:
@@ -362,15 +413,16 @@ class Coordinator:
                             state.sessions.pop(actor)
             elif event.kind == "land_intent":
                 operation = _string(data, "operation", event)
-                if operation in state.pending or operation in terminal_operations:
+                if operation in state.pending or state.terminal(operation):
                     raise WalCorruptError("duplicate landing operation", oid=event.oid)
                 attempt = data.get("attempt")
                 if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
                     raise WalCorruptError("land_intent.attempt is invalid", oid=event.oid)
-                self.repo.validate_branch_ref(_string(data, "target", event))
-                self.repo.validate_oid(
+                intent_target = self.repo.validate_branch_ref(_string(data, "target", event))
+                intent_head = self.repo.validate_oid(
                     _string(data, "expected_head", event), label="expected target"
                 )
+                state.target_positions.setdefault(intent_target, set()).add(intent_head)
                 self.repo.validate_oid(_string(data, "candidate", event), label="candidate")
                 self.repo.validate_oid(_string(data, "tree", event), label="candidate tree")
                 _string(data, "session_generation", event)
@@ -434,15 +486,30 @@ class Coordinator:
                 intent = state.pending.get(operation)
                 if intent is None or data.get("intent") != intent.event_id:
                     raise WalCorruptError("landed event has no matching intent", oid=event.oid)
-                if not data.get("recovered", False) and event.parents != (intent.oid,):
-                    raise WalCorruptError(
-                        "landed event is not adjacent to its intent", oid=event.oid
+                # Write-ahead ordering puts the branch CAS between the intent and
+                # its landed mark, so an unrelated append may legitimately sit
+                # between the two commits. Adjacency is therefore replaced by a
+                # full field-for-field agreement with the intent.
+                if any(
+                    data.get(field) != intent.data.get(source)
+                    for field, source in (
+                        ("commit", "candidate"),
+                        ("target", "target"),
+                        ("expected_head", "expected_head"),
+                        ("tree", "tree"),
                     )
-                if data.get("commit") != intent.data.get("candidate"):
-                    raise WalCorruptError("landed commit differs from its intent", oid=event.oid)
-                self.repo.validate_branch_ref(_string(data, "target", event))
-                self.repo.validate_oid(_string(data, "expected_head", event), label="landed base")
+                ):
+                    raise WalCorruptError("landed event differs from its intent", oid=event.oid)
+                landed_target = self.repo.validate_branch_ref(_string(data, "target", event))
+                landed_head = self.repo.validate_oid(
+                    _string(data, "expected_head", event), label="landed base"
+                )
+                landed_commit = self.repo.validate_oid(
+                    _string(data, "commit", event), label="landed commit"
+                )
                 self.repo.validate_oid(_string(data, "tree", event), label="landed tree")
+                positions = state.target_positions.setdefault(landed_target, set())
+                positions.update((landed_head, landed_commit))
                 landed_payload_paths = data.get("payload")
                 if not isinstance(landed_payload_paths, list) or any(
                     not isinstance(path, str) or not path for path in landed_payload_paths
@@ -456,7 +523,7 @@ class Coordinator:
                 if not isinstance(data.get("recovered"), bool):
                     raise WalCorruptError("landed.recovered is invalid", oid=event.oid)
                 state.pending.pop(operation)
-                terminal_operations.add(operation)
+                state.landed_operations[operation] = event
                 state.landed.append(event)
             elif event.kind == "refused":
                 refused_operation = data.get("operation")
@@ -466,8 +533,10 @@ class Coordinator:
                         raise WalCorruptError("refused.operation is invalid", oid=event.oid)
                     pending = state.pending.get(refused_operation)
                     if pending is not None and intent_id == pending.event_id:
-                        state.pending.pop(refused_operation)
-                    terminal_operations.add(refused_operation)
+                        state.refused_intents[refused_operation] = state.pending.pop(
+                            refused_operation
+                        )
+                    state.refused_operations.add(refused_operation)
                 _string(data, "action", event)
                 _string(data, "reason", event)
             else:  # all event kinds are covered above
@@ -498,10 +567,11 @@ class Coordinator:
         if body_pid <= 0 or not _pid_alive(body_pid, _pid_start(body_pid)):
             raise IdentityError("session process is not alive", session=actor, pid=body_pid)
         process_start = _pid_start(body_pid)
+        warnings = _liveness_warnings(process_start)
         target_ref = (
             self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
         )
-        base = self.repo.resolve_ref(target_ref)
+        base = self.repo.resolve_ref(target_ref, missing_ok=True)
         if base is None:
             raise GitError("landing target is unborn", reference=target_ref)
         now = time.time()
@@ -517,6 +587,7 @@ class Coordinator:
                 "expires_at": expires_at,
                 "base": base,
                 "target": target_ref,
+                "warnings": list(warnings),
             },
         )
         for _ in range(MAX_CAS_RETRIES):
@@ -539,14 +610,15 @@ class Coordinator:
             if self.wal.try_append((document,), snapshot.head) is not None:
                 index = self.repo.ensure_index(actor, base, reset=True)
                 return SessionInfo(
-                    actor,
-                    generation,
-                    body_pid,
-                    process_start,
-                    expires_at,
-                    base,
-                    target_ref,
-                    index,
+                    actor=actor,
+                    generation=generation,
+                    pid=body_pid,
+                    pid_start=process_start,
+                    expires_at=expires_at,
+                    base=base,
+                    target=target_ref,
+                    index_path=index,
+                    warnings=warnings,
                 )
         raise GitError("session registration CAS retry limit exceeded")
 
@@ -727,6 +799,16 @@ class Coordinator:
         )
         return self.wal.try_append((document,), snapshot.head) is not None
 
+    def _append_document(self, document: Mapping[str, Any], *, what: str) -> EventRecord:
+        """CAS-append one prepared document, re-reading the head on every loss."""
+
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self.wal.read()
+            records = self.wal.try_append((document,), snapshot.head)
+            if records is not None:
+                return records[0]
+        raise GitError(f"{what} CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
+
     def land(
         self,
         actor: str,
@@ -735,16 +817,33 @@ class Coordinator:
         target: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> LandResult:
+        """Audit, then land write-ahead: intent, branch CAS, landed mark.
+
+        Round A moved the branch and the WAL in one ``update-ref --stdin``
+        transaction. On the files ref backend that transaction is not
+        crash-atomic: Git commits the two loose refs as two sequential renames,
+        branch first, so a death between them leaves the candidate on the branch
+        with no WAL provenance at all. No two-loose-ref crash-atomic primitive
+        exists on this backend, so the protocol stops needing one. Every ref
+        update below is a single-ref CAS, which *is* atomic, and the order is
+        chosen so that each crash window leaves a state recovery can name:
+        either an intent with no branch move (recovery refuses it) or a branch
+        move whose intent is already recorded (recovery completes it).
+        """
+
         actor = _validate_actor(actor)
         target_ref = (
             self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
         )
-        operation = uuid.uuid4().hex
         attempts = 0
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
             snapshot = self.wal.read()
             state = self._fold(snapshot)
+            # A landing operation is one attempt. Retries mint a new id so the
+            # WAL keeps every attempt's intent and its terminal event distinct.
+            operation = uuid.uuid4().hex
+            intent_id = uuid.uuid4().hex
             session = self._active_session(state, actor, now)
             if session is None:
                 if not self._record_land_refusal(snapshot, actor, operation, "session_inactive"):
@@ -801,9 +900,17 @@ class Coordinator:
                 }
                 for change in changes
             )
+            context: dict[str, Any] = {
+                "actor": actor,
+                "target": target_ref,
+                "operation": operation,
+                "intent": intent_id,
+                "wal_head": snapshot.head,
+                "payload": [change.path for change in changes],
+            }
             if checkpoint is not None:
-                checkpoint("after_audit")
-            current = self.repo.resolve_ref(target_ref)
+                checkpoint("after_audit", context)
+            current = self.repo.resolve_ref(target_ref, missing_ok=True)
             if current is None:
                 raise GitError("landing target is unborn", reference=target_ref)
             if not self.repo.is_ancestor(session.base, current):
@@ -842,13 +949,19 @@ class Coordinator:
                     expected=[change.path for change in expected],
                     actual=[change.path for change in actual],
                 )
+            context["expected_head"] = current
+            context["tree"] = candidate_tree
             if checkpoint is not None:
-                checkpoint("after_tree")
+                checkpoint("after_tree", context)
             commit = self.repo.commit_tree(
                 candidate_tree,
-                message or f"onetree land: {actor}",
+                self.repo.landing_message(
+                    message or f"onetree land: {actor}", operation, intent_id, actor
+                ),
                 (current,),
             )
+            context["candidate"] = commit
+            payload_paths = [change.path for change in changes]
             intent = self.wal.document(
                 "land_intent",
                 actor,
@@ -863,60 +976,139 @@ class Coordinator:
                     "fences": list(fences),
                     "payload": [change.event_payload() for change in changes],
                 },
+                event_id=intent_id,
             )
-            landed = self.wal.document(
-                "landed",
-                actor,
-                {
-                    "operation": operation,
-                    "intent": intent["event_id"],
-                    "target": target_ref,
-                    "expected_head": current,
-                    "commit": commit,
-                    "tree": candidate_tree,
-                    "payload": [change.path for change in changes],
-                    "recovered": False,
-                },
-            )
-            new_wal_head, _ = self.wal.build_chain((intent, landed), snapshot.head)
             if checkpoint is not None:
-                checkpoint("before_transaction")
+                checkpoint("before_intent", context)
+
+            # Fence sample. Everything above was audited against a WAL read that
+            # is now old; this is the last look at the session and its claims
+            # before anything becomes visible to peers.
             landing_time = time.time()
             fenced_generations = {str(fence["claim_generation"]) for fence in fences}
-            fences_live = all(
-                claim.generation not in fenced_generations or claim.expires_at > landing_time
-                for claim in owned
-            )
-            if not _session_alive(session, landing_time) or not fences_live:
-                continue
-            attempts += 1
-            won = self.repo.update_refs_atomically(
-                (
-                    (target_ref, commit, current),
-                    (WAL_REF, new_wal_head, snapshot.head),
+            if not _session_alive(session, landing_time):
+                if not self._record_land_refusal(
+                    snapshot, actor, operation, "session_died_at_fence"
+                ):
+                    continue
+                raise LandingRefusedError(
+                    "landing session died between its audit and the fence",
+                    reason="session_died_at_fence",
+                    paths=list(payload_paths),
+                )
+            expired = tuple(
+                sorted(
+                    claim.path
+                    for claim in owned
+                    if claim.generation in fenced_generations and claim.expires_at <= landing_time
                 )
             )
-            if not won:
+            if expired:
+                if not self._record_land_refusal(
+                    snapshot, actor, operation, "claim_expired_at_fence", expired
+                ):
+                    continue
+                raise LandingRefusedError(
+                    "a fenced claim expired between its audit and the fence",
+                    reason="claim_expired_at_fence",
+                    paths=list(expired),
+                )
+
+            attempts += 1
+            # Write-ahead step 1. The WAL CAS is also the fence: any release,
+            # reclamation, registration change, or unrelated append since the
+            # snapshot invalidates this attempt and forces a fresh audit.
+            if self.wal.try_append((intent,), snapshot.head) is None:
                 continue
             if checkpoint is not None:
-                checkpoint("after_transaction")
+                checkpoint("after_intent", context)
+
+            # Write-ahead step 2. A single-ref CAS, so a crash inside it leaves
+            # the branch either moved or not, never half-moved.
+            if not self.repo.update_ref(target_ref, commit, current):
+                self._close_intent(actor, operation, intent_id, "target_moved")
+                continue
+            if checkpoint is not None:
+                checkpoint("after_branch", context)
+
+            # Write-ahead step 3. If this never runs, the intent stays pending
+            # with its candidate already on the branch, which is exactly the
+            # state recovery completes.
+            self._mark_landed(
+                actor, operation, intent_id, target_ref, current, commit, candidate_tree,
+                payload_paths,
+            )
+            if checkpoint is not None:
+                checkpoint("after_landed", context)
             return LandResult(
                 commit,
                 candidate_tree,
                 target_ref,
                 attempts,
-                tuple(change.path for change in changes),
+                tuple(payload_paths),
                 operation,
+                intent_id,
             )
         raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
+
+    def _close_intent(self, actor: str, operation: str, intent_id: str, reason: str) -> None:
+        document = self.wal.document(
+            "refused",
+            actor,
+            {
+                "action": "land",
+                "reason": reason,
+                "operation": operation,
+                "intent": intent_id,
+                "paths": [],
+            },
+        )
+        self._append_document(document, what="landing refusal")
+
+    def _mark_landed(
+        self,
+        actor: str,
+        operation: str,
+        intent_id: str,
+        target_ref: str,
+        expected_head: str,
+        commit: str,
+        tree: str,
+        payload_paths: Sequence[str],
+    ) -> None:
+        document = self.wal.document(
+            "landed",
+            actor,
+            {
+                "operation": operation,
+                "intent": intent_id,
+                "target": target_ref,
+                "expected_head": expected_head,
+                "commit": commit,
+                "tree": tree,
+                "payload": list(payload_paths),
+                "recovered": False,
+            },
+        )
+        try:
+            self._append_document(document, what="landed mark")
+        except GitError as error:
+            raise GitError(
+                "the candidate is on the branch but its landed mark could not be "
+                "appended; run `onetree wal --recover`",
+                operation=operation,
+                commit=commit,
+                target=target_ref,
+            ) from error
 
     def _verify_landed(self, state: _FoldedState) -> None:
         for event in state.landed:
             commit = _string(event.data, "commit", event)
             expected_tree = _string(event.data, "tree", event)
-            resolved = self.repo.resolve_ref(commit)
-            if resolved != commit:
-                raise WalCorruptError("landed commit does not resolve", oid=event.oid)
+            try:
+                self.repo.require_commit(commit)
+            except (GitError, RefCorruptError) as error:
+                raise WalCorruptError("landed commit does not resolve", oid=event.oid) from error
             expected_parent = _string(event.data, "expected_head", event)
             if self.repo.commit_parents(commit) != (expected_parent,):
                 raise WalCorruptError("landed commit parent differs from WAL", oid=event.oid)
@@ -924,25 +1116,128 @@ class Coordinator:
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
 
+    def _divergences(self, state: _FoldedState) -> tuple[Divergence, ...]:
+        """Compare every target the WAL knows against what the WAL says landed.
+
+        Two directions matter. The WAL can claim a landing the branch does not
+        contain, and the branch can carry a broker landing the WAL never
+        recorded — the shape a pre-write-ahead crash produced. Ordinary hand
+        commits are still permitted on these branches, so the branch-side test
+        keys on the landing trailer every broker candidate carries rather than
+        on mere presence of an unrecognised commit.
+        """
+
+        found: list[Divergence] = []
+        for target in sorted(state.target_positions):
+            head = self.repo.resolve_ref(target, missing_ok=True)
+            landed_here = [
+                event for event in state.landed if event.data.get("target") == target
+            ]
+            if head is None:
+                found.extend(
+                    Divergence(
+                        "target_missing",
+                        target,
+                        "the WAL recorded a landing on a target ref that no longer exists",
+                        commit=str(event.data.get("commit")),
+                        operation=str(event.data.get("operation")),
+                    )
+                    for event in landed_here
+                )
+                continue
+            for event in landed_here:
+                commit = str(event.data.get("commit"))
+                if not self.repo.is_ancestor(commit, head):
+                    found.append(
+                        Divergence(
+                            "landed_not_on_target",
+                            target,
+                            "the WAL records this commit as landed but the branch does not "
+                            "contain it",
+                            commit=commit,
+                            operation=str(event.data.get("operation")),
+                        )
+                    )
+            for operation, intent in sorted(state.refused_intents.items()):
+                if intent.data.get("target") != target:
+                    continue
+                candidate = str(intent.data.get("candidate"))
+                if self.repo.is_ancestor(candidate, head):
+                    found.append(
+                        Divergence(
+                            "refused_candidate_on_target",
+                            target,
+                            "the WAL refused this candidate but the branch contains it",
+                            commit=candidate,
+                            operation=operation,
+                        )
+                    )
+            excludes = self.repo.existing_commits(state.target_positions[target])
+            for marked in self.repo.marked_commits(target, excludes):
+                operation = marked.operation or ""
+                if not operation:
+                    continue
+                if (
+                    operation in state.landed_operations
+                    or operation in state.pending
+                    or operation in state.refused_intents
+                ):
+                    continue
+                found.append(
+                    Divergence(
+                        "unrecorded_landing",
+                        target,
+                        "a broker landing is on the branch with no WAL record of it",
+                        commit=marked.commit,
+                        operation=operation,
+                    )
+                )
+        return tuple(found)
+
     def inspect_wal(self) -> WalReport:
         snapshot = self.wal.read()
         state = self._fold(snapshot)
         self._verify_landed(state)
+        divergences = self._divergences(state)
         now = time.time()
         sessions = tuple(
             sorted(actor for actor in state.sessions if state.session_active(actor, now))
         )
         claims = tuple(sorted({claim.path for claim in state.active_claims(now)}))
+        locks = tuple(
+            str(path)
+            for path in dict.fromkeys(
+                lock
+                for reference in (WAL_REF, *sorted(state.target_positions))
+                for lock in self.repo.ref_lock_paths(reference)
+            )
+            if path.exists()
+        )
         return WalReport(
             snapshot.head,
             snapshot.events,
-            not state.pending,
+            not state.pending and not divergences,
             len(state.pending),
             sessions,
             claims,
+            divergences,
+            locks,
+            self.repo.temp_indexes(),
         )
 
     def recover(self) -> RecoveryResult:
+        # A ref lock left by a crashed process names no owner, so it cannot be
+        # liveness-checked and must not be deleted: a live peer may hold it.
+        # Recovery names it in a typed refusal instead of letting the next WAL
+        # append surface it as an unattributed Git failure.
+        held = [str(lock) for lock in self.repo.ref_lock_paths(WAL_REF) if lock.exists()]
+        if held:
+            raise RefLockedError(
+                "the WAL ref is locked; if no process holds it, remove the lock by hand",
+                reference=WAL_REF,
+                lock=held[0],
+                locks=held,
+            )
         repaired = 0
         refused = 0
         for _ in range(MAX_CAS_RETRIES):
@@ -950,7 +1245,26 @@ class Coordinator:
             state = self._fold(snapshot)
             if not state.pending:
                 self._verify_landed(state)
-                return RecoveryResult(True, 0, repaired, refused)
+                divergences = self._divergences(state)
+                if not divergences:
+                    return RecoveryResult(True, 0, repaired, refused)
+                document = self.wal.document(
+                    "refused",
+                    "recovery",
+                    {
+                        "action": "recover",
+                        "reason": "branch_diverged",
+                        "divergences": [item.payload() for item in divergences],
+                    },
+                )
+                if self.wal.try_append((document,), snapshot.head) is None:
+                    continue
+                raise WalDivergedError(
+                    "the branch and the WAL disagree about what the broker landed",
+                    divergences=[item.payload() for item in divergences],
+                    repaired=repaired,
+                    refused=refused,
+                )
             operation, intent = next(iter(state.pending.items()))
             target = _string(intent.data, "target", intent)
             candidate = _string(intent.data, "candidate", intent)
@@ -996,12 +1310,28 @@ class Coordinator:
                 refused += 1
         raise GitError("recovery CAS retry limit exceeded")
 
+    def _abandoned_temp_indexes(self) -> tuple[TempIndex, ...]:
+        """Select temp-index residue whose creating process incarnation is gone.
+
+        A file whose owner tag does not parse is reported by ``inspect`` but is
+        never swept here: without an owner there is no liveness question to ask,
+        and deleting an index a live process is mid-write on is worse than
+        leaving it.
+        """
+
+        return tuple(
+            residue
+            for residue in self.repo.temp_indexes()
+            if residue.pid is not None and not _pid_alive(residue.pid, residue.start)
+        )
+
     def gc(self, actor: str) -> GcResult:
         actor = _validate_actor(actor)
         for _ in range(MAX_CAS_RETRIES):
             snapshot = self.wal.read()
             state = self._fold(snapshot)
             now = time.time()
+            abandoned = self._abandoned_temp_indexes()
             active_claim_generations = {claim.generation for claim in state.active_claims(now)}
             stale_claims = tuple(
                 sorted(
@@ -1023,9 +1353,17 @@ class Coordinator:
                 {
                     "claim_generations": list(stale_claims),
                     "session_generations": list(stale_sessions),
+                    "temp_indexes": [residue.path.name for residue in abandoned],
                 },
             )
             records = self.wal.try_append((document,), snapshot.head)
             if records is not None:
-                return GcResult(records[0].kind, len(stale_claims), len(stale_sessions))
+                for residue in abandoned:
+                    residue.path.unlink(missing_ok=True)
+                return GcResult(
+                    records[0].kind,
+                    len(stale_claims),
+                    len(stale_sessions),
+                    len(abandoned),
+                )
         raise GitError("gc CAS retry limit exceeded")

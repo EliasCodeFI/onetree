@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -115,14 +116,22 @@ def test_claim_expiry_at_transaction_fence_refuses(git_repo: GitFixture) -> None
     git_repo.write("a.txt", "expires before CAS\n")
     git_repo.stage(session.index_path, "a.txt")
 
-    def expire(point: str) -> None:
-        if point == "before_transaction":
+    def expire(point: str, _context: Mapping[str, Any]) -> None:
+        if point == "before_intent":
             time.sleep(0.25)
 
     with pytest.raises(LandingRefusedError) as refused:
         coordinator.land("alpha", checkpoint=expire)
-    assert refused.value.details["reason"] == "unclaimed_paths"
+    assert refused.value.details["reason"] == "claim_expired_at_fence"
+    assert refused.value.details["paths"] == ["a.txt"]
     assert git_repo.oid() == git_repo.base
+    # The refusal is a WAL fact, not just an exception.
+    kinds = [
+        event.data.get("reason")
+        for event in coordinator.inspect_wal().events
+        if event.kind == "refused"
+    ]
+    assert "claim_expired_at_fence" in kinds
 
 
 def test_directory_claim_allows_addition_and_deletion_payload(git_repo: GitFixture) -> None:
@@ -134,12 +143,19 @@ def test_directory_claim_allows_addition_and_deletion_payload(git_repo: GitFixtu
     git_repo.stage(session.index_path, "nested")
 
     checkpoints: list[str] = []
-    result = coordinator.land("alpha", checkpoint=checkpoints.append)
+
+    def record(point: str, context: Mapping[str, Any]) -> None:
+        assert context["actor"] == "alpha"
+        checkpoints.append(point)
+
+    result = coordinator.land("alpha", checkpoint=record)
     assert checkpoints == [
         "after_audit",
         "after_tree",
-        "before_transaction",
-        "after_transaction",
+        "before_intent",
+        "after_intent",
+        "after_branch",
+        "after_landed",
     ]
     assert result.payload == ("nested/c.txt", "nested/new.txt")
     assert git_repo.git("show", f"{result.commit}:nested/new.txt").stdout == "new\n"

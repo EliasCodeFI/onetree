@@ -43,6 +43,24 @@ class WalCorruptError(OnetreeError):
     kind = "wal_corrupt"
 
 
+class RefCorruptError(OnetreeError):
+    """A ref exists but does not resolve to a commit (blob, tree, or dangling)."""
+
+    kind = "ref_corrupt"
+
+
+class RefLockedError(OnetreeError):
+    """A ``.lock`` file blocks the ref update; its holder cannot be identified."""
+
+    kind = "ref_locked"
+
+
+class WalDivergedError(OnetreeError):
+    """The target branch and the WAL disagree about what the broker landed."""
+
+    kind = "wal_diverged"
+
+
 class ClaimConflictError(OnetreeError):
     """Another live session owns an overlapping path claim."""
 

@@ -12,6 +12,79 @@ import pytest
 
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
+# A PATH-shim git that kills its caller from inside a matched invocation.
+#
+# Python checkpoints inside the broker cannot reach this window: for the whole
+# of a matched invocation the caller is blocked in subprocess.run, so a kill
+# issued from here lands while the ref update is in flight. A single-ref update
+# commits with one rename, so "in flight" has exactly two observable outcomes --
+# the rename happened, or it did not -- and both are produced here by mode.
+_KILL_GIT_SOURCE = """#!/bin/bash
+set -u
+matched_operation=0
+matched_reference=0
+for argument in "$@"; do
+  case "$argument" in
+    update-ref) matched_operation=1 ;;
+    "$ONETREE_TEST_KILL_REF") matched_reference=1 ;;
+  esac
+done
+if [ "$matched_operation" = 1 ] && [ "$matched_reference" = 1 ]; then
+  seen=0
+  if [ -f "$ONETREE_TEST_KILL_STATE" ]; then seen=$(<"$ONETREE_TEST_KILL_STATE"); fi
+  seen=$((seen + 1))
+  printf '%s' "$seen" > "$ONETREE_TEST_KILL_STATE"
+  if [ "$seen" = "$ONETREE_TEST_KILL_NTH" ]; then
+    if [ "$ONETREE_TEST_KILL_MODE" = after ]; then
+      "$ONETREE_TEST_REAL_GIT" "$@"
+    fi
+    kill -KILL "$PPID"
+    exit 0
+  fi
+fi
+exec "$ONETREE_TEST_REAL_GIT" "$@"
+"""
+
+
+@dataclass(frozen=True)
+class KillGit:
+    """A git shim that SIGKILLs the broker from inside one ref update."""
+
+    executable: Path
+    state: Path
+
+    def environment(self, reference: str, nth: int, mode: str) -> dict[str, str]:
+        return {
+            "ONETREE_TEST_REAL_GIT": _GIT_EXECUTABLE,
+            "ONETREE_TEST_KILL_STATE": str(self.state),
+            "ONETREE_TEST_KILL_REF": reference,
+            "ONETREE_TEST_KILL_NTH": str(nth),
+            "ONETREE_TEST_KILL_MODE": mode,
+        }
+
+
+def install_kill_git(executable: str, environment: dict[str, str]) -> None:
+    """Point this process's Git layer at the shim, through PATH resolution."""
+
+    import onetree.git
+
+    os.environ.update(environment)
+    os.environ["PATH"] = f"{Path(executable).parent}{os.pathsep}{os.environ['PATH']}"
+    resolved = shutil.which("git")
+    assert resolved == executable, resolved
+    # The module resolved the real git at import time, before PATH was changed.
+    onetree.git._GIT_EXECUTABLE = resolved
+
+
+@pytest.fixture
+def kill_git(tmp_path: Path) -> KillGit:
+    directory = tmp_path / "killgit"
+    directory.mkdir()
+    executable = directory / "git"
+    executable.write_text(_KILL_GIT_SOURCE, encoding="utf-8")
+    executable.chmod(0o755)
+    return KillGit(executable=executable, state=tmp_path / "killgit.count")
+
 
 @dataclass(frozen=True)
 class GitFixture:

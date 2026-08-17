@@ -133,6 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             payload = {"ok": True, "session": session.payload()}
             human = f"registered {session.actor}; index {session.index_path}"
+            if session.warnings:
+                human += f" [warning: {', '.join(session.warnings)}]"
         elif args.command == "claim":
             claim_result = coordinator.claim(_actor(args.actor), args.paths, ttl=args.ttl)
             payload = {
@@ -180,6 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "attempts": land_result.attempts,
                     "payload": list(land_result.payload),
                     "operation": land_result.operation,
+                    "intent": land_result.intent,
                 },
             }
             human = f"landed {land_result.commit} on {land_result.target}"
@@ -192,11 +195,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "pending": recovery_result.pending,
                     "repaired": recovery_result.repaired,
                     "refused": recovery_result.refused,
+                    "diverged": recovery_result.diverged,
                 },
             }
             human = f"recovery complete; pending={recovery_result.pending}"
         elif args.command == "wal":
             wal_result = coordinator.inspect_wal()
+            return_code = 0 if wal_result.consistent else 1
             payload = {
                 "ok": True,
                 "wal": {
@@ -206,10 +211,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "pending_intents": wal_result.pending_intents,
                     "active_sessions": list(wal_result.active_sessions),
                     "active_claims": list(wal_result.active_claims),
+                    "divergences": [item.payload() for item in wal_result.divergences],
+                    "ref_locks": list(wal_result.ref_locks),
+                    "temp_indexes": [residue.payload() for residue in wal_result.temp_indexes],
                     "events": [_event_payload(event) for event in wal_result.events],
                 },
             }
             human = f"WAL {wal_result.head or '(empty)'}: {len(wal_result.events)} event(s)"
+            if wal_result.divergences:
+                human += f"; DIVERGED on {len(wal_result.divergences)} record(s)"
+            # Residue is not inconsistency -- a ref lock is held for milliseconds
+            # during every healthy append, so folding it into `consistent` would
+            # fail a sound repo whenever a peer happens to be writing. It still
+            # has to reach the human line: it is what makes the next land refuse.
+            if wal_result.ref_locks:
+                human += f"; {len(wal_result.ref_locks)} ref lock(s) held"
+            if wal_result.temp_indexes:
+                human += f"; {len(wal_result.temp_indexes)} temp index(es) present"
         elif args.command == "gc":
             gc_result = coordinator.gc(_actor(args.actor))
             payload = {
@@ -218,11 +236,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "event": gc_result.event,
                     "removed_claims": gc_result.removed_claims,
                     "removed_sessions": gc_result.removed_sessions,
+                    "removed_temp_indexes": gc_result.removed_temp_indexes,
                 },
             }
             human = (
                 f"gc removed {gc_result.removed_claims} claim(s), "
-                f"{gc_result.removed_sessions} session(s)"
+                f"{gc_result.removed_sessions} session(s), "
+                f"{gc_result.removed_temp_indexes} temp index(es)"
             )
         else:
             raise AssertionError("unreachable: subparser is required")

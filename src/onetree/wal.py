@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from onetree.errors import GitError, WalCorruptError
+from onetree.errors import GitError, RefCorruptError, WalCorruptError
 from onetree.git import Repository
 
 WAL_REF = "refs/onetree/wal"
@@ -145,8 +145,24 @@ class Wal:
         document = self._validate_document(value, oid=oid)
         return EventRecord(oid=oid, parents=parents, document=document)
 
+    def head(self) -> str | None:
+        """Resolve the WAL ref, reporting a non-commit ref as WAL corruption.
+
+        A ref that exists but is not a commit is the one shape that must never
+        read as "no WAL yet": that reading answers every claim question with a
+        clean bill of health over the corruption.
+        """
+
+        try:
+            return self.repo.resolve_ref(WAL_REF, missing_ok=True)
+        except RefCorruptError as error:
+            raise WalCorruptError(
+                f"{WAL_REF} is corrupt: {error}",
+                **error.details,
+            ) from error
+
     def read(self) -> WalSnapshot:
-        head = self.repo.resolve_ref(WAL_REF, missing_ok=True)
+        head = self.head()
         if head is None:
             return WalSnapshot(head=None, events=())
         # Traverse only the candidate chain. ``--parents`` still exposes every
@@ -221,7 +237,14 @@ class Wal:
         expected_head: str | None,
     ) -> tuple[EventRecord, ...] | None:
         new_head, records = self.build_chain(documents, expected_head)
-        if not self.repo.update_ref(WAL_REF, new_head, expected_head):
+        try:
+            won = self.repo.update_ref(WAL_REF, new_head, expected_head)
+        except RefCorruptError as error:
+            raise WalCorruptError(
+                f"{WAL_REF} is corrupt: {error}",
+                **error.details,
+            ) from error
+        if not won:
             return None
         return records
 

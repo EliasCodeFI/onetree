@@ -8,14 +8,16 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture
+from conftest import GitFixture, KillGit, install_kill_git
 
+from onetree import core
 from onetree.core import Coordinator
-from onetree.errors import LandingRefusedError
+from onetree.errors import LandingRefusedError, WalDivergedError
 
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
@@ -41,9 +43,9 @@ def _land_worker(root: str, actor: str, barrier: Any, results: Any) -> None:
     coordinator = Coordinator(Path(root))
     waited = False
 
-    def checkpoint(point: str) -> None:
+    def checkpoint(point: str, _context: Mapping[str, Any]) -> None:
         nonlocal waited
-        if point == "before_transaction" and not waited:
+        if point == "before_intent" and not waited:
             waited = True
             barrier.wait(timeout=10)
 
@@ -55,14 +57,33 @@ def _land_worker(root: str, actor: str, barrier: Any, results: Any) -> None:
         results.put({"actor": actor, "attempts": result.attempts, "commit": result.commit})
 
 
-def _kill_lander(root: str, actor: str, point_to_kill: str) -> None:
+def _crash_lander(root: str, actor: str, wrapper: str, environment: dict[str, str]) -> None:
+    install_kill_git(wrapper, environment)
+    Coordinator(Path(root)).land(actor, message="crash fixture")
+
+
+def _deordered_lander(root: str, actor: str) -> None:
     coordinator = Coordinator(Path(root))
 
-    def checkpoint(point: str) -> None:
-        if point == point_to_kill:
-            os.kill(os.getpid(), signal.SIGKILL)
+    def checkpoint(point: str, context: Mapping[str, Any]) -> None:
+        if point != "before_intent":
+            return
+        subprocess.run(
+            [
+                _GIT_EXECUTABLE,
+                "-C",
+                root,
+                "update-ref",
+                str(context["target"]),
+                str(context["candidate"]),
+                str(context["expected_head"]),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.kill(os.getpid(), signal.SIGKILL)
 
-    coordinator.land(actor, message="kill fixture", checkpoint=checkpoint)
+    coordinator.land(actor, message="de-ordered control", checkpoint=checkpoint)
 
 
 def _register_and_stage(
@@ -116,9 +137,9 @@ def test_inv2_release_between_audit_and_cas_breaks_fence_then_reclaim_allows(
     unsafe = git_repo.raw_commit(index, git_repo.base, "unsafe INV2")
     released = False
 
-    def release_at_fence(point: str) -> None:
+    def release_at_fence(point: str, _context: Mapping[str, Any]) -> None:
         nonlocal released
-        if point == "before_transaction" and not released:
+        if point == "before_intent" and not released:
             released = True
             coordinator.release("alpha", [str(git_repo.root / "a.txt")])
 
@@ -255,38 +276,102 @@ def test_inv5_stale_full_tree_has_foreign_hunk_but_overlay_is_exact_and_conflict
     assert git_repo.oid() == conflicting
 
 
-@pytest.mark.parametrize(
-    "kill_point",
-    ["after_audit", "after_tree", "before_transaction", "after_transaction"],
-)
-def test_inv7_kill_at_each_land_phase_recovers_to_consistent_refs(
+def test_inv2_session_death_between_audit_and_fence_refuses(
     git_repo: GitFixture,
-    kill_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The landing-moment liveness re-sample is the only thing that can catch this.
+
+    The session is alive when the top-of-loop audit reads it and dies before the
+    fence, so a refusal here can come from nowhere else. The unsafe control at
+    the end disables exactly that sub-term and lands a dead session's payload.
+    """
+
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("doomed", pid=sleeper.pid, ttl=300)
+    coordinator.claim("doomed", [str(git_repo.root / "a.txt")])
+    git_repo.write("a.txt", "fence payload\n")
+    git_repo.stage(session.index_path, "a.txt")
+
+    def kill_session(point: str, _context: Mapping[str, Any]) -> None:
+        if point == "before_intent" and sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait(timeout=5)
+
+    with pytest.raises(LandingRefusedError) as refused:
+        coordinator.land("doomed", checkpoint=kill_session)
+    assert refused.value.details["reason"] == "session_died_at_fence"
+    assert git_repo.oid() == git_repo.base
+    reasons = [
+        event.data.get("reason")
+        for event in coordinator.inspect_wal().events
+        if event.kind == "refused"
+    ]
+    assert reasons == ["session_died_at_fence"]
+
+    # RED control (mutation M1): with the landing-moment liveness sub-term
+    # force-disabled and only the expiry sub-term left, the same dead session
+    # lands its payload on the branch.
+    monkeypatch.setattr(
+        core,
+        "_session_alive",
+        lambda session, now: bool(session.expires_at > now),
+    )
+    unsafe = coordinator.land("doomed", message="M1 control")
+    assert git_repo.oid() == unsafe.commit
+    assert git_repo.git("show", f"{unsafe.commit}:a.txt").stdout == "fence payload\n"
+
+
+#: Every window in which SIGKILL can land during the write-ahead protocol's ref
+#: updates, with the recovery outcome each one must produce. ``nth``/``mode``
+#: select the matched invocation and whether its rename completed first.
+_CRASH_WINDOWS = [
+    pytest.param("refs/onetree/wal", 1, "before", 0, 0, id="intent-not-appended"),
+    pytest.param("refs/onetree/wal", 1, "after", 0, 1, id="intent-appended"),
+    pytest.param("refs/heads/main", 1, "before", 0, 1, id="branch-not-moved"),
+    pytest.param("refs/heads/main", 1, "after", 1, 0, id="branch-moved"),
+    pytest.param("refs/onetree/wal", 2, "before", 1, 0, id="landed-not-appended"),
+    pytest.param("refs/onetree/wal", 2, "after", 0, 0, id="landed-appended"),
+]
+
+
+@pytest.mark.parametrize(("reference", "nth", "mode", "repaired", "refused"), _CRASH_WINDOWS)
+def test_inv7_kill_inside_each_ref_update_recovers_to_consistent_refs(
+    git_repo: GitFixture,
+    kill_git: KillGit,
+    reference: str,
+    nth: int,
+    mode: str,
+    repaired: int,
+    refused: int,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
-    index = _register_and_stage(git_repo, coordinator, "alpha", "a.txt", "a1\n")
-
-    if kill_point == "after_audit":
-        # RED control: the old split-ref shape can expose the branch update with
-        # no corresponding WAL landing event.
-        unsafe = git_repo.raw_commit(index, git_repo.base, "unsafe split refs")
-        git_repo.git("update-ref", "refs/heads/main", unsafe, git_repo.base)
-        assert git_repo.oid() == unsafe
-        assert not any(event.kind == "landed" for event in coordinator.inspect_wal().events)
-        git_repo.git("update-ref", "refs/heads/main", git_repo.base, unsafe)
+    _register_and_stage(git_repo, coordinator, "alpha", "a.txt", "a1\n")
 
     context = multiprocessing.get_context("fork")
     process = context.Process(
-        target=_kill_lander,
-        args=(str(git_repo.root), "alpha", kill_point),
+        target=_crash_lander,
+        args=(
+            str(git_repo.root),
+            "alpha",
+            str(kill_git.executable),
+            kill_git.environment(reference, nth, mode),
+        ),
     )
     process.start()
-    process.join(timeout=10)
+    process.join(timeout=20)
     assert process.exitcode == -signal.SIGKILL
+
+    # The invariant the write-ahead order buys: no crash window can put a broker
+    # landing on the branch that the WAL has no record of.
+    assert coordinator.inspect_wal().divergences == ()
 
     recovery = coordinator.recover()
     assert recovery.consistent
     assert recovery.pending == 0
+    assert (recovery.repaired, recovery.refused) == (repaired, refused)
+
     if git_repo.oid() == git_repo.base:
         coordinator.land("alpha", message="recovered retry")
 
@@ -294,5 +379,45 @@ def test_inv7_kill_at_each_land_phase_recovers_to_consistent_refs(
     kinds = [event.kind for event in report.events]
     assert report.consistent
     assert report.pending_intents == 0
-    assert kinds.count("land_intent") == kinds.count("landed") == 1
+    assert report.divergences == ()
+    assert kinds.count("landed") == 1
+    assert git_repo.git("rev-list", "--count", f"{git_repo.base}..{git_repo.oid()}").stdout.strip()
     assert git_repo.git("show", f"{git_repo.oid()}:a.txt").stdout == "a1\n"
+
+
+def test_inv7_de_ordered_protocol_leaves_an_unrecorded_landing_that_is_detected(
+    git_repo: GitFixture,
+) -> None:
+    """RED control: move the branch before recording the intent, then die.
+
+    This is the shape Round A's two-ref transaction produced when SIGKILL fell
+    between Git's two loose-ref renames. The shipped order cannot reach it --
+    every window in the matrix above reports no divergence -- and when it is
+    reached anyway, inspection and recovery must both name it.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    _register_and_stage(git_repo, coordinator, "alpha", "a.txt", "a1\n")
+
+    context = multiprocessing.get_context("fork")
+    process = context.Process(target=_deordered_lander, args=(str(git_repo.root), "alpha"))
+    process.start()
+    process.join(timeout=20)
+    assert process.exitcode == -signal.SIGKILL
+
+    assert git_repo.oid() != git_repo.base
+    report = coordinator.inspect_wal()
+    assert report.pending_intents == 0
+    assert not report.consistent
+    assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
+    assert report.divergences[0].commit == git_repo.oid()
+
+    with pytest.raises(WalDivergedError) as diverged:
+        coordinator.recover()
+    assert diverged.value.details["divergences"][0]["kind"] == "unrecorded_landing"
+    recorded = [
+        event
+        for event in coordinator.inspect_wal().events
+        if event.kind == "refused" and event.data.get("reason") == "branch_diverged"
+    ]
+    assert len(recorded) == 1

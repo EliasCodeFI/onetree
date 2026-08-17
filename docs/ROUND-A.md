@@ -4,22 +4,37 @@ Round A implements the session/index, claim, WAL, payload-audit, and landing
 core described by `docs/DESIGN.md`. It does not implement the Round B train
 referee, branch-operation guards, or rejection-repair contract.
 
+Round AF corrected this record where adversarial verification measured it
+wrong. Corrections are marked inline below and collected, with the findings
+that produced them, in `docs/ROUND-AF.md`.
+
 ## Decisions where the design left freedom
 
-### One atomic visibility boundary
+### A write-ahead landing, not an atomic visibility boundary
 
-A landing builds two adjacent WAL commits, `land_intent` followed by `landed`,
-without moving a ref. Git then performs one `update-ref --stdin` transaction
-that compares and swaps both the target branch and `refs/onetree/wal`. A
-successful transaction exposes the candidate commit and both events together;
-a failed or killed transaction exposes none of them. The WAL CAS also acts as
-the claim fence: any release, reclamation, registration change, or unrelated
-WAL append invalidates the prepared transaction and forces a fresh audit.
+> Amended by Round AF. This section originally described one `update-ref
+> --stdin` transaction over the target branch and `refs/onetree/wal` as a
+> single atomic visibility boundary. It is not one: on the files ref backend
+> that transaction is two sequential loose-ref renames, and a crash between
+> them exposed a landing the WAL had no record of. `docs/ROUND-AF.md` records
+> the measurement and the replacement.
 
-Claim and session expiry/liveness are sampled again immediately before that
-transaction. There is necessarily no atomic primitive spanning a Git ref lock
-and the operating system's process table or wall clock; “landing moment” in
-Round A therefore means this final sample followed by the Git transaction.
+A landing is written ahead in three steps, each a single-ref compare-and-swap:
+`land_intent` is appended to `refs/onetree/wal`; the target branch is moved
+from the audited head to the candidate; `landed` is appended. Every crash
+window therefore leaves either a pending intent, which recovery completes or
+refuses, or a moved branch missing only its `landed` mark, which recovery
+appends. No window can expose a broker landing that the WAL does not record.
+
+The intent append is also the claim fence: any release, reclamation,
+registration change, or unrelated WAL append moves the WAL head, the append's
+CAS loses, and the attempt re-audits from scratch. Fence semantics are as
+originally documented; the primitive carrying them changed.
+
+Claim and session expiry/liveness are sampled again immediately before the
+intent append. There is necessarily no atomic primitive spanning a Git ref lock
+and the operating system's process table or wall clock; “landing moment”
+therefore means this final sample followed by the intent append.
 
 ### Exact payload replay on a moved head
 
@@ -56,7 +71,9 @@ incarnation, so release/re-register/reclaim cannot create an ABA-valid fence.
 ### Claim paths
 
 Claim and check inputs must be absolute, resolve to an existing filesystem
-entry, and resolve inside the repository. Stored paths are canonical
+entry, and resolve inside the repository but outside Git's own metadata —
+Round AF added the last of those, since `check .git/config` had answered
+`blocked:false` rather than refusing. Stored paths are canonical
 repository-relative POSIX paths. Directory claims cover descendants, and a
 batch claim is all-or-nothing. A conflict reports the current actor id in both
 the typed exception and JSON output. A deleted claimed path remains releasable
@@ -74,11 +91,14 @@ event, session, claim, and landing-operation identities refuse replay.
 WAL updates request a reflog explicitly, so prior ref heads remain locally
 visible even though custom refs do not receive a reflog from Git by default.
 
-Normal Round A landing cannot expose an unresolved intent because of the
-two-ref transaction. `wal --recover` also handles an intent exposed by an
-older implementation or manual fault injection: if its immutable candidate is
-already on the target's ancestry, recovery appends `landed`; otherwise it
-appends `refused`. Intervening WAL events do not prevent repair.
+An exposed, unresolved intent is a normal crash outcome under the write-ahead
+protocol, not a foreign one — the original claim that the two-ref transaction
+made it impossible rested on an atomicity that backend does not provide.
+`wal --recover` resolves it: if the immutable candidate is already on the
+target's ancestry, recovery appends `landed`; otherwise it appends `refused`.
+Intervening WAL events do not prevent repair. Recovery also compares the branch
+against the landed set in both directions, so a branch that moved without a WAL
+record is a typed, recorded refusal rather than an all-clear.
 
 Session index files and short-lived temporary indexes are Git metadata. All
 coordination history is in `refs/onetree/wal`; no coordination state file is
@@ -97,12 +117,12 @@ state against real isolated repositories.
 | Invariant | Known-bad state observed before/without the guard | Guarded refusal and allow evidence |
 | --- | --- | --- |
 | INV1 | Raw `write-tree` / `commit-tree` / `update-ref` landed `a.txt` and `b.txt` while only `a.txt` was claimed. | `test_inv1_unclaimed_payload_refuses_whole_land_then_claimed_payload_lands` refuses `b.txt`, leaves the branch unchanged, then lands both after the second claim. |
-| INV2 | A target-only CAS still succeeded after the claim was released. | `test_inv2_release_between_audit_and_cas_breaks_fence_then_reclaim_allows` moves the WAL during the final checkpoint, invalidates the prepared transaction, and lands only after reclaim. The dead-session and expiry-at-fence fixtures separately refuse those fence losses. |
+| INV2 | A target-only CAS still succeeded after the claim was released. | `test_inv2_release_between_audit_and_cas_breaks_fence_then_reclaim_allows` moves the WAL during the final checkpoint, invalidates the prepared attempt, and lands only after reclaim. *(Round AF correction: this row originally also claimed a dead-session fence fixture. Round A's dead-session test refused at the top-of-loop audit, not in the audit-to-fence window, and the landing-moment liveness sub-term was mutation-dead. `test_inv2_session_death_between_audit_and_fence_refuses` is that fixture, added in Round AF with its unsafe control; the expiry-at-fence fixture was and remains real.)* |
 | INV3 | Two real processes ran one-shot CAS updates from one expected head: one returned 0, one returned 128, and only one payload remained. | `test_inv3_real_race_has_one_first_attempt_winner_and_both_payloads_land` starts two broker processes at the same transaction barrier. One result reports one attempt, the loser reports at least two, both commits are ancestors of the final head, and both files survive. |
 | INV4 | Raw plumbing forced `refs/onetree/wal` to a merge-shaped event commit. | `test_inv4_malformed_non_linear_wal_refuses_and_valid_append_is_linear` observes replay refusal, restores the prior immutable event, appends normally, and verifies the exact parent chain and original blob bytes. |
 | INV5 | Naively re-parenting a stale session tree made the candidate diff contain both the intended `a.txt` change and a foreign `b.txt` reversion. | `test_inv5_stale_full_tree_has_foreign_hunk_but_overlay_is_exact_and_conflict_refuses` lands an overlay whose diff is only `a.txt`, preserves `b.txt`, and separately refuses an intervening same-path change. |
-| INV6 | Resolving a relative nonexistent path manufactured an absolute-looking key with an empty holder/warning result—the measured reference defect. | `test_inv6_invalid_paths_refuse_and_conflicts_name_holder` gets typed `relative`, `nonexistent`, and `outside_repository` errors; an absolute existing path is allowed, and a live conflict names `alpha`. |
-| INV7 | A split target/WAL sequence exposed a moved branch with no `landed` event. | `test_inv7_kill_at_each_land_phase_recovers_to_consistent_refs` sends real `SIGKILL` after audit, after tree construction, before the transaction, and after it. Replay always sees both refs moved or neither, reports no pending intent, and an eventual retry contains the payload. Exposed-intent fixtures also exercise both repair outcomes. |
+| INV6 | Resolving a relative nonexistent path manufactured an absolute-looking key with an empty holder/warning result—the measured reference defect. Round AF added the `.git`-internal case, which had been accepted rather than refused. | `test_inv6_invalid_paths_refuse_and_conflicts_name_holder` gets typed `relative`, `nonexistent`, and `outside_repository` errors; an absolute existing path is allowed, and a live conflict names `alpha`. `test_git_internal_paths_are_a_typed_refusal_not_a_silent_allow` covers `git_internal`, with a gitlink and a `--separate-git-dir` repository separating its two arms. |
+| INV7 | A de-ordered protocol (branch moved before its intent exists) leaves a landing the WAL has no record of; `test_inv7_de_ordered_protocol_leaves_an_unrecorded_landing_that_is_detected` reproduces it and observes the detection. | `test_inv7_kill_inside_each_ref_update_recovers_to_consistent_refs` sends real `SIGKILL` *inside the git subprocess*, across all six crash windows of the write-ahead protocol, asserting the lander died of the signal. Replay reports no divergence in every window, recovery repairs or refuses as tabulated in `docs/ROUND-AF.md`, and an eventual retry contains the payload. *(Round AF correction: this row originally described four Python-checkpoint kills, which passed unchanged against a fully de-atomized transaction — the fixture was insensitive to the guard it documented.)* |
 
 ## CLI surface
 
@@ -118,7 +138,10 @@ against that private index or a short-lived index below `.git/onetree/tmp`.
 
 ## Local verification
 
-The final pre-handoff suite on 2026-08-17 used Python 3.14.4 and Git 2.53.0.
-It completed 53 tests in 7.19 seconds with 91.01% branch coverage. The required
-`ruff check src tests`, `mypy`, and `pytest` gates were green. These are local
-observations, not broader performance claims.
+The Round A pre-handoff suite on 2026-08-17 used Python 3.14.4 and Git 2.53.0.
+It completed 53 tests in 7.19 seconds with 91.01% branch coverage, and the
+required `ruff check src tests`, `mypy`, and `pytest` gates were green — which
+is the point of the corrections above: green gates were compatible with the
+defects Round AF closed. After Round AF the same gates are green over 92 tests
+with 93.46% branch coverage. These are local observations, not broader
+performance claims.
