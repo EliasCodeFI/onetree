@@ -8,11 +8,11 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from onetree.errors import GitError, RefCorruptError, RefLockedError
+from onetree.errors import GitError, RefCorruptError, RefLockedError, UnsupportedWorktreeError
 from onetree.proc import process_tag
 
 _GIT_EXECUTABLE = shutil.which("git")
@@ -25,12 +25,6 @@ _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
-#: Upper bound on one page of the history walk that looks for unrecorded broker
-#: commits. A complete audit may consume more than one page; this bounds each
-#: Git result, not the amount of honest history the repository may accumulate.
-DIVERGENCE_SCAN_LIMIT = 4096
-
-
 @dataclass(frozen=True, order=True)
 class TreeEntry:
     """One recursive tree entry relevant to a payload audit."""
@@ -63,20 +57,6 @@ class MarkedCommit:
 
 
 @dataclass(frozen=True)
-class TrailerScan:
-    """The result of one branch-side trailer walk, and whether it was complete.
-
-    ``truncated`` is the difference between "no unrecorded landing is on this
-    branch" and "the walk stopped before it could tell", which is the whole
-    value of scanning at all.
-    """
-
-    commits: tuple[MarkedCommit, ...]
-    truncated: bool
-    limit: int
-
-
-@dataclass(frozen=True)
 class GitResult:
     """Captured output from one non-raising Git call."""
 
@@ -102,6 +82,17 @@ class Repository:
         self.root = Path(root_text).resolve()
         git_dir_text = self.git_text("rev-parse", "--absolute-git-dir")
         self.git_dir = Path(git_dir_text).resolve()
+        common_dir_text = self.git_text("rev-parse", "--git-common-dir")
+        common_candidate = Path(common_dir_text)
+        self.common_git_dir = (
+            common_candidate if common_candidate.is_absolute() else self.root / common_candidate
+        ).resolve()
+        if self.git_dir != self.common_git_dir:
+            raise UnsupportedWorktreeError(
+                "linked Git worktrees are unsupported in Gate 1; use the primary working tree",
+                git_dir=str(self.git_dir),
+                common_git_dir=str(self.common_git_dir),
+            )
         object_format = self.git_text("rev-parse", "--show-object-format")
         if object_format not in {"sha1", "sha256"}:
             raise GitError("unsupported Git object format", object_format=object_format)
@@ -241,20 +232,19 @@ class Repository:
         empty stderr: a ref file that is ``chmod 000`` and a ref path that is a
         directory both come back indistinguishable from absent (measured on Git
         2.53.0). Matching the message text therefore cannot carry the
-        distinction, so it is taken from the active ref backend directly. A
-        backend-wide table must be readable before reftable can answer that one
-        name is absent.
+        distinction, so it is taken from the active ref backend directly. On
+        reftable, only a stable empty ``tables.list`` carries a separate
+        decision: nonempty table contents are Git's responsibility, and a
+        concurrent replacement is ordinary ref traffic rather than corruption.
         """
 
         if self.ref_format == "reftable":
             existence = self.git("show-ref", "--exists", reference, check=False)
             if existence.returncode == 2:
-                # "No table names this ref" is an answer about the tables, so it
-                # is only worth as much as they are. A tables.list truncated to
-                # zero bytes produces exactly this status while the ref's bytes
-                # sit in the orphaned *.ref tables beside it -- and Git's own
-                # fsck and refs-verify both bless that repository. Absent is
-                # therefore taken from storage here too, not from the status.
+                # A zero-byte tables.list produces this status while the ref's
+                # bytes sit in orphaned *.ref tables beside it. That stable
+                # sentinel is checked below; concurrent list replacement is
+                # retried by resolve_ref rather than treated as corruption.
                 return self._reftable_storage_state()
             if existence.returncode == 0:
                 return "reftable names the ref but Git cannot resolve it"
@@ -292,50 +282,22 @@ class Repository:
         return None
 
     def _reftable_storage_state(self) -> str | None:
-        """Why reftable cannot decide a ref, or None when its tables are readable.
+        """Return the one storage fact reftable absence needs from us.
 
-        This is what the absent answer rests on, not only what names a refusal:
-        every shape below turns "Git found no table naming this ref" into a
-        refusal, because none of them is a state a healthy repository is ever
-        found in.
+        Git decides whether a nonempty table set names a ref. The broker only
+        adds the stable zero-byte sentinel: Git 2.53.0 writes a nonempty
+        ``tables.list`` at init and replaces it atomically thereafter. Parsing
+        names, opening listed tables, or comparing two valid list snapshots
+        would turn compaction and ordinary writes into false corruption.
         """
 
-        directory = self.git_path("reftable")
+        table_list = self.git_path("reftable") / "tables.list"
         try:
-            status = directory.lstat()
-        except OSError as error:
-            return f"the reftable directory cannot be examined: {error.strerror}"
-        if not stat.S_ISDIR(status.st_mode):
-            return "the reftable path is not a directory"
-        table_list = directory / "tables.list"
-        try:
-            first = table_list.read_bytes()
+            contents = table_list.read_bytes()
         except OSError as error:
             return f"reftable tables.list cannot be read: {error.strerror}"
-        try:
-            names = first.decode("utf-8", errors="strict").splitlines()
-        except UnicodeDecodeError:
-            return "reftable tables.list is not UTF-8"
-        if not names:
-            # `git init --ref-format=reftable` writes a non-empty list before it
-            # returns, and every later write replaces it by rename, so no table
-            # list is ever legitimately empty -- not even transiently.
+        if not contents:
             return "reftable tables.list is empty"
-        for name in names:
-            candidate = Path(name)
-            if not name or candidate.name != name or not name.endswith(".ref"):
-                return "reftable tables.list names an invalid table"
-            try:
-                with (directory / candidate).open("rb") as handle:
-                    handle.read(1)
-            except OSError as error:
-                return f"reftable table {name} cannot be read: {error.strerror}"
-        try:
-            second = table_list.read_bytes()
-        except OSError as error:
-            return f"reftable tables.list cannot be re-read: {error.strerror}"
-        if second != first:
-            return "reftable tables.list changed while it was examined"
         return None
 
     def resolve_ref(self, reference: str, *, missing_ok: bool = False) -> str | None:
@@ -367,11 +329,14 @@ class Repository:
                 oid=stored,
                 object_type=self.object_type(stored),
             )
-        unreadable = self.ref_storage_state(reference)
-        if unreadable is not None:
+        storage_error = self.ref_storage_state(reference)
+        if storage_error is not None or self.ref_format == "reftable":
             # Storage was observed after both Git probes. A peer may have
             # created or deleted the ref in that window, so classify only after
-            # one fresh pair of probes and one fresh storage observation.
+            # one fresh pair of probes and one fresh storage observation. The
+            # reftable absent arm always takes this retry: a nonempty
+            # tables.list can be atomically replaced by a healthy peer between
+            # the first probes and this observation.
             retry = self._rev_parse(f"{reference}^{{commit}}")
             if retry.returncode == 0:
                 try:
@@ -393,14 +358,14 @@ class Repository:
                     oid=stored,
                     object_type=self.object_type(stored),
                 )
-            unreadable = self.ref_storage_state(reference)
-            if unreadable is not None:
+            storage_error = self.ref_storage_state(reference)
+            if storage_error is not None:
                 raise RefCorruptError(
-                    f"{reference} cannot be read: {unreadable}",
+                    f"{reference} cannot be read: {storage_error}",
                     reference=reference,
                     oid=None,
                     object_type=None,
-                    reason=unreadable,
+                    reason=storage_error,
                 )
         if missing_ok:
             return None
@@ -611,24 +576,29 @@ class Repository:
             paths.append(self.ref_lock_path("HEAD"))
         return tuple(dict.fromkeys(paths))
 
-    def _reapplied(self, new: str, observed: str | None) -> bool:
+    def _reapplied(self, old: str | None, new: str, observed: str | None) -> bool:
         """Did this invocation's own update land before its exit status was lost?
 
         ``git update-ref`` commits a single-ref update with one rename and then
         still has work to do before it exits. A death in that window -- an OOM
-        kill, a SIGKILL -- returns a non-zero status over a rename that already
-        applied, and the ref is then left holding the very OID this call was
-        writing.
+        kill, a SIGKILL, or merely a lost status after Git completed -- returns
+        a non-zero status over a rename that already applied. A peer may append
+        ordinary commits before this process re-reads the ref, so the candidate
+        need not still be its tip.
 
         That is not a race any peer can win. A broker candidate carries this
         operation's and this intent's UUIDs in its commit trailer, and a WAL
         append carries a fresh event id, so no other process can produce the OID
         being written here. Observing it on the ref therefore means this
-        invocation succeeded and only its report was lost. Every other value is
-        somebody else's write and remains a genuine CAS loss.
+        invocation succeeded and only its report was lost. A no-op CAS is not
+        a reapplied write even when its old value remains an ancestor of the
+        moved target. Every other value is somebody else's write and remains a
+        genuine CAS loss.
         """
 
-        return observed == new
+        if observed is None or new == old:
+            return False
+        return observed == new or self.is_ancestor(new, observed)
 
     def update_ref(self, reference: str, new: str, old: str | None) -> bool:
         """Compare-and-swap one ref; True on win, False only on a genuine CAS loss.
@@ -666,7 +636,7 @@ class Repository:
             # reporting itself reapplied.
             observed = self.resolve_ref(reference, missing_ok=True)
             if observed != old:
-                return self._reapplied(new, observed)
+                return self._reapplied(old, new, observed)
             detail = result.stderr.decode("utf-8", errors="replace").strip()
             held = tuple(lock for lock in candidates if lock.exists())
             contended = contended or bool(held)
@@ -709,42 +679,130 @@ class Repository:
         self,
         target: str,
         excludes: Sequence[str] = (),
-        *,
-        limit: int | None = None,
-        skip: int = 0,
-    ) -> TrailerScan:
-        """List commits on ``target`` above ``excludes`` and their landing trailer.
+    ) -> Iterator[MarkedCommit]:
+        """Stream every marked commit on a stable target in one Git walk.
 
-        One record more than the cap is requested so a walk that reached the cap
-        is distinguishable from one that ran out of history: the caller has to
-        be able to say "the audit was cut short" instead of "the branch is
-        clean". ``limit`` is read from the module constant at call time so a
-        fixture can shrink the window without rebuilding thousands of commits.
+        The former ``--skip`` pagination restarted ``git log`` from ``target``
+        for every page, making an otherwise linear audit quadratic in branch
+        depth. One process emits the identical record format incrementally, so
+        the Git walk and the parser both retain only a bounded buffer.
         """
 
-        bound = DIVERGENCE_SCAN_LIMIT if limit is None else limit
-        arguments = [
+        arguments = (
             "log",
-            f"--max-count={bound + 1}",
-            f"--skip={skip}",
             "--format=%H%x1f%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)%x1e",
             target,
             *(f"^{oid}" for oid in excludes),
             "--",
-        ]
-        output = self.git(*arguments).stdout
-        commits: list[MarkedCommit] = []
-        for raw_record in output.split(b"\x1e"):
-            record = raw_record.strip()
-            if not record:
-                continue
-            try:
-                text = record.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as error:
-                raise GitError("commit listing is not UTF-8", reference=target) from error
-            oid, separator, trailer = text.partition("\x1f")
-            if not separator:
-                raise GitError("malformed commit listing record", reference=target)
-            operation = trailer.strip() or None
-            commits.append(MarkedCommit(self.validate_oid(oid.strip(), label="target"), operation))
-        return TrailerScan(tuple(commits[:bound]), len(commits) > bound, bound)
+        )
+        try:
+            if _GIT_EXECUTABLE is None:
+                raise OSError("git executable was not found on PATH")
+            process = subprocess.Popen(  # noqa: S603 - argv-only Git plumbing
+                [_GIT_EXECUTABLE, "-C", str(self.root), *arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self._environment(),
+            )
+        except OSError as error:
+            raise GitError("could not execute git: " + str(error), operation="log") from error
+
+        if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE is explicit
+            process.kill()
+            process.wait()
+            raise GitError("could not capture git log output", operation="log")
+
+        buffer = b""
+        returncode: int | None = None
+        stderr = b""
+        try:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\x1e" in buffer:
+                    raw_record, _, buffer = buffer.partition(b"\x1e")
+                    marked = self._parse_marked_commit(raw_record, target)
+                    if marked is not None:
+                        yield marked
+            if buffer.strip():
+                marked = self._parse_marked_commit(buffer, target)
+                if marked is not None:
+                    yield marked
+            returncode = process.wait()
+            stderr = process.stderr.read()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if returncode is None:
+                stderr = process.stderr.read()
+        if returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(
+                f"git log failed with exit {returncode}: {detail}",
+                operation="log",
+                returncode=returncode,
+            )
+
+    def _parse_marked_commit(self, raw_record: bytes, target: str) -> MarkedCommit | None:
+        record = raw_record.strip()
+        if not record:
+            return None
+        try:
+            text = record.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise GitError("commit listing is not UTF-8", reference=target) from error
+        oid, separator, trailer = text.partition("\x1f")
+        if not separator:
+            raise GitError("malformed commit listing record", reference=target)
+        operation = trailer.strip() or None
+        return MarkedCommit(self.validate_oid(oid.strip(), label="target"), operation)
+
+    def first_marked_commit(self, target: str) -> str | None:
+        """Return one broker-marked commit on ``target``, if history has one."""
+
+        result = self.git(
+            "log",
+            "--format=%H",
+            "--max-count=1",
+            "--fixed-strings",
+            "--grep=Onetree-Operation:",
+            target,
+            "--",
+        )
+        raw = result.stdout.strip()
+        if not raw:
+            return None
+        try:
+            oid = raw.decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise GitError("marked commit ID is not ASCII", reference=target) from error
+        return self.validate_oid(oid, label="marked commit")
+
+    def fetch_wal(self, remote: str = "origin") -> None:
+        """Fetch only the WAL ref, never an implicit remote branch update."""
+
+        self.git(
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            remote,
+            "refs/onetree/wal:refs/onetree/wal",
+        )
+
+    def has_remote(self, remote: str) -> bool:
+        """Whether ``remote`` is configured without treating a missing one as Git failure."""
+
+        result = self.git("config", "--get", f"remote.{remote}.url", check=False)
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+        if result.returncode == 1:
+            return False
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise GitError(
+            f"cannot inspect remote {remote}: {detail}",
+            operation="config",
+            remote=remote,
+        )

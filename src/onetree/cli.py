@@ -69,7 +69,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     wal = subparsers.add_parser("wal", help="Verify and inspect refs/onetree/wal.")
     _add_repo(wal)
-    wal.add_argument("--recover", action="store_true", help="Resolve any exposed intent.")
+    wal_action = wal.add_mutually_exclusive_group()
+    wal_action.add_argument("--recover", action="store_true", help="Resolve any exposed intent.")
+    wal_action.add_argument(
+        "--repair",
+        action="store_true",
+        help="Fetch a WAL ref omitted by a default git clone, then re-inspect.",
+    )
     _add_output(wal)
 
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")
@@ -189,6 +195,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             human = f"landed {land_result.commit} on {land_result.target}"
             if land_result.warnings:
                 human += f" [warning: {', '.join(land_result.warnings)}]"
+        elif args.command == "wal" and args.repair:
+            wal_result = coordinator.repair_wal_history()
+            return_code = 0 if wal_result.consistent else 1
+            payload = {
+                "ok": wal_result.consistent,
+                "repair": {
+                    "ref": "refs/onetree/wal",
+                    "head": wal_result.head,
+                    "consistent": wal_result.consistent,
+                    "pending_intents": wal_result.pending_intents,
+                    "divergences": [item.payload() for item in wal_result.divergences],
+                },
+            }
+            human = (
+                f"WAL repair fetched refs/onetree/wal: "
+                f"{'consistent' if wal_result.consistent else 'INCONSISTENT'}"
+            )
         elif args.command == "wal" and args.recover:
             # Exit codes differ between the two `wal` modes on purpose. Inspection
             # is a report: 1 means "I looked and the state is not clean", the way

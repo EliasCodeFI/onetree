@@ -26,6 +26,7 @@ from onetree.errors import (
     WalAppendRefusedError,
     WalCorruptError,
     WalDivergedError,
+    WalHistoryMissingError,
 )
 from onetree.git import MarkedCommit, Repository, TempIndex, TreeEntry
 from onetree.proc import process_alive as _pid_alive
@@ -371,6 +372,48 @@ class Coordinator:
     def __init__(self, repository: Path | str) -> None:
         self.repo = Repository(repository)
         self.wal = Wal(self.repo)
+
+    def _missing_wal_history(self, snapshot: WalSnapshot) -> Divergence | None:
+        """Name the default-clone shape before a new WAL event can adopt it."""
+
+        if snapshot.head is not None:
+            return None
+        # A local crash before the first WAL write produces the same branch
+        # marker with no WAL, and AF4 deliberately audits that state after the
+        # first registration. The ordinary clone shape is distinguishable: its
+        # default ``origin`` retains the missing WAL ref while the clone fetched
+        # only branches. Quarantine that state without suppressing local crash
+        # detection.
+        if not self.repo.has_remote("origin"):
+            return None
+        target = self.repo.symbolic_head()
+        if target is None:
+            return None
+        commit = self.repo.first_marked_commit(target)
+        if commit is None:
+            return None
+        return Divergence(
+            "wal_history_missing",
+            target,
+            "the branch contains broker landings but refs/onetree/wal is absent; "
+            "a default git clone does not fetch that ref",
+            commit=commit,
+        )
+
+    def _read_wal(self) -> WalSnapshot:
+        """Read only a WAL whose absence cannot silently adopt broker history."""
+
+        snapshot = self.wal.read()
+        missing = self._missing_wal_history(snapshot)
+        if missing is not None:
+            raise WalHistoryMissingError(
+                "the branch contains broker history but refs/onetree/wal is missing; "
+                "run `onetree wal --repair` before mutating",
+                target=missing.target,
+                commit=missing.commit,
+                repair="onetree wal --repair",
+            )
+        return snapshot
 
     def _canonical_path(self, raw_path: str) -> str:
         candidate = Path(raw_path).expanduser()
@@ -725,7 +768,7 @@ class Coordinator:
             },
         )
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             existing = self._active_session(state, actor, time.time())
             if existing is not None:
@@ -769,7 +812,7 @@ class Coordinator:
             raise InvalidPathError("at least one claim path is required", reason="empty")
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             session = self._active_session(state, actor, now)
             if session is None:
@@ -836,7 +879,7 @@ class Coordinator:
     def check(self, actor: str, path: str) -> CheckResult:
         actor = _validate_actor(actor)
         canonical = self._canonical_path(path)
-        state = self._fold(self.wal.read())
+        state = self._fold(self._read_wal())
         relevant = tuple(
             claim for claim in state.active_claims(time.time()) if _overlaps(claim.path, canonical)
         )
@@ -849,7 +892,7 @@ class Coordinator:
         canonical = tuple(sorted({self._canonical_path(path) for path in paths}))
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             if self._active_session(state, actor, now) is None:
                 raise IdentityError("session is not active", session=actor)
@@ -938,7 +981,7 @@ class Coordinator:
         """CAS-append one prepared document, re-reading the head on every loss."""
 
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             records = self._try_append(self._fold(snapshot), snapshot, (document,))
             if records is not None:
                 return records[0]
@@ -970,11 +1013,12 @@ class Coordinator:
         window between the rename that applies the update and the exit status
         that reports it: the branch moved, this process is still alive, and it
         is holding a failure over its own success. That third state is named
-        where it happens, by ``Repository._reapplied`` -- the ref holding this
-        call's own candidate is a win whose report was lost, not a lost race.
-        Reading it as a lost race refuses an intent whose candidate is on the
-        branch, and nothing retires a ``refused`` event, so the WAL stays
-        diverged on ``refused_candidate_on_target`` forever over correct data.
+        where it happens, by ``Repository._reapplied`` -- a target that
+        contains this call's own candidate is a win whose report was lost, even
+        if ordinary commits have advanced its tip. Reading it as a lost race
+        refuses an intent whose candidate is on the branch, and nothing retires
+        a ``refused`` event, so the WAL stays diverged on
+        ``refused_candidate_on_target`` forever over correct data.
         """
 
         actor = _validate_actor(actor)
@@ -984,7 +1028,7 @@ class Coordinator:
         attempts = 0
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             # A landing operation is one attempt. Retries mint a new id so the
             # WAL keeps every attempt's intent and its terminal event distinct.
@@ -1316,7 +1360,7 @@ class Coordinator:
     def _landing_recorded(self, operation: str, document: Mapping[str, Any]) -> bool:
         """Is this exact landing already recorded, field for field, by someone else?"""
 
-        recorded = self._fold(self.wal.read()).landed_operations.get(operation)
+        recorded = self._fold(self._read_wal()).landed_operations.get(operation)
         if recorded is None:
             return False
         return all(
@@ -1438,17 +1482,9 @@ class Coordinator:
         head: str,
         excludes: Sequence[str],
     ) -> Iterator[MarkedCommit]:
-        """Read a stable branch head in bounded pages until its audit is complete."""
+        """Read one stable branch head in one complete streamed history walk."""
 
-        skip = 0
-        while True:
-            page = self.repo.marked_commits(head, excludes, skip=skip)
-            yield from page.commits
-            if not page.truncated:
-                return
-            if not page.commits:
-                raise GitError("branch audit page made no progress", reference=head, skip=skip)
-            skip += len(page.commits)
+        yield from self.repo.marked_commits(head, excludes)
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
         """History the branch-side audit may skip: none of it.
@@ -1467,18 +1503,32 @@ class Coordinator:
         Retreating to the honest boundary is not available either: lead (c)
         settled that the commit below the WAL's first sighting of a branch is in
         scope, and that is precisely the history a first-sight floor drops. What
-        is left is the empty floor. Pagination already bounds each Git result,
-        so a complete walk costs pages rather than correctness.
+        is left is the empty floor. The history walk is one streamed Git process,
+        so a complete walk costs linear traversal rather than repeated pages.
 
-        The accepted consequence is recorded in docs/ROUND-AF4.md: a repository
-        holding broker landings from a WAL it does not have reports them as
-        unrecorded. That answer is true -- this WAL does not account for them.
+        A repository holding broker landings from a WAL it does not have is not
+        allowed to append a new event and thereby adopt that history. The
+        preflight in ``_read_wal`` names the ordinary ``git clone`` case and the
+        CLI exposes an explicit fetch-only repair path.
         """
 
         return ()
 
     def inspect_wal(self) -> WalReport:
         snapshot = self.wal.read()
+        missing = self._missing_wal_history(snapshot)
+        if missing is not None:
+            return WalReport(
+                snapshot.head,
+                snapshot.events,
+                False,
+                0,
+                (),
+                (),
+                (missing,),
+                (),
+                self.repo.temp_indexes(),
+            )
         state = self._fold(snapshot)
         self._verify_landed(state)
         divergences = self._divergences(state)
@@ -1499,6 +1549,19 @@ class Coordinator:
             locks,
             self.repo.temp_indexes(),
         )
+
+    def repair_wal_history(self) -> WalReport:
+        """Fetch the missing WAL ref explicitly, then inspect the repaired view."""
+
+        snapshot = self.wal.read()
+        missing = self._missing_wal_history(snapshot)
+        if missing is None:
+            raise WalHistoryMissingError(
+                "there is no missing WAL history to repair",
+                repair="onetree wal --repair",
+            )
+        self.repo.fetch_wal()
+        return self.inspect_wal()
 
     def _held_locks(self, state: _FoldedState) -> tuple[str, ...]:
         """Every ref lock, WAL and target, that will refuse the next write."""
@@ -1613,7 +1676,7 @@ class Coordinator:
         repaired = 0
         refused = 0
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             documents, batch_repaired, batch_refused, in_flight = self._recovery_documents(
                 state, time.time()
@@ -1679,7 +1742,7 @@ class Coordinator:
     def gc(self, actor: str) -> GcResult:
         actor = _validate_actor(actor)
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self._read_wal()
             state = self._fold(snapshot)
             now = time.time()
             abandoned = self._abandoned_temp_indexes()

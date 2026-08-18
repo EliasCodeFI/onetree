@@ -15,7 +15,8 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+import threading
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +33,11 @@ from onetree.errors import (
     RefCorruptError,
     RefLockedError,
     ReleaseRefusedError,
+    UnsupportedWorktreeError,
     WalAppendRefusedError,
     WalCorruptError,
     WalDivergedError,
+    WalHistoryMissingError,
 )
 from onetree.git import Repository
 from onetree.proc import process_alive, process_start
@@ -572,17 +575,14 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
 
 def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
     git_repo: GitFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A page boundary bounds one Git result, never the audit's correctness."""
+    """A deep unrecorded landing remains visible in the complete stream."""
 
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
     for index in range(3):
         git_repo.external_commit("b.txt", f"hand {index}\n", f"hand commit {index}")
-    monkeypatch.setattr(git_module, "DIVERGENCE_SCAN_LIMIT", 2)
-
     report = coordinator.inspect_wal()
     kinds = [item.kind for item in report.divergences]
     assert kinds == ["unrecorded_landing"]
@@ -591,7 +591,7 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
     with pytest.raises(WalDivergedError):
         coordinator.recover()
 
-    # The marked commit is below the first page and really is on the target.
+    # The marked commit is below the ordinary hand history and really is on the target.
     assert git_repo.git(
         "merge-base", "--is-ancestor", unrecorded, git_repo.oid(), check=False
     ).returncode == 0
@@ -605,7 +605,7 @@ def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
     _advance_with_ordinary_commits(
         coordinator,
         git_repo.base,
-        git_module.DIVERGENCE_SCAN_LIMIT + 4,
+        4_100,
     )
 
     assert coordinator.inspect_wal().consistent
@@ -1243,6 +1243,7 @@ def _arm_kill_git(
     reference: str,
     nth: int,
     mode: str,
+    hand_commits: int = 0,
 ) -> None:
     """Point this process's Git layer at the shim, reversibly.
 
@@ -1252,7 +1253,9 @@ def _arm_kill_git(
     every mutation has to be undone afterwards.
     """
 
-    for name, value in kill_git.environment(reference, nth, mode).items():
+    for name, value in kill_git.environment(
+        reference, nth, mode, hand_commits=hand_commits
+    ).items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("PATH", f"{kill_git.executable.parent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", str(kill_git.executable))
@@ -1355,7 +1358,11 @@ def test_the_shipped_cas_reading_turns_that_death_into_a_false_payload_conflict(
     coordinator = Coordinator(git_repo.root)
     session = _register(coordinator, git_repo, "alpha", "a.txt")
     _stage(git_repo, session, "a.txt", "killed mid update-ref\n")
-    monkeypatch.setattr(Repository, "_reapplied", lambda _self, _new, _observed: False)
+    monkeypatch.setattr(
+        Repository,
+        "_reapplied",
+        lambda _self, _old, _new, _observed: False,
+    )
     _arm_kill_git(
         monkeypatch, kill_git, reference="refs/heads/main", nth=1, mode="self_after"
     )
@@ -1417,13 +1424,12 @@ def test_a_crash_left_landing_is_found_under_any_number_of_hand_commits(
 def test_page_boundaries_never_drop_the_commit_they_land_on(
     git_repo: GitFixture,
     hand_commits: int,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contiguity across ``--skip`` pages, swept over every boundary offset.
+    """Contiguity across the former page offsets, swept through one stream.
 
-    With a page size of two the walk crosses a boundary after rows 2, 4 and 6,
-    so a seam that double-counted or skipped one row would lose the marked
-    commit at exactly one of these offsets and report a clean branch.
+    AF4's offsets 1--6 remain the compact regression sweep. The implementation
+    no longer emits ``--skip`` pages, but a stream parser seam that dropped or
+    duplicated a record would still lose the marked commit at one of them.
     """
 
     coordinator = Coordinator(git_repo.root)
@@ -1431,8 +1437,6 @@ def test_page_boundaries_never_drop_the_commit_they_land_on(
     unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
     for index in range(hand_commits):
         git_repo.external_commit("b.txt", f"hand {index}\n", f"hand commit {index}")
-    monkeypatch.setattr(git_module, "DIVERGENCE_SCAN_LIMIT", 2)
-
     report = coordinator.inspect_wal()
     assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
     assert report.divergences[0].commit == unrecorded
@@ -1671,3 +1675,248 @@ def test_land_warnings_reach_both_cli_output_modes(
     code, human, err = _cli("land", "--repo", str(git_repo.root), "--session", "beta")
     assert (code, err) == (0, "")
     assert human.rstrip("\n").endswith(f"[warning: {core_module.DEGRADED_LIVENESS}]")
+
+
+# --------------------------------------------------------------------------
+# Round AF5 -- predicates sized to the defect, not the old fixture
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+@pytest.mark.parametrize("hand_commits", [0, 1, 3])
+def test_a_status_lost_branch_cas_stays_a_win_above_any_hand_commits(
+    tmp_path: Path,
+    ref_format: str,
+    hand_commits: int,
+    kill_git: KillGit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate is on its target when the target contains it, not just at its tip."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "status lost above candidate\n")
+    _arm_kill_git(
+        monkeypatch,
+        kill_git,
+        reference="refs/heads/main",
+        nth=1,
+        mode="self_after_hand_commits",
+        hand_commits=hand_commits,
+    )
+
+    result = coordinator.land("alpha", message="status lost above candidate")
+
+    assert git_repo.git(
+        "merge-base", "--is-ancestor", result.commit, "refs/heads/main", check=False
+    ).returncode == 0
+    assert git_repo.git("show", f"{result.commit}:a.txt").stdout == "status lost above candidate\n"
+    events = coordinator.wal.read().events
+    assert [event.kind for event in events if event.kind == "land_intent"]
+    assert [event.data.get("reason") for event in events if event.kind == "refused"] == []
+    assert coordinator.inspect_wal().consistent
+    assert coordinator.recover().consistent
+
+
+def test_a_status_lost_wal_intent_append_is_not_retried_under_a_new_operation(
+    git_repo: GitFixture,
+    kill_git: KillGit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The WAL append uses the same lost-status predicate as the branch CAS."""
+
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "lost WAL intent status\n")
+    _arm_kill_git(
+        monkeypatch, kill_git, reference=WAL_REF, nth=1, mode="self_after"
+    )
+
+    result = coordinator.land("alpha", message="lost WAL intent status")
+
+    report = coordinator.inspect_wal()
+    intents = [event for event in report.events if event.kind == "land_intent"]
+    landed = [event for event in report.events if event.kind == "landed"]
+    assert [event.data["operation"] for event in intents] == [result.operation]
+    assert [event.data["operation"] for event in landed] == [result.operation]
+    assert report.pending_intents == 0
+    assert report.consistent
+    assert coordinator.recover().consistent
+
+
+def test_reftable_table_replacement_during_an_absent_probe_is_not_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid concurrent ``tables.list`` replacements are traffic, not damage."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, "reftable")
+    repository = Repository(git_repo.root)
+    table_list = repository.git_dir / "reftable" / "tables.list"
+    original_read_bytes = Path.read_bytes
+    original = original_read_bytes(table_list)
+    reads = 0
+
+    def changing_read_bytes(path: Path) -> bytes:
+        nonlocal reads
+        if path == table_list:
+            reads += 1
+            return original if reads % 2 else original + b"\n"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read_bytes)
+
+    assert repository.resolve_ref("refs/onetree/absent", missing_ok=True) is None
+    assert reads >= 2
+
+
+def test_reftable_table_open_race_cannot_turn_an_absent_ref_into_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listed table can disappear during compaction after its list was read."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, "reftable")
+    repository = Repository(git_repo.root)
+    table_list = repository.git_dir / "reftable" / "tables.list"
+    table = table_list.parent / table_list.read_text(encoding="utf-8").splitlines()[0]
+    original_open = Path.open
+
+    def vanishing_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == table:
+            raise FileNotFoundError("compaction removed the old table")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", vanishing_open)
+
+    assert repository.resolve_ref("refs/onetree/absent", missing_ok=True) is None
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+def test_an_absent_wal_stays_absent_under_two_thousand_ordinary_ref_writes(
+    tmp_path: Path,
+    ref_format: str,
+) -> None:
+    """The ordinary absent path must not manufacture corruption under ref traffic."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    repository = Repository(git_repo.root)
+    stop = threading.Event()
+    writer_error: list[BaseException] = []
+
+    def writer() -> None:
+        index = 0
+        try:
+            while not stop.is_set():
+                reference = f"refs/heads/peer{index % 3}"
+                git_repo.git("update-ref", reference, git_repo.base)
+                git_repo.git("update-ref", "-d", reference)
+                index += 1
+        except BaseException as error:  # the test thread must report, not vanish
+            writer_error.append(error)
+
+    peer = threading.Thread(target=writer, daemon=True)
+    peer.start()
+    errors: list[RefCorruptError] = []
+    try:
+        for _ in range(2_000):
+            try:
+                assert repository.resolve_ref(WAL_REF, missing_ok=True) is None
+            except RefCorruptError as error:
+                errors.append(error)
+    finally:
+        stop.set()
+        peer.join(timeout=10)
+
+    assert not peer.is_alive()
+    assert writer_error == []
+    assert errors == []
+
+
+def test_the_branch_audit_uses_one_log_without_skip_pagination(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full audit is one history walk, not repeatedly re-walked pages."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+    for index in range(6):
+        git_repo.external_commit("b.txt", f"hand {index}\n", f"hand commit {index}")
+
+    original_popen = git_module.subprocess.Popen
+    log_calls: list[tuple[str, ...]] = []
+
+    def recording_popen(arguments: Sequence[str], *args: Any, **kwargs: Any) -> Any:
+        if "log" in arguments:
+            log_calls.append(tuple(arguments))
+        return original_popen(arguments, *args, **kwargs)
+
+    monkeypatch.setattr(git_module.subprocess, "Popen", recording_popen)
+
+    report = coordinator.inspect_wal()
+
+    assert [item.commit for item in report.divergences] == [unrecorded]
+    assert len(log_calls) == 1
+    assert all(not argument.startswith("--skip=") for argument in log_calls[0])
+    assert all(not argument.startswith("--max-count=") for argument in log_calls[0])
+
+
+def test_a_plain_clone_missing_the_wal_is_quarantined_before_it_can_append(
+    tmp_path: Path,
+) -> None:
+    """Default ``git clone`` omits the WAL ref, so it must not adopt history silently."""
+
+    source = _repository_with_ref_backend(tmp_path / "source", "files")
+    source_coordinator = Coordinator(source.root)
+    session = _register(source_coordinator, source, "alpha", "a.txt")
+    _stage(source, session, "a.txt", "broker landing before clone\n")
+    source_coordinator.land("alpha", message="broker landing before clone")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        [_GIT_EXECUTABLE, "clone", "--quiet", str(source.root), str(clone)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    coordinator = Coordinator(clone)
+    assert coordinator.wal.head() is None
+
+    report = coordinator.inspect_wal()
+    assert not report.consistent
+    assert [item.kind for item in report.divergences] == ["wal_history_missing"]
+    with pytest.raises(WalHistoryMissingError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "wal_history_missing"
+    assert coordinator.wal.read().events == ()
+
+    with pytest.raises(WalHistoryMissingError):
+        coordinator.recover()
+    code, output, error = _cli("wal", "--repo", str(clone), "--json")
+    assert (code, error) == (1, "")
+    assert json.loads(output)["wal"]["divergences"][0]["kind"] == "wal_history_missing"
+
+    code, output, error = _cli("wal", "--repo", str(clone), "--repair", "--json")
+    assert (code, error) == (0, "")
+    assert json.loads(output)["repair"]["consistent"] is True
+    coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert coordinator.recover().consistent
+
+
+def test_linked_worktrees_are_refused_before_they_can_split_shared_wal_state(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    """Gate 1 is one working tree, enforced where every entry point starts."""
+
+    linked = tmp_path / "linked"
+    git_repo.git("worktree", "add", "--detach", str(linked), git_repo.base)
+
+    with pytest.raises(UnsupportedWorktreeError) as refused:
+        Coordinator(linked)
+
+    assert refused.value.kind == "unsupported_worktree"
+    assert not (git_repo.root / ".git" / "onetree").exists()

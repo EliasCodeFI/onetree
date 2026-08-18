@@ -23,9 +23,10 @@ _GIT_EXECUTABLE = shutil.which("git") or "git"
 #
 # Which process dies is the second axis, and it decides who is left to observe
 # the outcome. `before`/`after` kill the broker, reproducing a crash that leaves
-# recovery to a later run. `self_after` kills only the git process, after
-# letting it finish: the ref moved, and the broker survives to read a non-zero
-# exit status over an update that already applied.
+# recovery to a later run. `self_after` kills only the git process *after the
+# real Git command has returned*: the ref moved, and the broker survives to read
+# a non-zero exit status over an update that already applied. This is not a
+# mid-rename death; the broker cannot distinguish the two observations.
 _KILL_GIT_SOURCE = """#!/bin/bash
 set -u
 matched_operation=0
@@ -46,6 +47,24 @@ if [ "$matched_operation" = 1 ] && [ "$matched_reference" = 1 ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"
       kill -KILL "$$"
     fi
+    if [ "$ONETREE_TEST_KILL_MODE" = self_after_hand_commits ]; then
+      "$ONETREE_TEST_REAL_GIT" "$@"
+      repository=""
+      previous=""
+      for argument in "$@"; do
+        if [ "$previous" = -C ]; then repository="$argument"; break; fi
+        previous="$argument"
+      done
+      if [ -z "$repository" ]; then exit 97; fi
+      hand_commits="${ONETREE_TEST_HAND_COMMITS:-0}"
+      count=0
+      while [ "$count" -lt "$hand_commits" ]; do
+        "$ONETREE_TEST_REAL_GIT" -C "$repository" commit \\
+          --quiet --allow-empty -m "ordinary hand interleave $count"
+        count=$((count + 1))
+      done
+      kill -KILL "$$"
+    fi
     if [ "$ONETREE_TEST_KILL_MODE" = after ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"
     fi
@@ -64,13 +83,21 @@ class KillGit:
     executable: Path
     state: Path
 
-    def environment(self, reference: str, nth: int, mode: str) -> dict[str, str]:
+    def environment(
+        self,
+        reference: str,
+        nth: int,
+        mode: str,
+        *,
+        hand_commits: int = 0,
+    ) -> dict[str, str]:
         return {
             "ONETREE_TEST_REAL_GIT": _GIT_EXECUTABLE,
             "ONETREE_TEST_KILL_STATE": str(self.state),
             "ONETREE_TEST_KILL_REF": reference,
             "ONETREE_TEST_KILL_NTH": str(nth),
             "ONETREE_TEST_KILL_MODE": mode,
+            "ONETREE_TEST_HAND_COMMITS": str(hand_commits),
         }
 
 

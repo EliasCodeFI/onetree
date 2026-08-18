@@ -25,6 +25,18 @@ class GitError(OnetreeError):
     kind = "git_error"
 
 
+class UnsupportedWorktreeError(OnetreeError):
+    """Gate 1 coordination was invoked from a linked Git worktree."""
+
+    kind = "unsupported_worktree"
+
+
+class WalHistoryMissingError(OnetreeError):
+    """A branch carries broker history but its WAL ref was not fetched."""
+
+    kind = "wal_history_missing"
+
+
 class IdentityError(OnetreeError):
     """A session identity is absent, ambiguous, or malformed."""
 
