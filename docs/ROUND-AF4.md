@@ -52,7 +52,7 @@ applying process dead before it learned that.
 | 1 | F-B1 | major (execution-miss) | **Closed by guard; no source change.** `land()` already wrote `lander_start = _pid_start(os.getpid())`; nothing held it there. AF3 guarded only the read side. The mutation to `None` survived the entire 134-test baseline. | `test_a_healthy_landing_records_the_birth_tick_it_will_be_judged_by` |
 | 2 | A-F1 | major (new-debt) | **Closed.** A git death after the branch CAS applied now completes the landing on both backends instead of raising `payload_conflict` over its own successful write. | `test_a_git_death_after_the_branch_cas_applied_completes_the_landing[files\|reftable]`; RED control `test_the_shipped_cas_reading_turns_that_death_into_a_false_payload_conflict` |
 | 3 | A-F2 ≡ B-F4 | major | **Closed.** The grandparent floor is gone; a crash-left unrecorded landing is found under any number of hand commits, measured at depths 0, 1, 2, 3 and 5 on both backends. | `test_a_crash_left_landing_is_found_under_any_number_of_hand_commits[0\|1\|2\|3\|5 × files\|reftable]`; `test_page_boundaries_never_drop_the_commit_they_land_on[1..6]` |
-| 4 | F-B2 | major | **Closed by guard; no source change.** The `land_intent.lander.warnings` cross-check shipped at `c2ab14a` with no fixture. Weakening it to a bare type check now goes red. | `test_a_lander_whose_warnings_contradict_its_birth_tick_is_refused` (4 params: 3 red under mutation, 1 agreeing-warnings control stays green) |
+| 4 | F-B2 | major | **Closed by guard; no source change.** The `land_intent.lander.warnings` cross-check shipped at `c2ab14a` with no fixture. Disabling the cross-check now takes all four refusal params red. | `test_a_lander_whose_warnings_contradict_its_birth_tick_is_refused` (4 params, all four contradictory shapes) paired with `test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted` (2 params, the only two agreeing pairs) |
 | 5 | B-F3 | major | **Closed.** A zero-byte `reftable/tables.list` refuses instead of answering absent, while the files backend keeps answering absent for a deleted loose ref. | `test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent`; files control `test_a_deleted_loose_wal_ref_still_answers_absent_on_the_files_backend` |
 | 6 | B-F5 | major | **Closed as specified; see residuals.** `_reftable_storage_state`'s body now carries the absent-arm decision rather than being decision-dead, proven by a discriminating RED control. Its individual sub-shapes remain unfalsified — stated honestly below, not painted green. | RED control inside `test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent`, patching `_reftable_storage_state` to `return None` |
 | 7 | B-F6 | minor | **Closed by guard; no source change.** `cli.py:191` (the human-mode warning suffix) was uncovered; `--json` was not. Deleting the human branch was invisible to the suite. | `test_land_warnings_reach_both_cli_output_modes` |
@@ -63,8 +63,11 @@ Full captures: `/tmp/af4-gates/red-first-items-2-3-5.txt` (fixtures observed
 failing against unfixed src at `c2ab14a`) and
 `/tmp/af4-gates/red-first-items-1-4-7.txt` (mutation probes).
 
-**Items 2, 3 and 5 were observed failing before any fix existed.** Run against
-`c2ab14a` with a clean tree: 10 failed, 19 passed.
+**Items 2, 3 and 5 were observed failing before any fix existed.** Running the
+round's own tests against `c2ab14a` src: **10 failed, 153 passed** over the full
+suite. The AF4 selection alone (`-k` over the new guards) was 10 failed, 19
+passed — the same 10 failures by name, which is the figure the capture file
+records. Every one of the 10 is an AF4 guard; no pre-existing test regressed.
 
 - Item 2, both backends: `LandingRefusedError: target changed on payload paths`,
   reason `payload_conflict`, raised over a landing whose candidate is already on
@@ -93,12 +96,31 @@ them, and the falsifiability bar is the surviving mutation:
 | Probe | Mutation | Result |
 | --- | --- | --- |
 | M-1 | `core.py:1117` `lander_start = _pid_start(os.getpid())` → `None` | 1 failed, 162 passed. `assert ('degraded_liveness',) == ()`. The same mutation passed the whole 134-test baseline. |
-| M-4 | `core.py:334` drop `tuple(warnings) != _liveness_warnings(start)` | 3 failed, 160 passed. `Failed: DID NOT RAISE WalAppendRefusedError`. The fourth param is the agreeing-warnings control and stays green. |
+| M-4 | `core.py:331` `if "warnings" in value:` → `if False and "warnings" in value:` — the whole cross-check disabled, which is the mutation F-B2 itself names | 4 failed, 159 passed. `Failed: DID NOT RAISE WalAppendRefusedError` on **all four** params: `[4242-warnings0]`, `[None-warnings1]`, `[4242-warnings2]`, `[4242-degraded_liveness]`. |
+| M-4b | `core.py:334` drop only `tuple(warnings) != _liveness_warnings(start)`, leaving `isinstance(warnings, list)` standing | 3 failed, 160 passed. The fourth param `[4242-degraded_liveness]` is the non-list shape `"degraded_liveness"`, so the surviving `isinstance` check still catches it. A narrower second probe, not F-B2's mutation. |
+| M-4c | `core.py:334` condition → `if True:` — a guard that refuses everything | 35 failed, 130 passed, including **both** params of `test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted`. This is what the acceptance fixture exists to catch. |
 | M-7 | `cli.py:190-191` delete the human-mode warning suffix | 1 failed, 162 passed. `assert False` on `.endswith('[warning: degraded_liveness]')`. |
 
 Every probe was reverted from a byte copy taken before it; `src/onetree/cli.py`
 is absent from the committed change set, which is the check that no probe
 leaked.
+
+**Refusal fixtures need an acceptance half.** All four params of the item-4
+refusal fixture are contradictory shapes — `(4242, ["degraded_liveness"])`,
+`(None, [])`, `(4242, ["something_else"])` and the non-list `(4242,
+"degraded_liveness")`. None of them is an acceptance control, so on its own that
+fixture cannot tell a correct cross-check apart from a guard that refuses
+everything: an unconditional `raise` at the top of `_validate_lander` satisfies
+all four. `test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted`
+supplies the missing half with the only two agreeing pairs the cross-check
+admits — `(None, ["degraded_liveness"])` for the degraded direction and
+`(<tick>, [])` for the healthy one — and asserts both survive the append *and*
+the read back out, since the validator runs again on every fold. M-4c is the
+measurement that it discriminates. In fairness to what that probe shows: 35
+tests go red under it, because every healthy and every degraded landing
+exercises acceptance incidentally. The new fixture's contribution is that the
+property is now *stated* and named, rather than being a side effect of unrelated
+tests that could be rewritten away without anyone noticing.
 
 **Two poison controls** guard against fixtures that would pass for the wrong
 reason. Item 2's control restores the old conflation by patching
@@ -190,6 +212,29 @@ believed at the time.
    the error — the mask was measured at depth one and the fix was sized to the
    measurement.
 
+### Correction to this round's own first commit
+
+`bc67d2c`, the first AF4 commit, described the item-4 fixture's fourth
+parametrization as "the agreeing-warnings control" and reported M-4 as "3 red
+under mutation, 1 agreeing-warnings control stays green." That was false, and a
+verification seat caught it. All four params are contradictory shapes; the
+fourth is the non-list `(4242, "degraded_liveness")`. The 3/160 result came from
+a narrower mutation that dropped only the value comparison and left
+`isinstance(warnings, list)` standing, which is what spared the fourth param —
+not an acceptance property it never had.
+
+The correction is recorded here rather than by amending `bc67d2c`, because the
+ref was already published and the history should show it. Three things changed:
+the M-4 row now reports F-B2's own named mutation at 4 failed / 159 passed with
+the narrower probe kept and correctly described as M-4b; the acceptance fixture
+the doc wrongly claimed to have now actually exists; and the red-first figure is
+stated as a full-suite number.
+
+The underlying guard was never wrong — it was stronger than the record claimed,
+which is the direction that hides rather than breaks. A round record that
+misdescribes its own fixture is exactly the class AF4 exists to punish, and it
+would have been dishonest to let the finding stand as an AF3-only failing.
+
 ## Honest residuals
 
 Not closed, and not to be read as closed:
@@ -218,11 +263,15 @@ against the main checkout, so every run below was made with
 | --- | --- |
 | `ruff check src tests` | `All checks passed!` |
 | `mypy --strict src/onetree` | `Success: no issues found in 7 source files` |
-| `pytest` | `163 passed in 39.64s`; `Total coverage: 92.26%`, floor 90 |
+| `pytest` | `165 passed in 39.58s`; `Total coverage: 92.26%`, floor 90 |
 
 Baseline at `c2ab14a`, re-measured in this worktree before any edit: 134
-passed, 92.06%. Delta: +29 tests, +0.20 points. Newly covered:
-`core.py:335`, `git.py:323`, `cli.py:191`.
+passed, 92.06%. Delta: +31 tests, +0.20 points. Newly covered:
+`core.py:335`, `git.py:323`, `cli.py:191`. The two acceptance params add no
+coverage, which is expected and is the point: the accepting path through
+`_validate_lander` was already walked by every landing in the suite, and what
+was missing was a fixture that *says so*. Coverage cannot see that gap, which is
+why line counts are not the falsifiability bar here.
 
 The must-not-regress set was re-run by name and all 19 selected cases pass:
 AF CRIT-1 (`test_recovery_run_during_a_live_landing_leaves_it_alone`,

@@ -1494,6 +1494,66 @@ def test_a_lander_whose_warnings_contradict_its_birth_tick_is_refused(
         coordinator.inspect_wal()
 
 
+@pytest.mark.parametrize(
+    ("start", "warnings"),
+    [
+        (None, [core_module.DEGRADED_LIVENESS]),
+        (4242, []),
+    ],
+)
+def test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted(
+    git_repo: GitFixture,
+    start: int | None,
+    warnings: list[str],
+) -> None:
+    """The acceptance half of the pair above, without which it proves nothing.
+
+    A validator fixture that only ever shows refusals cannot tell a correct
+    guard apart from one that refuses everything: ``raise`` on the first line of
+    ``_validate_lander`` would satisfy every case in
+    ``test_a_lander_whose_warnings_contradict_its_birth_tick_is_refused`` and all
+    four of its parametrisations. These are the only two agreeing pairs the
+    cross-check admits -- degraded reports the warning, healthy reports none --
+    and both must survive the append and the read back out.
+
+    Real landings exercise this incidentally, but incidentally is not stated.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    claim = coordinator.claim("alpha", [str(git_repo.root / "a.txt")]).claims[0]
+    index = coordinator.repo.ensure_index("alpha", git_repo.base)
+    tree = coordinator.repo.write_tree(index)
+    candidate = coordinator.repo.commit_tree(tree, "candidate", (git_repo.base,))
+    entry = coordinator.repo.tree_entries(git_repo.base)["a.txt"].payload()
+    document = coordinator.wal.document(
+        "land_intent",
+        "alpha",
+        {
+            "operation": "9" * 32,
+            "attempt": 1,
+            "target": "refs/heads/main",
+            "expected_head": git_repo.base,
+            "candidate": candidate,
+            "tree": tree,
+            "session_generation": session.generation,
+            "lander": {"pid": os.getpid(), "start": start, "warnings": warnings},
+            "fences": [{"path": "a.txt", "claim_generation": claim.generation}],
+            "payload": [{"path": "a.txt", "old": entry, "new": entry}],
+        },
+    )
+    snapshot = coordinator.wal.read()
+
+    appended = coordinator._try_append(coordinator._fold(snapshot), snapshot, (document,))
+
+    assert appended is not None
+    # Written, and still readable: the validator runs again on every fold, so an
+    # append the door accepted must not become corruption on the way back out.
+    report = coordinator.inspect_wal()
+    intent = next(event for event in report.events if event.kind == "land_intent")
+    assert intent.data["lander"] == {"pid": os.getpid(), "start": start, "warnings": warnings}
+
+
 def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
