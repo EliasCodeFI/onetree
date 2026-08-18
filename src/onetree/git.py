@@ -8,7 +8,7 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -249,7 +249,13 @@ class Repository:
         if self.ref_format == "reftable":
             existence = self.git("show-ref", "--exists", reference, check=False)
             if existence.returncode == 2:
-                return None
+                # "No table names this ref" is an answer about the tables, so it
+                # is only worth as much as they are. A tables.list truncated to
+                # zero bytes produces exactly this status while the ref's bytes
+                # sit in the orphaned *.ref tables beside it -- and Git's own
+                # fsck and refs-verify both bless that repository. Absent is
+                # therefore taken from storage here too, not from the status.
+                return self._reftable_storage_state()
             if existence.returncode == 0:
                 return "reftable names the ref but Git cannot resolve it"
             storage_error = self._reftable_storage_state()
@@ -286,7 +292,13 @@ class Repository:
         return None
 
     def _reftable_storage_state(self) -> str | None:
-        """Why reftable cannot decide a ref, or None when its tables are readable."""
+        """Why reftable cannot decide a ref, or None when its tables are readable.
+
+        This is what the absent answer rests on, not only what names a refusal:
+        every shape below turns "Git found no table naming this ref" into a
+        refusal, because none of them is a state a healthy repository is ever
+        found in.
+        """
 
         directory = self.git_path("reftable")
         try:
@@ -304,6 +316,11 @@ class Repository:
             names = first.decode("utf-8", errors="strict").splitlines()
         except UnicodeDecodeError:
             return "reftable tables.list is not UTF-8"
+        if not names:
+            # `git init --ref-format=reftable` writes a non-empty list before it
+            # returns, and every later write replaces it by rename, so no table
+            # list is ever legitimately empty -- not even transiently.
+            return "reftable tables.list is empty"
         for name in names:
             candidate = Path(name)
             if not name or candidate.name != name or not name.endswith(".ref"):
@@ -397,21 +414,6 @@ class Repository:
         if resolved is None:  # pragma: no cover - missing_ok is not set
             raise AssertionError("resolve_ref returned None without missing_ok")
         return resolved
-
-    def existing_commits(self, oids: Iterable[str]) -> tuple[str, ...]:
-        """Filter ``oids`` down to the ones this object store holds as commits."""
-
-        wanted = sorted({oid for oid in oids if oid})
-        if not wanted:
-            return ()
-        request = "".join(f"{oid}\n" for oid in wanted).encode("ascii")
-        output = self.git("cat-file", "--batch-check", input_bytes=request).stdout
-        present: list[str] = []
-        for line in output.decode("ascii", errors="replace").splitlines():
-            fields = line.split()
-            if len(fields) >= 2 and fields[1] == "commit":
-                present.append(fields[0].lower())
-        return tuple(present)
 
     def head_ref(self) -> str:
         result = self.git("symbolic-ref", "--quiet", "HEAD", check=False)
@@ -609,15 +611,36 @@ class Repository:
             paths.append(self.ref_lock_path("HEAD"))
         return tuple(dict.fromkeys(paths))
 
+    def _reapplied(self, new: str, observed: str | None) -> bool:
+        """Did this invocation's own update land before its exit status was lost?
+
+        ``git update-ref`` commits a single-ref update with one rename and then
+        still has work to do before it exits. A death in that window -- an OOM
+        kill, a SIGKILL -- returns a non-zero status over a rename that already
+        applied, and the ref is then left holding the very OID this call was
+        writing.
+
+        That is not a race any peer can win. A broker candidate carries this
+        operation's and this intent's UUIDs in its commit trailer, and a WAL
+        append carries a fresh event id, so no other process can produce the OID
+        being written here. Observing it on the ref therefore means this
+        invocation succeeded and only its report was lost. Every other value is
+        somebody else's write and remains a genuine CAS loss.
+        """
+
+        return observed == new
+
     def update_ref(self, reference: str, new: str, old: str | None) -> bool:
         """Compare-and-swap one ref; True on win, False only on a genuine CAS loss.
 
-        A failing ``update-ref`` is three different things: the expected value
-        moved (a lost race, retryable by re-auditing), another process holds the
-        ref lock (retryable in place), or Git failed for its own reasons (not
-        retryable at all). Collapsing the last two into "lost race" turns one bad
-        invocation into a retry storm that ends in an unrelated error, so each is
-        separated here and only the first returns False.
+        A failing ``update-ref`` is four different things: the update applied and
+        the process died before saying so (a win whose report was lost), the
+        expected value moved (a lost race, retryable by re-auditing), another
+        process holds the ref lock (retryable in place), or Git failed for its
+        own reasons (not retryable at all). Collapsing the last two into "lost
+        race" turns one bad invocation into a retry storm that ends in an
+        unrelated error, and collapsing the first into it refuses a landing that
+        is already on the branch, so each is separated here.
 
         The lock probe runs after the failed invocation, so a peer that releases
         its lock in between leaves contention looking like a hard Git failure.
@@ -638,8 +661,12 @@ class Repository:
             )
             if result.returncode == 0:
                 return True
-            if self.resolve_ref(reference, missing_ok=True) != old:
-                return False
+            # Asked in this order on purpose: a no-op CAS (new == old, which is
+            # how a lock is probed) must stay on the retry path rather than
+            # reporting itself reapplied.
+            observed = self.resolve_ref(reference, missing_ok=True)
+            if observed != old:
+                return self._reapplied(new, observed)
             detail = result.stderr.decode("utf-8", errors="replace").strip()
             held = tuple(lock for lock in candidates if lock.exists())
             contended = contended or bool(held)

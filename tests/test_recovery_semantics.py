@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture, install_kill_git
+from conftest import GitFixture, KillGit, install_kill_git
 
 from onetree import core as core_module
 from onetree import git as git_module
@@ -28,6 +28,7 @@ from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import (
     GitError,
+    LandingRefusedError,
     RefCorruptError,
     RefLockedError,
     ReleaseRefusedError,
@@ -36,6 +37,7 @@ from onetree.errors import (
     WalDivergedError,
 )
 from onetree.git import Repository
+from onetree.proc import process_alive, process_start
 from onetree.wal import WAL_REF
 
 #: A pid no process on this machine holds, with a birth tick that cannot match.
@@ -556,11 +558,13 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
         coordinator.recover()
 
     # RED control (mutation M16): restore the shipped floor -- every position
-    # the WAL has ever seen -- and the same on-disk state reads clean.
+    # the WAL has ever seen -- and the same on-disk state reads clean. This is
+    # also what keeps the empty floor falsifiable: a floor is one monkeypatch
+    # away, and installing one loses the finding.
     monkeypatch.setattr(
         Coordinator,
         "_scan_floor",
-        lambda self, state, target: self.repo.existing_commits(state.target_positions[target]),
+        lambda _self, state, target: tuple(state.target_positions[target]),
     )
     assert coordinator.inspect_wal().consistent
     assert coordinator.recover().consistent
@@ -1225,3 +1229,385 @@ def test_an_intent_with_no_lander_recorded_falls_back_to_its_session(
     sleeper.wait(timeout=5)
     assert coordinator.recover().refused == 1
     assert coordinator.inspect_wal().pending_intents == 0
+
+
+# --------------------------------------------------------------------------
+# Round AF4 -- a falsifiable landing bar, and crash states that classify
+# --------------------------------------------------------------------------
+
+
+def _arm_kill_git(
+    monkeypatch: pytest.MonkeyPatch,
+    kill_git: KillGit,
+    *,
+    reference: str,
+    nth: int,
+    mode: str,
+) -> None:
+    """Point this process's Git layer at the shim, reversibly.
+
+    ``install_kill_git`` edits the interpreter for good, which is why the
+    PPID-kill tests spend a forked child on it. ``self_after`` kills the git
+    process and leaves the broker running, so it is observed in-process and
+    every mutation has to be undone afterwards.
+    """
+
+    for name, value in kill_git.environment(reference, nth, mode).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", f"{kill_git.executable.parent}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", str(kill_git.executable))
+
+
+def test_a_healthy_landing_records_the_birth_tick_it_will_be_judged_by(
+    git_repo: GitFixture,
+) -> None:
+    """The write half of the in-flight bar, which nothing observed.
+
+    ``test_lander_birth_tick_is_part_of_the_in_flight_bar`` pins the read half:
+    recovery must ask liveness with the tick the intent recorded. No fixture
+    watched a healthy landing *record* one, so ``lander_start = None`` at the
+    write site left all 134 tests green while every landing in production
+    silently degraded to the bare-pid bar -- under which a recycled pid keeps a
+    dead lander's intent in flight forever, which is the hazard the whole
+    in-flight guarantee rests on.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "healthy lander\n")
+    # proc.py reads Linux's birth tick and the suite's liveness model needs it;
+    # its absence is a failure to report, never a case to skip past.
+    expected_start = process_start(os.getpid())
+    assert expected_start is not None
+
+    landed = coordinator.land("alpha", message="healthy landing")
+
+    assert landed.warnings == ()
+    intent = next(
+        event
+        for event in coordinator.wal.read().events
+        if event.kind == "land_intent" and event.data.get("operation") == landed.operation
+    )
+    lander = intent.data["lander"]
+    assert lander["pid"] == os.getpid()
+    assert lander["start"] == expected_start
+    assert lander["warnings"] == []
+    # ...and what was recorded is the tick liveness is actually decided by, not
+    # merely an integer: the next incarnation of this pid must not answer for
+    # this one.
+    assert process_alive(lander["pid"], lander["start"])
+    assert not process_alive(lander["pid"], lander["start"] + 1)
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+def test_a_git_death_after_the_branch_cas_applied_completes_the_landing(
+    tmp_path: Path,
+    ref_format: str,
+    kill_git: KillGit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third crash state ``land()``'s own docstring said could not exist.
+
+    ``git update-ref`` still has work to do after the rename that commits a
+    single-ref update. A death in that window (OOM kill, SIGKILL) returns a
+    non-zero status over an update that already applied, and the ref then holds
+    this invocation's own candidate. Reading that as a lost race refuses an
+    intent whose candidate is on the branch, which leaves the WAL diverged on
+    ``refused_candidate_on_target`` permanently -- over data that is correct.
+    """
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "killed mid update-ref\n")
+    _arm_kill_git(
+        monkeypatch, kill_git, reference="refs/heads/main", nth=1, mode="self_after"
+    )
+
+    result = coordinator.land("alpha", message="killed mid update-ref")
+
+    assert result.attempts == 1
+    assert git_repo.oid() == result.commit
+    assert git_repo.git("show", "refs/heads/main:a.txt").stdout == "killed mid update-ref\n"
+    events = coordinator.wal.read().events
+    landed = [event for event in events if event.kind == "landed"]
+    assert [event.data["operation"] for event in landed] == [result.operation]
+    assert landed[0].data["recovered"] is False
+    # No refusal of any kind: the landing succeeded and is recorded as such.
+    assert [event.data.get("reason") for event in events if event.kind == "refused"] == []
+    report = coordinator.inspect_wal()
+    assert report.consistent
+    assert report.divergences == ()
+    assert coordinator.recover().consistent
+
+
+def test_the_shipped_cas_reading_turns_that_death_into_a_false_payload_conflict(
+    git_repo: GitFixture,
+    kill_git: KillGit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED control for the pair: restore the conflation, the harm comes back.
+
+    ``update_ref`` classified every failed invocation whose ref had moved as a
+    lost race, without asking whether it had moved to this call's own candidate.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "killed mid update-ref\n")
+    monkeypatch.setattr(Repository, "_reapplied", lambda _self, _new, _observed: False)
+    _arm_kill_git(
+        monkeypatch, kill_git, reference="refs/heads/main", nth=1, mode="self_after"
+    )
+
+    with pytest.raises(LandingRefusedError) as refused:
+        coordinator.land("alpha", message="killed mid update-ref")
+
+    assert refused.value.details["reason"] == "payload_conflict"
+    # The landing the caller was told was refused is on the branch, with the
+    # right bytes -- that is what makes the refusal false rather than merely
+    # unlucky.
+    intent = next(
+        event for event in coordinator.wal.read().events if event.kind == "land_intent"
+    )
+    assert git_repo.oid() == intent.data["candidate"]
+    assert git_repo.git("show", "refs/heads/main:a.txt").stdout == "killed mid update-ref\n"
+    assert [item.kind for item in coordinator.inspect_wal().divergences] == [
+        "refused_candidate_on_target"
+    ]
+    # Nothing retires a `refused` event, so this is permanent: recovery raises
+    # on every call, exit 2, over a repository whose data is fine.
+    for _ in range(2):
+        with pytest.raises(WalDivergedError):
+            coordinator.recover()
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+@pytest.mark.parametrize("hand_commits", [0, 1, 2, 3, 5])
+def test_a_crash_left_landing_is_found_under_any_number_of_hand_commits(
+    tmp_path: Path,
+    ref_format: str,
+    hand_commits: int,
+) -> None:
+    """The scan floor's depth was never the defect; the floor was.
+
+    Lead (c) measured the mask at one permitted hand commit and the floor moved
+    down one generation; AF3b then measured the same mask at two and at three.
+    A floor a fixed genealogical distance below first sight is defeated by that
+    many hand commits, so the class only closes when the audit stops excluding
+    history it has never read.
+    """
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    coordinator = Coordinator(git_repo.root)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+    for index in range(hand_commits):
+        git_repo.external_commit("b.txt", f"hand {index}\n", f"permitted hand commit {index}")
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+
+    report = coordinator.inspect_wal()
+    assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
+    assert report.divergences[0].commit == unrecorded
+    assert not report.consistent
+    with pytest.raises(WalDivergedError):
+        coordinator.recover()
+
+
+@pytest.mark.parametrize("hand_commits", [1, 2, 3, 4, 5, 6])
+def test_page_boundaries_never_drop_the_commit_they_land_on(
+    git_repo: GitFixture,
+    hand_commits: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contiguity across ``--skip`` pages, swept over every boundary offset.
+
+    With a page size of two the walk crosses a boundary after rows 2, 4 and 6,
+    so a seam that double-counted or skipped one row would lose the marked
+    commit at exactly one of these offsets and report a clean branch.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+    for index in range(hand_commits):
+        git_repo.external_commit("b.txt", f"hand {index}\n", f"hand commit {index}")
+    monkeypatch.setattr(git_module, "DIVERGENCE_SCAN_LIMIT", 2)
+
+    report = coordinator.inspect_wal()
+    assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
+    assert report.divergences[0].commit == unrecorded
+
+
+@pytest.mark.parametrize(
+    ("start", "warnings"),
+    [
+        (4242, [core_module.DEGRADED_LIVENESS]),
+        (None, []),
+        (4242, ["something_else"]),
+        (4242, "degraded_liveness"),
+    ],
+)
+def test_a_lander_whose_warnings_contradict_its_birth_tick_is_refused(
+    git_repo: GitFixture,
+    start: int | None,
+    warnings: Any,
+) -> None:
+    """The warnings validator had no observed-failing input in the suite.
+
+    ``(None, [])`` is the harmful direction: an intent that degraded to bare-pid
+    liveness while reporting itself healthy, which is exactly what an operator
+    reading the WAL would have to trust.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    claim = coordinator.claim("alpha", [str(git_repo.root / "a.txt")]).claims[0]
+    index = coordinator.repo.ensure_index("alpha", git_repo.base)
+    tree = coordinator.repo.write_tree(index)
+    candidate = coordinator.repo.commit_tree(tree, "candidate", (git_repo.base,))
+    entry = coordinator.repo.tree_entries(git_repo.base)["a.txt"].payload()
+    document = coordinator.wal.document(
+        "land_intent",
+        "alpha",
+        {
+            "operation": "9" * 32,
+            "attempt": 1,
+            "target": "refs/heads/main",
+            "expected_head": git_repo.base,
+            "candidate": candidate,
+            "tree": tree,
+            "session_generation": session.generation,
+            "lander": {"pid": os.getpid(), "start": start, "warnings": warnings},
+            "fences": [{"path": "a.txt", "claim_generation": claim.generation}],
+            "payload": [{"path": "a.txt", "old": entry, "new": entry}],
+        },
+    )
+    snapshot = coordinator.wal.read()
+
+    with pytest.raises(WalAppendRefusedError, match="lander.warnings is invalid"):
+        coordinator._try_append(coordinator._fold(snapshot), snapshot, (document,))
+
+    # RED control: through the un-validated primitive -- the only path a forger
+    # has -- the same document has to be refused on the way back out.
+    assert coordinator.wal.try_append((document,), snapshot.head) is not None
+    with pytest.raises(WalCorruptError, match="lander.warnings is invalid"):
+        coordinator.inspect_wal()
+
+
+def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next D1 variant, and the one reftable can actually decide.
+
+    ``show-ref --exists`` answers "no table names this ref" with the same status
+    for a truncated table list as for a ref that was never written, while the
+    WAL's bytes sit in the orphaned ``*.ref`` tables beside it. Trusting that
+    status without looking at storage answers every claim question over an
+    empty log at exit 0.
+    """
+
+    git_repo = _repository_with_ref_backend(tmp_path, "reftable")
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
+    assert coordinator.check("beta", str(git_repo.root / "a.txt")).blocked
+
+    table_list = coordinator.repo.git_dir / "reftable" / "tables.list"
+    original = table_list.read_bytes()
+    # A fresh reftable repository always writes a non-empty list, so zero bytes
+    # is not a state Git ever leaves behind -- it is decidable, not ambiguous.
+    assert original
+    table_list.write_bytes(b"")
+    try:
+        # Git's own verdict on this state, measured rather than assumed: the ref
+        # reads absent and both integrity checks bless the repository, so the
+        # refusal below is strictly stronger than anything Git will say.
+        assert git_repo.git("show-ref", "--exists", WAL_REF, check=False).returncode == 2
+        assert git_repo.git("fsck", check=False).returncode == 0
+        assert git_repo.git("refs", "verify", check=False).returncode == 0
+        assert sorted(table_list.parent.glob("*.ref"))
+
+        with pytest.raises(RefCorruptError, match="cannot be read"):
+            coordinator.repo.resolve_ref(WAL_REF, missing_ok=True)
+        for call in (
+            coordinator.inspect_wal,
+            coordinator.recover,
+            lambda: coordinator.check("beta", str(git_repo.root / "a.txt")),
+        ):
+            with pytest.raises(WalCorruptError, match="cannot be read"):
+                call()
+
+        # RED control (B-F5): gut `_reftable_storage_state` to `return None` --
+        # the shape that left its whole body decision-dead -- and the live WAL
+        # reads as an empty healthy one, at exit 0, with the claim gone.
+        monkeypatch.setattr(Repository, "_reftable_storage_state", lambda _self: None)
+        assert coordinator.repo.resolve_ref(WAL_REF, missing_ok=True) is None
+        assert coordinator.inspect_wal().events == ()
+        assert not coordinator.check("beta", str(git_repo.root / "a.txt")).blocked
+    finally:
+        table_list.write_bytes(original)
+    assert coordinator.check("beta", str(git_repo.root / "a.txt")).blocked
+
+
+def test_a_deleted_loose_wal_ref_still_answers_absent_on_the_files_backend(
+    tmp_path: Path,
+) -> None:
+    """The files control: there the same question is genuinely undecidable.
+
+    Nothing on the files backend distinguishes "this loose ref was deleted" from
+    "it was never written", so absent remains the only honest answer and the
+    reftable refusal must not leak across.
+    """
+
+    git_repo = _repository_with_ref_backend(tmp_path, "files")
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    coordinator.repo.git_path(WAL_REF).unlink()
+
+    assert coordinator.repo.resolve_ref(WAL_REF, missing_ok=True) is None
+    assert coordinator.inspect_wal().events == ()
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+def test_registering_on_an_unborn_branch_refuses_the_same_on_both_backends(
+    tmp_path: Path,
+    ref_format: str,
+) -> None:
+    """Absent must stay absent on reftable now that it is taken from storage."""
+
+    git_repo = _repository_with_ref_backend(tmp_path, ref_format)
+    coordinator = Coordinator(git_repo.root)
+
+    assert coordinator.repo.resolve_ref("refs/heads/unborn", missing_ok=True) is None
+    with pytest.raises(GitError, match="landing target is unborn"):
+        coordinator.register_session(
+            "alpha", pid=os.getpid(), ttl=300, target="refs/heads/unborn"
+        )
+
+
+def test_land_warnings_reach_both_cli_output_modes(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Degradation the operator never sees is degradation that was not surfaced.
+
+    Both output modes carried the warning and neither was asserted anywhere, so
+    dropping the JSON key and the human suffix together left the suite green.
+    """
+
+    coordinator = Coordinator(git_repo.root)
+    alpha = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, alpha, "a.txt", "degraded through the cli\n")
+    beta = _register(coordinator, git_repo, "beta", "b.txt")
+    _stage(git_repo, beta, "b.txt", "degraded through the cli as well\n")
+    monkeypatch.setattr(core_module, "_pid_start", lambda _pid: None)
+
+    code, out, err = _cli("land", "--repo", str(git_repo.root), "--session", "alpha", "--json")
+    assert (code, err) == (0, "")
+    assert len(out.strip().splitlines()) == 1  # exactly one JSON object on stdout
+    assert json.loads(out)["land"]["warnings"] == [core_module.DEGRADED_LIVENESS]
+
+    code, human, err = _cli("land", "--repo", str(git_repo.root), "--session", "beta")
+    assert (code, err) == (0, "")
+    assert human.rstrip("\n").endswith(f"[warning: {core_module.DEGRADED_LIVENESS}]")

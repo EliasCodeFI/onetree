@@ -139,8 +139,6 @@ def test_resolve_ref_separates_absent_corrupt_and_present(git_repo: GitFixture) 
     repository = Repository(git_repo.root)
     assert repository.resolve_ref("refs/heads/main") == git_repo.base
     assert repository.resolve_ref("refs/heads/missing", missing_ok=True) is None
-    assert repository.existing_commits(()) == ()
-    assert repository.existing_commits((git_repo.base, _DANGLING)) == (git_repo.base,)
     assert repository.object_type(git_repo.base) == "commit"
     assert repository.object_type(_DANGLING) is None
 

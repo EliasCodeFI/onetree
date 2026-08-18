@@ -210,12 +210,9 @@ class _FoldedState:
     refused_intents: dict[str, EventRecord]
     #: Every operation a ``refused`` event named, whether or not it had an intent.
     refused_operations: set[str]
-    #: Positions the WAL has observed for each target ref.
+    #: Positions the WAL has observed for each target ref. They name the targets
+    #: a branch-side audit has to visit; they never bound how far down it looks.
     target_positions: dict[str, set[str]]
-    #: The FIRST position the WAL ever observed for each target ref, in event
-    #: order. It is the only honest floor for a branch-side audit: below it the
-    #: WAL never saw this branch and never claimed to.
-    target_origin: dict[str, str]
     #: Divergence sets recovery has already recorded a refusal for, so probing a
     #: diverged repository does not append one event per probe.
     diverged_refusals: set[tuple[tuple[str, ...], ...]]
@@ -234,7 +231,6 @@ class _FoldedState:
             refused_intents={},
             refused_operations=set(),
             target_positions={},
-            target_origin={},
             diverged_refusals=set(),
         )
 
@@ -250,7 +246,6 @@ class _FoldedState:
             refused_intents=dict(self.refused_intents),
             refused_operations=set(self.refused_operations),
             target_positions={key: set(value) for key, value in self.target_positions.items()},
-            target_origin=dict(self.target_origin),
             diverged_refusals=set(self.diverged_refusals),
             event_ids=set(self.event_ids),
             session_generations=set(self.session_generations),
@@ -259,9 +254,7 @@ class _FoldedState:
 
     def observe_position(self, target: str, *positions: str) -> None:
         seen = self.target_positions.setdefault(target, set())
-        for position in positions:
-            self.target_origin.setdefault(target, position)
-            seen.add(position)
+        seen.update(positions)
 
     def terminal(self, operation: str) -> bool:
         return operation in self.landed_operations or operation in self.refused_operations
@@ -968,9 +961,20 @@ class Coordinator:
         with no WAL provenance at all. No two-loose-ref crash-atomic primitive
         exists on this backend, so the protocol stops needing one. Every ref
         update below is a single-ref CAS, which *is* atomic, and the order is
-        chosen so that each crash window leaves a state recovery can name:
-        either an intent with no branch move (recovery refuses it) or a branch
-        move whose intent is already recorded (recovery completes it).
+        chosen so that each crash window leaves a state that can be named.
+
+        There are three such states, not two. A crash before the branch moves
+        leaves an intent with no branch move, which recovery refuses. A crash
+        after it moves leaves a branch move whose intent is already recorded,
+        which recovery completes. And ``git update-ref`` itself can die in the
+        window between the rename that applies the update and the exit status
+        that reports it: the branch moved, this process is still alive, and it
+        is holding a failure over its own success. That third state is named
+        where it happens, by ``Repository._reapplied`` -- the ref holding this
+        call's own candidate is a win whose report was lost, not a lost race.
+        Reading it as a lost race refuses an intent whose candidate is on the
+        branch, and nothing retires a ``refused`` event, so the WAL stays
+        diverged on ``refused_candidate_on_target`` forever over correct data.
         """
 
         actor = _validate_actor(actor)
@@ -1353,13 +1357,14 @@ class Coordinator:
         keys on the landing trailer every broker candidate carries rather than
         on mere presence of an unrecognised commit.
 
-        The branch-side walk is bounded by the WAL's recorded landing chain: it
-        starts at the head and stops below the first position this WAL ever
-        observed for the target. Bounding it by every position the WAL has *since*
-        seen — which is what it used to do — retires the finding the moment any
-        session registers on top of the unrecorded commit or lands above it, and
-        an unrecorded landing that stops being reported by being used is worse
-        than one that was never detected.
+        The branch-side walk starts at the head and stops only when it runs out
+        of history. It used to be bounded by every position the WAL had seen,
+        which retired the finding the moment any session registered on top of
+        the unrecorded commit or landed above it, and then by a fixed
+        genealogical distance below the first position it ever saw, which
+        retired it behind that many permitted hand commits. An unrecorded
+        landing that stops being reported by being used is worse than one that
+        was never detected; see ``_scan_floor`` for why no floor survives.
         """
 
         found: list[Divergence] = []
@@ -1446,25 +1451,31 @@ class Coordinator:
             skip += len(page.commits)
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
-        """History the branch-side audit may skip: safely below first sight.
+        """History the branch-side audit may skip: none of it.
 
-        The floor is the grandparents of that first position, so both the first
-        position and its immediate parents stay inside the walk. The parent can
-        be a crash-left landing hidden by one permitted hand commit before the
-        WAL first observes the branch. In a shallow clone an unavailable parent
-        still degrades to no floor, preserving the complete visible-history scan.
+        Every exclusion this walk can express is ``git log ^X``, which drops X
+        *and its entire ancestry*. The WAL has audited none of that ancestry, so
+        any non-empty floor hides an unbounded amount of history behind one
+        commit. That makes a floor unsound by construction rather than merely
+        shallow, and two rounds measured the same class at successive depths:
+        lead (c) found a crash-left landing masked by one permitted hand commit
+        below first sight, and the round after it found the grandparent floor
+        that replaced it masked by two and by three. A fixed genealogical
+        distance d is always defeated by d hand commits, so the depth was never
+        the defect.
+
+        Retreating to the honest boundary is not available either: lead (c)
+        settled that the commit below the WAL's first sighting of a branch is in
+        scope, and that is precisely the history a first-sight floor drops. What
+        is left is the empty floor. Pagination already bounds each Git result,
+        so a complete walk costs pages rather than correctness.
+
+        The accepted consequence is recorded in docs/ROUND-AF4.md: a repository
+        holding broker landings from a WAL it does not have reports them as
+        unrecorded. That answer is true -- this WAL does not account for them.
         """
 
-        origin = state.target_origin.get(target)
-        if origin is None or not self.repo.existing_commits((origin,)):
-            return ()
-        parents = self.repo.existing_commits(self.repo.commit_parents(origin))
-        grandparents = (
-            ancestor
-            for parent in parents
-            for ancestor in self.repo.commit_parents(parent)
-        )
-        return self.repo.existing_commits(grandparents)
+        return ()
 
     def inspect_wal(self) -> WalReport:
         snapshot = self.wal.read()

@@ -12,13 +12,20 @@ import pytest
 
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
-# A PATH-shim git that kills its caller from inside a matched invocation.
+# A PATH-shim git that SIGKILLs the broker, or itself, from inside a matched
+# invocation.
 #
 # Python checkpoints inside the broker cannot reach this window: for the whole
 # of a matched invocation the caller is blocked in subprocess.run, so a kill
 # issued from here lands while the ref update is in flight. A single-ref update
 # commits with one rename, so "in flight" has exactly two observable outcomes --
 # the rename happened, or it did not -- and both are produced here by mode.
+#
+# Which process dies is the second axis, and it decides who is left to observe
+# the outcome. `before`/`after` kill the broker, reproducing a crash that leaves
+# recovery to a later run. `self_after` kills only the git process, after
+# letting it finish: the ref moved, and the broker survives to read a non-zero
+# exit status over an update that already applied.
 _KILL_GIT_SOURCE = """#!/bin/bash
 set -u
 matched_operation=0
@@ -35,6 +42,10 @@ if [ "$matched_operation" = 1 ] && [ "$matched_reference" = 1 ]; then
   seen=$((seen + 1))
   printf '%s' "$seen" > "$ONETREE_TEST_KILL_STATE"
   if [ "$seen" = "$ONETREE_TEST_KILL_NTH" ]; then
+    if [ "$ONETREE_TEST_KILL_MODE" = self_after ]; then
+      "$ONETREE_TEST_REAL_GIT" "$@"
+      kill -KILL "$$"
+    fi
     if [ "$ONETREE_TEST_KILL_MODE" = after ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"
     fi
