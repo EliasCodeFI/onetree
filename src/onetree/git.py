@@ -24,6 +24,8 @@ _GIT_COMMON_OPTIONS = (
     "core.commitGraph=false",
     "-c",
     "core.multiPackIndex=false",
+    "-c",
+    "log.showSignature=false",
 )
 
 #: Operation id carried by every broker-built candidate commit. It is what
@@ -34,6 +36,11 @@ _LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
 _TRAILER_LINE = re.compile(
     rb"(?P<key>[A-Za-z0-9-]+)[ \t]*:[ \t]*(?P<value>.*)"
 )
+_GIT_GENERATED_TRAILER_PREFIXES = (
+    b"Signed-off-by: ",
+    b"(cherry picked from commit ",
+)
+_FIXED_COMMENT_PREFIX = b"#"
 _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
@@ -428,6 +435,69 @@ class Repository:
         # a long WAL does not spawn one subprocess per landing record.
         self._valid_branch_refs.add(reference)
         return reference
+
+    def audit_heads(self) -> dict[str, str]:
+        """Resolve every local branch plus HEAD in one parseable ref listing."""
+
+        result = self.git("show-ref", "--head", "--branches", check=False)
+        if result.returncode not in {0, 1} or (result.returncode == 1 and result.stdout):
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(
+                f"cannot list audit refs: {detail or 'unknown error'}",
+                operation="show-ref",
+                returncode=result.returncode,
+            )
+        heads: dict[str, str] = {}
+        for raw_line in result.stdout.splitlines():
+            raw_oid, separator, raw_reference = raw_line.partition(b" ")
+            if not separator or not raw_oid or not raw_reference:
+                raise GitError("malformed audit ref listing", operation="show-ref")
+            try:
+                reference = raw_reference.decode("utf-8", errors="strict")
+                oid = raw_oid.decode("ascii", errors="strict").lower()
+            except UnicodeDecodeError as error:
+                raise GitError(
+                    "audit ref listing is not UTF-8/ASCII", operation="show-ref"
+                ) from error
+            if reference != "HEAD":
+                self.validate_branch_ref(reference)
+            if reference in heads:
+                raise GitError(
+                    "audit ref listing repeats a reference",
+                    operation="show-ref",
+                    reference=reference,
+                )
+            commit = self.validate_oid(oid, label="audit ref")
+            object_type = self.object_type(commit)
+            if object_type != "commit":
+                raise RefCorruptError(
+                    f"{reference} does not resolve to a commit",
+                    reference=reference,
+                    oid=commit,
+                    object_type=object_type,
+                )
+            heads[reference] = commit
+        return heads
+
+    def default_branch_ref(self) -> str:
+        """Return HEAD's branch, or its unique same-tip branch while detached."""
+
+        symbolic = self.symbolic_head()
+        if symbolic is not None:
+            return self.validate_branch_ref(symbolic)
+        head = self.require_commit("HEAD")
+        matches = sorted(
+            reference
+            for reference, commit in self.audit_heads().items()
+            if reference != "HEAD" and commit == head
+        )
+        if len(matches) == 1:
+            return matches[0]
+        raise GitError(
+            "HEAD is detached; pass a branch ref",
+            operation="symbolic-ref",
+            matching_branches=matches,
+        )
 
     def index_path(self, actor: str) -> Path:
         return self.git_dir / "onetree" / "sessions" / actor / "index"
@@ -955,35 +1025,75 @@ class Repository:
 
     @staticmethod
     def _landing_operation_from_message(raw_message: bytes, *, commit: str) -> str | None:
-        """Parse onetree's fixed final trailer block without Git's configurable parser."""
+        """Parse the fixed, Git-compatible trailer-block subset onetree owns.
+
+        Git also lets repository configuration add separators, comment bytes and
+        recognized trailer keys. Those inputs are deliberately excluded here:
+        the broker's identity cannot change with ``.git/config``. The stable
+        subset retains Git's all-trailer rule, its 25% generated-trailer rule,
+        its two built-in generated prefixes, ``#`` comments, and the ``---``
+        message divider.
+        """
 
         lines = [
             line[:-1] if line.endswith(b"\r") else line
             for line in raw_message.split(b"\n")
         ]
+        for index, line in enumerate(lines):
+            if line.startswith(b"---") and (
+                len(line) == 3 or (len(line) > 3 and line[3] in b" \t\v\f\r")
+            ):
+                lines = lines[:index]
+                break
         while lines and not lines[-1].strip(b" \t"):
             lines.pop()
         if not lines:
             return None
 
-        block_start = 0
+        block_start: int | None = None
         for index in range(len(lines) - 1, -1, -1):
             if not lines[index].strip(b" \t"):
                 block_start = index + 1
                 break
+        if block_start is None:
+            return None
 
         parsed: list[tuple[bytes, bytes]] = []
+        trailer_lines = 0
+        non_trailer_lines = 0
+        recognized_prefix = False
+        previous_kind: str | None = None
         for line in lines[block_start:]:
+            if line.startswith(_FIXED_COMMENT_PREFIX):
+                previous_kind = None
+                continue
             if line.startswith((b" ", b"\t")):
-                if not parsed:
-                    return None
-                key, value = parsed[-1]
-                parsed[-1] = (key, value + b" " + line.strip(b" \t"))
+                if previous_kind == "trailer" and parsed:
+                    key, value = parsed[-1]
+                    parsed[-1] = (key, value + b" " + line.strip(b" \t"))
+                elif previous_kind not in {"trailer", "generated"}:
+                    non_trailer_lines += 1
+                continue
+            if line.startswith(_GIT_GENERATED_TRAILER_PREFIXES):
+                trailer_lines += 1
+                recognized_prefix = True
+                previous_kind = "generated"
                 continue
             match = _TRAILER_LINE.fullmatch(line)
             if match is None:
-                return None
+                non_trailer_lines += 1
+                previous_kind = "non_trailer"
+                continue
+            trailer_lines += 1
             parsed.append((match.group("key"), match.group("value")))
+            previous_kind = "trailer"
+
+        all_trailers = trailer_lines > 0 and non_trailer_lines == 0
+        generated_quorum = (
+            recognized_prefix and trailer_lines * 3 >= non_trailer_lines
+        )
+        if not all_trailers and not generated_quorum:
+            return None
 
         values = [
             value.strip(b" \t")

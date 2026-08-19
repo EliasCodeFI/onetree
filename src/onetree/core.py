@@ -43,6 +43,7 @@ _ACTOR_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 DEGRADED_LIVENESS = "degraded_liveness"
 
 Checkpoint = Callable[[str, Mapping[str, Any]], None]
+_AuditHeads = tuple[tuple[str, str | None], ...]
 
 #: The fields a ``landed`` mark must repeat from its intent, field for field.
 _LANDED_INTENT_FIELDS = (
@@ -381,46 +382,57 @@ class Coordinator:
         self.repo = Repository(repository)
         self.wal = Wal(self.repo)
 
-    def _audit_targets(
+    def _audit_heads(
         self,
         state: _FoldedState,
         target: str | None = None,
-    ) -> tuple[str, ...]:
-        """Targets whose Git-visible histories this operation can affect or adopt."""
+    ) -> _AuditHeads:
+        """One repository-wide view: every local branch plus HEAD."""
 
-        targets = set(state.target_positions)
+        current = self.repo.audit_heads()
+        targets = set(current).union(state.target_positions)
         if target is not None:
             targets.add(self.repo.validate_branch_ref(target))
-        else:
-            # A detached checkout still has a readable history. ``HEAD`` is a
-            # report-only audit target; adoption requires an explicit branch ref.
-            targets.add(self.repo.symbolic_head() or "HEAD")
-        return tuple(sorted(targets))
+        ordered = sorted(targets, key=lambda reference: (reference == "HEAD", reference))
+        return tuple((reference, current.get(reference)) for reference in ordered)
+
+    @staticmethod
+    def _audit_target_names(heads: _AuditHeads) -> tuple[str, ...]:
+        return tuple(reference for reference, _ in heads)
 
     def _unrecorded_landings(
         self,
         state: _FoldedState,
-        targets: Sequence[str],
+        heads: _AuditHeads,
     ) -> tuple[Divergence, ...]:
         """Broker-marked branch commits for which this WAL has no terminal record."""
 
         found: list[Divergence] = []
         seen: set[str] = set()
-        for target in targets:
-            head = self.repo.resolve_ref(target, missing_ok=True)
-            if head is None:
+        walked_heads: set[str] = set()
+        recorded = {
+            (str(event.data.get("commit")), str(event.data.get("operation")))
+            for event in state.landed
+        }
+        recorded.update(
+            (str(event.data.get("candidate")), operation)
+            for operation, event in state.pending.items()
+        )
+        recorded.update(
+            (str(event.data.get("candidate")), operation)
+            for operation, event in state.refused_intents.items()
+        )
+        for target, head in heads:
+            if head is None or head in walked_heads:
                 continue
+            walked_heads.add(head)
             for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
                 operation = marked.operation or ""
-                if (
-                    not operation
-                    or operation in seen
-                    or operation in state.landed_operations
-                    or operation in state.pending
-                    or operation in state.refused_intents
-                ):
+                if not operation or marked.commit in seen:
                     continue
-                seen.add(operation)
+                seen.add(marked.commit)
+                if (marked.commit, operation) in recorded:
+                    continue
                 found.append(
                     Divergence(
                         "unrecorded_landing",
@@ -435,28 +447,33 @@ class Coordinator:
     def _read_wal(self, target: str | None = None) -> WalSnapshot:
         """Read a WAL for mutation only after auditing the histories it would adopt."""
 
-        snapshot = self.wal.read()
-        state = self._fold(snapshot)
-        targets = self._audit_targets(state, target)
-        self._refuse_legacy_grafts(targets)
-        if self.repo.is_shallow():
-            raise ShallowHistoryError(
-                "the repository is shallow, so broker landing history cannot be audited "
-                "completely; deepen it before mutating",
-                targets=list(targets),
-                repair="deepen the repository, then run `onetree wal --adopt` if needed",
-            )
-        unrecorded = self._unrecorded_landings(state, targets)
-        if unrecorded:
-            raise UnrecordedLandingError(
-                "the branch carries broker landings that refs/onetree/wal does not record; "
-                "run `onetree wal --adopt` before mutating",
-                targets=sorted({item.target for item in unrecorded}),
-                commits=[item.commit for item in unrecorded],
-                divergences=[item.payload() for item in unrecorded],
-                repair="onetree wal --adopt",
-            )
-        return snapshot
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self.wal.read()
+            state = self._fold(snapshot)
+            heads = self._audit_heads(state, target)
+            targets = self._audit_target_names(heads)
+            self._refuse_legacy_grafts(targets)
+            if self.repo.is_shallow():
+                raise ShallowHistoryError(
+                    "the repository is shallow, so broker landing history cannot be audited "
+                    "completely; deepen it before mutating",
+                    targets=list(targets),
+                    repair="deepen the repository, then run `onetree wal --adopt` if needed",
+                )
+            unrecorded = self._unrecorded_landings(state, heads)
+            if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
+                continue
+            if unrecorded:
+                raise UnrecordedLandingError(
+                    "the repository carries broker landings that refs/onetree/wal does not "
+                    "record; run `onetree wal --adopt` before mutating",
+                    targets=sorted({item.target for item in unrecorded}),
+                    commits=[item.commit for item in unrecorded],
+                    divergences=[item.payload() for item in unrecorded],
+                    repair="onetree wal --adopt",
+                )
+            return snapshot
+        raise GitError("audit snapshot retry limit exceeded", retries=MAX_CAS_RETRIES)
 
     def _refuse_legacy_grafts(self, targets: Sequence[str]) -> None:
         graft_file = self.repo.nonempty_graft_file()
@@ -723,18 +740,29 @@ class Coordinator:
                 raise WalCorruptError("adopted event has unexpected fields", oid=event.oid)
             _validate_actor(event.actor)
             operation = _string(data, "operation", event)
-            if operation in state.pending or state.terminal(operation):
+            if operation in state.pending:
                 raise WalCorruptError("duplicate landing operation", oid=event.oid)
-            target = self.repo.validate_branch_ref(_string(data, "target", event))
+            target_value = _string(data, "target", event)
+            target = (
+                "HEAD"
+                if target_value == "HEAD"
+                else self.repo.validate_branch_ref(target_value)
+            )
             expected_head = self.repo.validate_oid(
                 _string(data, "expected_head", event), label="adopted base"
             )
             commit = self.repo.validate_oid(
                 _string(data, "commit", event), label="adopted commit"
             )
+            if any(
+                existing.data.get("operation") == operation
+                and existing.data.get("commit") == commit
+                for existing in state.landed
+            ):
+                raise WalCorruptError("duplicate adopted landing", oid=event.oid)
             self.repo.validate_oid(_string(data, "tree", event), label="adopted tree")
             state.observe_position(target, expected_head, commit)
-            state.landed_operations[operation] = event
+            state.landed_operations.setdefault(operation, event)
             state.landed.append(event)
         elif event.kind == "landed":
             operation = _string(data, "operation", event)
@@ -819,7 +847,9 @@ class Coordinator:
         process_start = _pid_start(body_pid)
         warnings = _liveness_warnings(process_start)
         target_ref = (
-            self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
+            self.repo.default_branch_ref()
+            if target is None
+            else self.repo.validate_branch_ref(target)
         )
         base = self.repo.resolve_ref(target_ref, missing_ok=True)
         if base is None:
@@ -1098,7 +1128,9 @@ class Coordinator:
 
         actor = _validate_actor(actor)
         target_ref = (
-            self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
+            self.repo.default_branch_ref()
+            if target is None
+            else self.repo.validate_branch_ref(target)
         )
         attempts = 0
         for _ in range(MAX_CAS_RETRIES):
@@ -1460,7 +1492,13 @@ class Coordinator:
                     commit=commit,
                 ) from error
             expected_parent = _string(event.data, "expected_head", event)
-            if self.repo.commit_parents(commit) != (expected_parent,):
+            parents = self.repo.commit_parents(commit)
+            if event.kind == "adopted":
+                actual_expected = parents[0] if parents else self.repo.zero_oid
+                parents_match = actual_expected == expected_parent
+            else:
+                parents_match = parents == (expected_parent,)
+            if not parents_match:
                 raise WalCorruptError("landed commit parent differs from WAL", oid=event.oid)
             actual_tree = self.repo.git_text("show", "-s", "--format=%T", commit)
             if actual_tree != expected_tree:
@@ -1477,7 +1515,7 @@ class Coordinator:
     def _divergences(
         self,
         state: _FoldedState,
-        targets: Sequence[str] = (),
+        heads: _AuditHeads,
     ) -> tuple[Divergence, ...]:
         """Compare every target the WAL knows against what the WAL says landed.
 
@@ -1499,12 +1537,12 @@ class Coordinator:
         """
 
         found: list[Divergence] = []
-        audit_targets = tuple(sorted(set(state.target_positions).union(targets)))
-        for target in audit_targets:
-            head = self.repo.resolve_ref(target, missing_ok=True)
-            landed_here = [
-                event for event in state.landed if event.data.get("target") == target
-            ]
+        for target, head in heads:
+            landed_here = (
+                []
+                if target == "HEAD"
+                else [event for event in state.landed if event.data.get("target") == target]
+            )
             if head is None:
                 found.extend(
                     Divergence(
@@ -1544,7 +1582,7 @@ class Coordinator:
                             operation=operation,
                         )
                     )
-        found.extend(self._unrecorded_landings(state, audit_targets))
+        found.extend(self._unrecorded_landings(state, heads))
         return tuple(found)
 
     def _audit_marked_commits(
@@ -1591,60 +1629,65 @@ class Coordinator:
     def inspect_wal(self, target: str | None = None) -> WalReport:
         """Inspect without mutating, including states that mutation must refuse."""
 
-        snapshot = self.wal.read()
-        state = self._fold(snapshot)
-        self._verify_landed(state)
-        targets = self._audit_targets(state, target)
-        boundaries: list[Divergence] = []
-        graft_file = self.repo.nonempty_graft_file()
-        if graft_file is not None:
-            boundaries.extend(
-                Divergence(
-                    "legacy_grafts",
-                    audit_target,
-                    f"the non-empty legacy graft file {graft_file} can hide history and "
-                    "must be converted or removed before mutation",
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self.wal.read()
+            state = self._fold(snapshot)
+            self._verify_landed(state)
+            heads = self._audit_heads(state, target)
+            targets = self._audit_target_names(heads)
+            boundaries: list[Divergence] = []
+            graft_file = self.repo.nonempty_graft_file()
+            if graft_file is not None:
+                boundaries.extend(
+                    Divergence(
+                        "legacy_grafts",
+                        audit_target,
+                        f"the non-empty legacy graft file {graft_file} can hide history and "
+                        "must be converted or removed before mutation",
+                    )
+                    for audit_target in targets
                 )
-                for audit_target in targets
-            )
-        if self.repo.is_shallow():
-            boundaries.extend(
-                Divergence(
-                    "shallow_history",
-                    audit_target,
-                    "the repository is shallow, so history below its boundary was not audited",
+            if self.repo.is_shallow():
+                boundaries.extend(
+                    Divergence(
+                        "shallow_history",
+                        audit_target,
+                        "the repository is shallow, so history below its boundary was not audited",
+                    )
+                    for audit_target in targets
                 )
-                for audit_target in targets
+            divergences = (*boundaries, *self._divergences(state, heads))
+            now = time.time()
+            sessions = tuple(
+                sorted(actor for actor in state.sessions if state.session_active(actor, now))
             )
-        divergences = (*boundaries, *self._divergences(state, targets))
-        now = time.time()
-        sessions = tuple(
-            sorted(actor for actor in state.sessions if state.session_active(actor, now))
-        )
-        claims = tuple(sorted({claim.path for claim in state.active_claims(now)}))
-        locks = self._held_locks(state)
-        return WalReport(
-            snapshot.head,
-            snapshot.events,
-            not state.pending and not divergences,
-            len(state.pending),
-            sessions,
-            claims,
-            divergences,
-            locks,
-            self.repo.temp_indexes(),
-        )
+            claims = tuple(sorted({claim.path for claim in state.active_claims(now)}))
+            locks = self._held_locks(state)
+            temp_indexes = self.repo.temp_indexes()
+            if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
+                continue
+            return WalReport(
+                snapshot.head,
+                snapshot.events,
+                not state.pending and not divergences,
+                len(state.pending),
+                sessions,
+                claims,
+                divergences,
+                locks,
+                temp_indexes,
+            )
+        raise GitError("audit snapshot retry limit exceeded", retries=MAX_CAS_RETRIES)
 
     def adopt_landings(self, target: str | None = None) -> AdoptionResult:
         """Explicitly record every unrecorded landing found by the local audit."""
 
-        target_ref = (
-            self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
-        )
+        target_ref = None if target is None else self.repo.validate_branch_ref(target)
         for _ in range(MAX_CAS_RETRIES):
             snapshot = self.wal.read()
             state = self._fold(snapshot)
-            targets = self._audit_targets(state, target_ref)
+            heads = self._audit_heads(state, target_ref)
+            targets = self._audit_target_names(heads)
             self._refuse_legacy_grafts(targets)
             if self.repo.is_shallow():
                 raise ShallowHistoryError(
@@ -1652,7 +1695,9 @@ class Coordinator:
                     targets=list(targets),
                     repair="deepen the repository before adopting",
                 )
-            unrecorded = self._unrecorded_landings(state, targets)
+            unrecorded = self._unrecorded_landings(state, heads)
+            if self.wal.head() != snapshot.head or self._audit_heads(state, target_ref) != heads:
+                continue
             if not unrecorded:
                 raise UnrecordedLandingError(
                     "the audit found no unrecorded broker landings to adopt",
@@ -1665,12 +1710,6 @@ class Coordinator:
                 if item.commit is None or item.operation is None:
                     raise AssertionError("unrecorded landing has no commit or operation")
                 parents = self.repo.commit_parents(item.commit)
-                if len(parents) != 1:
-                    raise GitError(
-                        "cannot adopt a broker landing without exactly one parent",
-                        commit=item.commit,
-                        parents=list(parents),
-                    )
                 tree = self.repo.git_text("show", "-s", "--format=%T", item.commit)
                 documents.append(
                     self.wal.document(
@@ -1679,12 +1718,14 @@ class Coordinator:
                         {
                             "operation": item.operation,
                             "target": item.target,
-                            "expected_head": parents[0],
+                            "expected_head": parents[0] if parents else self.repo.zero_oid,
                             "commit": item.commit,
                             "tree": tree,
                         },
                     )
                 )
+            if self._audit_heads(state, target_ref) != heads:
+                continue
             records = self._try_append(state, snapshot, documents)
             if records is None:
                 continue
@@ -1820,7 +1861,10 @@ class Coordinator:
             # to leave unexamined while reporting an all-clear.
             locks = self._held_locks(state)
             self._verify_landed(state)
-            divergences = self._divergences(state, self._audit_targets(state, target))
+            heads = self._audit_heads(state, target)
+            divergences = self._divergences(state, heads)
+            if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
+                continue
             if not divergences:
                 if in_flight:
                     return RecoveryResult(False, in_flight, repaired, refused, locks)

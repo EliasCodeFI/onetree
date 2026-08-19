@@ -121,6 +121,30 @@ def _unrecorded_landing(coordinator: Coordinator, parent: str, operation: str) -
     return commit
 
 
+def _marked_commit(
+    coordinator: Coordinator,
+    reference: str,
+    operation: str,
+    parents: Sequence[str],
+    *,
+    tree_from: str | None = None,
+    extra: str = "",
+) -> str:
+    """Put one broker-marked commit on ``reference`` without touching the WAL."""
+
+    repository = coordinator.repo
+    source = tree_from or (parents[0] if parents else repository.require_commit("HEAD"))
+    tree = repository.git_text("show", "-s", "--format=%T", source)
+    commit = repository.commit_tree(
+        tree,
+        f"unrecorded landing\n\nOnetree-Operation: {operation}{extra}\n",
+        parents,
+    )
+    previous = repository.resolve_ref(reference, missing_ok=True)
+    assert repository.update_ref(reference, commit, previous)
+    return commit
+
+
 def _make_commit_graph_entry_parentless(commit_graph: Path, commit: str) -> None:
     """Make one SHA-1 commit-graph row a checksum-valid false root."""
 
@@ -702,6 +726,193 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
 
 
 @pytest.mark.parametrize(
+    "shape",
+    [
+        "wal_unknown_branch",
+        "root",
+        "merge",
+        "copied_operation",
+        "detached",
+        "detached_only",
+    ],
+)
+def test_repository_wide_audit_and_adoption_cover_every_landing_shape(
+    git_repo: GitFixture,
+    shape: str,
+) -> None:
+    """Every local branch plus HEAD is audited, and every refusal has an escape."""
+
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "recorded landing\n")
+    landed = coordinator.land("alpha", message="recorded landing")
+    main = git_repo.oid()
+    operation = "f" * 32
+
+    if shape == "wal_unknown_branch":
+        target = "refs/heads/release"
+        git_repo.git("branch", "release", main)
+        candidate = _marked_commit(coordinator, target, operation, (main,))
+        expected_head = main
+    elif shape == "root":
+        target = "refs/heads/orphan"
+        candidate = _marked_commit(
+            coordinator,
+            target,
+            operation,
+            (),
+            tree_from=main,
+        )
+        expected_head = coordinator.repo.zero_oid
+    elif shape == "merge":
+        target = "refs/heads/main"
+        tree = coordinator.repo.git_text("show", "-s", "--format=%T", main)
+        side = coordinator.repo.commit_tree(tree, "ordinary side", (main,))
+        assert coordinator.repo.update_ref("refs/heads/feature", side, None)
+        candidate = _marked_commit(coordinator, target, operation, (main, side))
+        expected_head = main
+    elif shape == "copied_operation":
+        target = "refs/heads/release"
+        operation = landed.operation
+        (expected_head,) = coordinator.repo.commit_parents(landed.commit)
+        candidate = _marked_commit(
+            coordinator,
+            target,
+            operation,
+            (expected_head,),
+            tree_from=landed.commit,
+        )
+    elif shape == "detached":
+        target = "refs/heads/main"
+        candidate = _marked_commit(coordinator, target, operation, (main,))
+        expected_head = main
+        git_repo.git("checkout", "--quiet", "--detach", candidate)
+    else:
+        target = "HEAD"
+        tree = coordinator.repo.git_text("show", "-s", "--format=%T", main)
+        candidate = coordinator.repo.commit_tree(
+            tree,
+            coordinator.repo.landing_message(
+                "detached-only landing", operation, "e" * 32, "ghost"
+            ),
+            (main,),
+        )
+        expected_head = main
+        git_repo.git("checkout", "--quiet", "--detach", candidate)
+
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.target, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", target, candidate)
+    ]
+    explicit_target = "refs/heads/main" if shape == "detached_only" else None
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session(
+            "beta",
+            pid=os.getpid(),
+            ttl=300,
+            target=explicit_target,
+        )
+    assert refused.value.kind == "unrecorded_landing"
+
+    adoption = coordinator.adopt_landings()
+    assert len(adoption.adopted) == 1
+    adopted = adoption.adopted[0]
+    assert frozenset(adopted.data) == {
+        "operation",
+        "target",
+        "expected_head",
+        "commit",
+        "tree",
+    }
+    assert adopted.data["operation"] == operation
+    assert adopted.data["target"] == target
+    assert adopted.data["expected_head"] == expected_head
+    assert adopted.data["commit"] == candidate
+    assert adoption.report.consistent
+    registered = coordinator.register_session(
+        "beta",
+        pid=os.getpid(),
+        ttl=300,
+        target=explicit_target,
+    )
+    if shape == "detached":
+        coordinator.claim("beta", [str(git_repo.root / "nested/c.txt")])
+        _stage(git_repo, registered, "nested/c.txt", "post-adoption landing\n")
+        assert coordinator.land("beta", message="post-adoption landing").target == target
+
+
+def test_a_completed_peer_landing_restarts_the_audit_snapshot(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete peer interleave is recorded, not misreported as unrecorded."""
+
+    coordinator = Coordinator(git_repo.root)
+    peer = _register(coordinator, git_repo, "peer", "b.txt")
+    _stage(git_repo, peer, "b.txt", "peer landing\n")
+    original = Coordinator._unrecorded_landings
+    fired: list[bool] = []
+
+    def interleave(
+        self: Coordinator,
+        state: Any,
+        targets: Any,
+    ) -> Any:
+        if not fired:
+            fired.append(True)
+            coordinator.land("peer", message="complete peer landing")
+        return original(self, state, targets)
+
+    monkeypatch.setattr(Coordinator, "_unrecorded_landings", interleave)
+
+    registered = coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+
+    assert fired == [True]
+    assert registered.actor == "beta"
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_branch_move_without_a_wal_write_restarts_the_audit_snapshot(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed captured ref is retried even when the WAL head did not move."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    main = git_repo.oid()
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", main)
+    candidate = coordinator.repo.commit_tree(
+        tree,
+        coordinator.repo.landing_message(
+            "unrecorded interleave", "d" * 32, "e" * 32, "ghost"
+        ),
+        (main,),
+    )
+    original = Coordinator._unrecorded_landings
+    fired: list[bool] = []
+
+    def interleave(
+        self: Coordinator,
+        state: Any,
+        targets: Any,
+    ) -> Any:
+        if not fired:
+            fired.append(True)
+            assert coordinator.repo.update_ref("refs/heads/main", candidate, main)
+        return original(self, state, targets)
+
+    monkeypatch.setattr(Coordinator, "_unrecorded_landings", interleave)
+
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+
+    assert fired == [True]
+    assert refused.value.kind == "unrecorded_landing"
+    assert coordinator.wal.read().events[-1].actor == "alpha"
+
+
+@pytest.mark.parametrize(
     ("hidden_by", "expected_refusal"),
     [("replace", "unrecorded_landing"), ("grafts", "legacy_grafts")],
 )
@@ -910,6 +1121,76 @@ def test_trailer_configuration_cannot_hide_a_landing(
     assert refused.value.kind == "unrecorded_landing"
 
 
+@pytest.mark.parametrize(
+    ("raw_message", "expected"),
+    [
+        pytest.param(
+            b"subject\n\nOnetree-Operation: "
+            + b"a" * 32
+            + b"\n(cherry picked from commit "
+            + b"1" * 40
+            + b")\n",
+            "a" * 32,
+            id="git-generated-line",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n# fixed comment\n",
+            "a" * 32,
+            id="fixed-comment-line",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\nordinary prose\n",
+            None,
+            id="ordinary-prose-negative-control",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: "
+            + b"a" * 32
+            + b"\n(cherry picked from commit "
+            + b"1" * 40
+            + b")\n"
+            + b"\n".join(f"prose {index}".encode() for index in range(6))
+            + b"\n",
+            "a" * 32,
+            id="exactly-25-percent-trailers",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: "
+            + b"a" * 32
+            + b"\n(cherry picked from commit "
+            + b"1" * 40
+            + b")\n"
+            + b"\n".join(f"prose {index}".encode() for index in range(7))
+            + b"\n",
+            None,
+            id="below-25-percent-negative-control",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n---\npatch text\n",
+            "a" * 32,
+            id="divider-ends-message",
+        ),
+        pytest.param(
+            b"Onetree-Operation: " + b"a" * 32 + b"\n",
+            None,
+            id="title-is-not-a-trailer-block",
+        ),
+        pytest.param(
+            b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n",
+            "a" * 32,
+            id="all-trailers-control",
+        ),
+    ],
+)
+def test_fixed_trailer_block_boundary_matches_the_audit_contract(
+    raw_message: bytes,
+    expected: str | None,
+) -> None:
+    """The fixed parser accepts Git's stable shapes without reading repository config."""
+
+    assert Repository._landing_operation_from_message(raw_message, commit="a" * 40) == expected
+
+
 def test_configured_log_encoding_cannot_reframe_audit_messages(
     git_repo: GitFixture,
 ) -> None:
@@ -1028,6 +1309,68 @@ def test_signature_display_configuration_cannot_precede_audit_records(
     marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
     assert marked[signed] == operation
     assert coordinator.repo.landing_operation(signed) == operation
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("call_site", ["adopt", "verify"])
+def test_wal_audit_never_executes_the_repositorys_signature_program(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    call_site: str,
+) -> None:
+    """Both tree-verification paths are read-only even for a signed branch commit."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "3" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    raw_commit = coordinator.repo.git("cat-file", "commit", hidden).stdout
+    headers, divider, message = raw_commit.partition(b"\n\n")
+    assert divider == b"\n\n"
+    signed_content = (
+        headers
+        + b"\ngpgsig -----BEGIN PGP SIGNATURE-----\n"
+        + b" deliberately invalid\n"
+        + b" -----END PGP SIGNATURE-----\n\n"
+        + message
+    )
+    signed = coordinator.repo.git_text(
+        "hash-object",
+        "--literally",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+        input_bytes=signed_content,
+    )
+    assert coordinator.repo.update_ref("refs/heads/main", signed, hidden)
+
+    if call_site == "verify":
+        coordinator.adopt_landings()
+
+    marker = tmp_path / f"gpg-{call_site}-invoked"
+    fake_gpg = tmp_path / f"fake-gpg-{call_site}"
+    fake_gpg.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('invoked', encoding='utf-8')\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    fake_gpg.chmod(0o755)
+    git_repo.git("config", "log.showSignature", "true")
+    git_repo.git("config", "gpg.program", str(fake_gpg))
+
+    unpinned = git_repo.git("show", "-s", "--format=%T", signed, check=False)
+    assert unpinned.returncode == 0
+    assert marker.is_file()
+    marker.unlink()
+
+    if call_site == "adopt":
+        coordinator.adopt_landings()
+    else:
+        coordinator.inspect_wal()
+
     assert not marker.exists()
 
 
@@ -2732,7 +3075,7 @@ def test_missing_wal_detection_and_adoption_do_not_depend_on_clone_shape(
     coordinator.register_session("beta", pid=os.getpid(), ttl=300, target=target)
 
 
-def test_a_first_wal_append_on_another_branch_does_not_disarm_the_guard(
+def test_a_landing_on_another_local_branch_blocks_the_first_wal_append(
     tmp_path: Path,
 ) -> None:
     _, remote, landed = _published_broker_repository(tmp_path)
@@ -2746,21 +3089,17 @@ def test_a_first_wal_append_on_another_branch_does_not_disarm_the_guard(
     fixture = GitFixture(clone, landed)
     fixture.git("checkout", "--quiet", "clean")
     coordinator = Coordinator(clone)
-    coordinator.register_session(
-        "clean-session", pid=os.getpid(), ttl=300, target="refs/heads/clean"
-    )
-    assert coordinator.wal.head() is not None
-
-    fixture.git("checkout", "--quiet", "main")
     with pytest.raises(OnetreeError) as refused:
         coordinator.register_session(
-            "main-session", pid=os.getpid(), ttl=300, target="refs/heads/main"
+            "clean-session", pid=os.getpid(), ttl=300, target="refs/heads/clean"
         )
     assert refused.value.kind == "unrecorded_landing"
-    adoption = coordinator.adopt_landings("refs/heads/main")
+    assert coordinator.wal.head() is None
+
+    adoption = coordinator.adopt_landings()
     assert [event.data["commit"] for event in adoption.adopted] == [landed]
     coordinator.register_session(
-        "main-session", pid=os.getpid(), ttl=300, target="refs/heads/main"
+        "clean-session", pid=os.getpid(), ttl=300, target="refs/heads/clean"
     )
 
 
