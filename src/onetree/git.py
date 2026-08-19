@@ -22,12 +22,18 @@ _GIT_COMMON_OPTIONS = (
     "advice.graftFileDeprecated=false",
     "-c",
     "core.commitGraph=false",
+    "-c",
+    "core.multiPackIndex=false",
 )
 
 #: Operation id carried by every broker-built candidate commit. It is what
 #: makes a landing self-identifying in ordinary Git history, so divergence
 #: detection can tell a broker commit apart from a permitted hand commit.
 LANDING_TRAILER = "Onetree-Operation"
+_LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
+_TRAILER_LINE = re.compile(
+    rb"(?P<key>[A-Za-z0-9-]+)[ \t]*:[ \t]*(?P<value>.*)"
+)
 _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
@@ -119,11 +125,15 @@ class Repository:
     def _environment(index: Path | None = None) -> dict[str, str]:
         environment = os.environ.copy()
         for name in (
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_COMMON_DIR",
             "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
             "GIT_SHALLOW_FILE",
+            "GIT_TEST_COMMIT_GRAPH",
+            "GIT_TEST_MULTI_PACK_INDEX",
         ):
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
@@ -767,14 +777,16 @@ class Repository:
         arguments = (
             "log",
             "-z",
-            "--format=%H%x00%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)",
+            "--encoding=UTF-8",
+            "--no-show-signature",
+            "--format=%H%x00",
             target,
             *(f"^{oid}" for oid in excludes),
             "--",
         )
         # stderr goes to a file rather than a pipe. Git can therefore fill it
         # without blocking before it closes stdout.
-        found: list[MarkedCommit] = []
+        found: list[str] = []
         with tempfile.TemporaryFile() as stderr_file:
             try:
                 if _GIT_EXECUTABLE is None:
@@ -814,7 +826,7 @@ class Repository:
                         if pending_oid is None:
                             pending_oid = field
                         else:
-                            found.append(self._parse_marked_commit(pending_oid, field, target))
+                            found.append(self._parse_walked_commit(pending_oid, field, target))
                             pending_oid = None
                 malformed_stream = bool(buffer or pending_oid is not None)
                 returncode = process.wait()
@@ -837,38 +849,158 @@ class Repository:
                 )
             if malformed_stream:
                 raise GitError("malformed commit listing stream", reference=target)
-        return iter(found)
+        return iter(self._marked_commits_from_oids(found, reference=target))
 
-    def _parse_marked_commit(
+    def _parse_walked_commit(
         self,
         raw_oid: bytes,
-        raw_trailer: bytes,
+        raw_padding: bytes,
         target: str,
-    ) -> MarkedCommit:
+    ) -> str:
         try:
             oid = raw_oid.strip().decode("ascii", errors="strict")
         except UnicodeDecodeError as error:
             raise GitError("commit listing object ID is not ASCII", reference=target) from error
+        commit = self.validate_oid(oid, label="target")
+        if raw_padding:
+            raise GitError("malformed commit listing stream", reference=target)
+        return commit
+
+    def _marked_commits_from_oids(
+        self,
+        commits: Sequence[str],
+        *,
+        reference: str,
+    ) -> list[MarkedCommit]:
+        """Read raw commits through Git's size-framed batch protocol."""
+
+        if not commits:
+            return []
+        requests = b"".join(commit.encode("ascii") + b"\n" for commit in commits)
+        with tempfile.TemporaryFile() as output_file, tempfile.TemporaryFile() as stderr_file:
+            try:
+                if _GIT_EXECUTABLE is None:
+                    raise OSError("git executable was not found on PATH")
+                completed = subprocess.run(  # noqa: S603 - argv-only Git plumbing
+                    [
+                        _GIT_EXECUTABLE,
+                        *_GIT_COMMON_OPTIONS,
+                        "-C",
+                        str(self.root),
+                        "cat-file",
+                        "--batch",
+                    ],
+                    check=False,
+                    input=requests,
+                    stdout=output_file,
+                    stderr=stderr_file,
+                    env=self._environment(),
+                )
+            except OSError as error:
+                raise GitError(
+                    "could not execute git: " + str(error),
+                    operation="cat-file",
+                ) from error
+            if completed.returncode != 0:
+                stderr_file.seek(0)
+                stderr = stderr_file.read(64 * 1024 + 1)
+                truncated = len(stderr) > 64 * 1024
+                detail = stderr[: 64 * 1024].decode("utf-8", errors="replace").strip()
+                if truncated:
+                    detail += " [stderr truncated]"
+                raise GitError(
+                    f"git cat-file failed with exit {completed.returncode}: {detail}",
+                    operation="cat-file",
+                    returncode=completed.returncode,
+                )
+
+            output_file.seek(0)
+            found: list[MarkedCommit] = []
+            for commit in commits:
+                header = output_file.readline().removesuffix(b"\n")
+                fields = header.split(b" ")
+                expected_oid = commit.encode("ascii")
+                if (
+                    len(fields) != 3
+                    or fields[0] != expected_oid
+                    or fields[1] != b"commit"
+                    or not fields[2].isdigit()
+                ):
+                    raise GitError(
+                        "malformed cat-file batch header",
+                        reference=reference,
+                        commit=commit,
+                    )
+                size = int(fields[2])
+                raw_object = output_file.read(size)
+                if len(raw_object) != size or output_file.read(1) != b"\n":
+                    raise GitError(
+                        "truncated cat-file batch object",
+                        reference=reference,
+                        commit=commit,
+                    )
+                raw_message = self._commit_message(raw_object, commit=commit)
+                operation = self._landing_operation_from_message(raw_message, commit=commit)
+                found.append(MarkedCommit(commit, operation))
+            if output_file.read(1):
+                raise GitError("unexpected cat-file batch output", reference=reference)
+        return found
+
+    @staticmethod
+    def _commit_message(raw_object: bytes, *, commit: str) -> bytes:
+        _, separator, raw_message = raw_object.partition(b"\n\n")
+        if not separator:
+            raise GitError("commit object has no header terminator", commit=commit)
+        return raw_message
+
+    @staticmethod
+    def _landing_operation_from_message(raw_message: bytes, *, commit: str) -> str | None:
+        """Parse onetree's fixed final trailer block without Git's configurable parser."""
+
+        lines = [
+            line[:-1] if line.endswith(b"\r") else line
+            for line in raw_message.split(b"\n")
+        ]
+        while lines and not lines[-1].strip(b" \t"):
+            lines.pop()
+        if not lines:
+            return None
+
+        block_start = 0
+        for index in range(len(lines) - 1, -1, -1):
+            if not lines[index].strip(b" \t"):
+                block_start = index + 1
+                break
+
+        parsed: list[tuple[bytes, bytes]] = []
+        for line in lines[block_start:]:
+            if line.startswith((b" ", b"\t")):
+                if not parsed:
+                    return None
+                key, value = parsed[-1]
+                parsed[-1] = (key, value + b" " + line.strip(b" \t"))
+                continue
+            match = _TRAILER_LINE.fullmatch(line)
+            if match is None:
+                return None
+            parsed.append((match.group("key"), match.group("value")))
+
+        values = [
+            value.strip(b" \t")
+            for key, value in parsed
+            if key.lower() == _LANDING_TRAILER_BYTES
+        ]
+        if not values:
+            return None
         try:
-            trailer = raw_trailer.decode("utf-8", errors="strict")
+            operation = b",".join(values).decode("utf-8", errors="strict").strip()
         except UnicodeDecodeError as error:
-            raise GitError("commit listing is not UTF-8", reference=target) from error
-        operation = trailer.strip() or None
-        return MarkedCommit(self.validate_oid(oid, label="target"), operation)
+            raise GitError("landing trailer is not UTF-8", commit=commit) from error
+        return operation or None
 
     def landing_operation(self, commit: str) -> str | None:
         """Read the real landing trailer from exactly one commit."""
 
-        raw = self.git(
-            "show",
-            "-s",
-            "--format=%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)",
-            commit,
-        ).stdout.strip()
-        if not raw:
-            return None
-        try:
-            operation = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as error:
-            raise GitError("landing trailer is not UTF-8", commit=commit) from error
-        return operation
+        raw_object = self.git("cat-file", "commit", commit).stdout
+        raw_message = self._commit_message(raw_object, commit=commit)
+        return self._landing_operation_from_message(raw_message, commit=commit)

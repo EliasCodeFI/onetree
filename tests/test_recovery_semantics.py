@@ -148,6 +148,43 @@ def _make_commit_graph_entry_parentless(commit_graph: Path, commit: str) -> None
     commit_graph.write_bytes(content)
 
 
+def _make_midx_entry_point_to(midx: Path, victim: str, decoy: str) -> None:
+    """Make one MIDX row return another object's bytes, preserving its checksum."""
+
+    content = bytearray(midx.read_bytes())
+    assert content[:5] == b"MIDX\x01"
+    oid_version = content[5]
+    if oid_version == 1:
+        hash_length = 20
+        digest = hashlib.sha1  # noqa: S324 - Git's repository format requires SHA-1
+    elif oid_version == 2:
+        hash_length = 32
+        digest = hashlib.sha256
+    else:  # pragma: no cover - Repository rejects unknown object formats first
+        raise AssertionError(f"unsupported MIDX object format {oid_version}")
+
+    chunks: dict[bytes, int] = {}
+    for index in range(content[6] + 1):
+        start = 12 + index * 12
+        chunk_id = bytes(content[start : start + 4])
+        chunks[chunk_id] = struct.unpack(">Q", content[start + 4 : start + 12])[0]
+    fanout = chunks[b"OIDF"]
+    object_count = struct.unpack(">I", content[fanout + 255 * 4 : fanout + 256 * 4])[0]
+    oid_lookup = chunks[b"OIDL"]
+    oids = [
+        bytes(content[oid_lookup + index * hash_length : oid_lookup + (index + 1) * hash_length])
+        for index in range(object_count)
+    ]
+    victim_index = oids.index(bytes.fromhex(victim))
+    decoy_index = oids.index(bytes.fromhex(decoy))
+    offsets = chunks[b"OOFF"]
+    decoy_entry = bytes(content[offsets + decoy_index * 8 : offsets + (decoy_index + 1) * 8])
+    assert decoy_entry[4] & 0x80 == 0, "fixture requires a directly encoded pack offset"
+    content[offsets + victim_index * 8 : offsets + (victim_index + 1) * 8] = decoy_entry
+    content[-hash_length:] = digest(content[:-hash_length], usedforsecurity=False).digest()
+    midx.write_bytes(content)
+
+
 def _published_broker_repository(
     tmp_path: Path,
     *,
@@ -773,6 +810,364 @@ def test_the_empty_graft_override_does_not_add_deprecation_advice(
 
 
 @pytest.mark.parametrize(
+    ("config_route", "config_key", "config_value"),
+    [
+        pytest.param("local", "trailer.separators", "=", id="local-separator"),
+        pytest.param(
+            "local",
+            "trailer.Onetree-Operation.key",
+            "X",
+            id="local-exact-key-rewrite",
+        ),
+        pytest.param(
+            "local",
+            "trailer.hostile.key",
+            "Onetree-OperationX",
+            id="local-key-prefix-rewrite",
+        ),
+        pytest.param("global", "trailer.separators", "=", id="global-separator"),
+        pytest.param("system", "trailer.separators", "=", id="system-separator"),
+        pytest.param("worktree", "trailer.separators", "=", id="worktree-separator"),
+        pytest.param(
+            "command-environment",
+            "trailer.separators",
+            "=",
+            id="command-environment-separator",
+        ),
+        pytest.param(
+            "command-parameters",
+            "trailer.separators",
+            "=",
+            id="command-parameters-separator",
+        ),
+    ],
+)
+def test_trailer_configuration_cannot_hide_a_landing(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_route: str,
+    config_key: str,
+    config_value: str,
+) -> None:
+    """Git's configurable trailer parser is not onetree's parser contract."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "7" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+
+    for name in (
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    if config_route == "local":
+        git_repo.git("config", config_key, config_value)
+    elif config_route == "worktree":
+        git_repo.git("config", "extensions.worktreeConfig", "true")
+        git_repo.git("config", "--worktree", config_key, config_value)
+    elif config_route == "global":
+        global_config = tmp_path / "global.config"
+        global_config.write_text("[trailer]\n\tseparators = =\n", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    elif config_route == "system":
+        system_config = tmp_path / "system.config"
+        system_config.write_text("[trailer]\n\tseparators = =\n", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
+    elif config_route == "command-environment":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", config_key)
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", config_value)
+    else:
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'{config_key}'='{config_value}'")
+
+    format_argument = (
+        "--format=%H%x00%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)"
+    )
+    unpinned_fields = git_repo.git(
+        "log", "-z", format_argument, "refs/heads/main", "--"
+    ).stdout.split("\0")
+    hidden_position = unpinned_fields.index(hidden)
+    assert unpinned_fields[hidden_position + 1] == ""
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == operation
+    assert coordinator.repo.landing_operation(hidden) == operation
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_configured_log_encoding_cannot_reframe_audit_messages(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "6" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    git_repo.git("config", "i18n.logOutputEncoding", "UTF-16")
+
+    unpinned = coordinator.repo.git(
+        "log", "-1", "-z", "--format=%H%x00%B", hidden, "--"
+    ).stdout
+    assert unpinned.startswith(b"\xff\xfe")
+    assert unpinned.count(b"\x00") > 40
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == operation
+    assert coordinator.repo.landing_operation(hidden) == operation
+
+
+def test_a_nul_in_a_commit_message_cannot_hide_its_final_trailer(
+    git_repo: GitFixture,
+) -> None:
+    """Raw object framing must not inherit pretty-format NUL truncation."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "4" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    raw_object = coordinator.repo.git("cat-file", "commit", hidden).stdout
+    headers, separator, message = raw_object.partition(b"\n\n")
+    body, trailer_separator, trailers = message.partition(b"\n\n")
+    assert separator == b"\n\n"
+    assert trailer_separator == b"\n\n"
+    nul_object = (
+        headers
+        + separator
+        + body
+        + b"\x00pretty output stops here"
+        + trailer_separator
+        + trailers
+    )
+    nul_hidden = coordinator.repo.git_text(
+        "hash-object",
+        "--literally",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+        input_bytes=nul_object,
+    )
+    assert coordinator.repo.update_ref("refs/heads/main", nul_hidden, hidden)
+
+    pretty = coordinator.repo.git("show", "-s", "--format=%B", nul_hidden).stdout
+    assert b"Onetree-Operation" not in pretty
+    assert b"\x00" in coordinator.repo.git("cat-file", "commit", nul_hidden).stdout
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[nul_hidden] == operation
+    assert coordinator.repo.landing_operation(nul_hidden) == operation
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", nul_hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_signature_display_configuration_cannot_precede_audit_records(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "5" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    raw_commit = coordinator.repo.git("cat-file", "commit", hidden).stdout
+    headers, divider, message = raw_commit.partition(b"\n\n")
+    assert divider == b"\n\n"
+    signed_content = (
+        headers
+        + b"\ngpgsig -----BEGIN PGP SIGNATURE-----\n"
+        + b" deliberately invalid\n"
+        + b" -----END PGP SIGNATURE-----\n\n"
+        + message
+    )
+    signed = coordinator.repo.git_text(
+        "hash-object",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+        input_bytes=signed_content,
+    )
+    assert coordinator.repo.update_ref("refs/heads/main", signed, hidden)
+
+    marker = tmp_path / "gpg-invoked"
+    fake_gpg = tmp_path / "fake-gpg"
+    fake_gpg.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('invoked', encoding='utf-8')\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    fake_gpg.chmod(0o755)
+    git_repo.git("config", "log.showSignature", "true")
+    git_repo.git("config", "gpg.program", str(fake_gpg))
+
+    unpinned = git_repo.git("log", "-1", "--format=%H", signed, "--", check=False)
+    assert unpinned.returncode == 0
+    assert marker.is_file()
+    marker.unlink()
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[signed] == operation
+    assert coordinator.repo.landing_operation(signed) == operation
+    assert not marker.exists()
+
+
+def test_a_midx_cannot_substitute_landing_bytes(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audit ignores a checksum-valid MIDX whose OID-to-offset row lies."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "8" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    parent = coordinator.repo.git_text("rev-parse", f"{hidden}^")
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", hidden)
+    decoy = coordinator.repo.commit_tree(tree, "ordinary work", (parent,))
+    git_repo.git("update-ref", "refs/heads/midx-decoy", decoy)
+    git_repo.git("repack", "-a", "-d", "-q")
+    git_repo.git("update-ref", "-d", "refs/heads/midx-decoy")
+    git_repo.git("multi-pack-index", "write")
+    midx = coordinator.repo.common_git_dir / "objects" / "pack" / "multi-pack-index"
+    assert midx.is_file()
+
+    format_argument = (
+        "--format=%H%x00%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)"
+    )
+    control_fields = git_repo.git(
+        "log", "-z", format_argument, "refs/heads/main", "--"
+    ).stdout.split("\0")
+    assert control_fields[control_fields.index(hidden) + 1] == operation
+    assert git_repo.git("multi-pack-index", "verify", check=False).returncode == 0
+
+    _make_midx_entry_point_to(midx, hidden, decoy)
+
+    assert git_repo.git("multi-pack-index", "verify", check=False).returncode == 1
+    blinded_fields = git_repo.git(
+        "log", "-z", format_argument, "refs/heads/main", "--"
+    ).stdout.split("\0")
+    assert blinded_fields[blinded_fields.index(hidden) + 1] == ""
+    substituted = git_repo.git("cat-file", "commit", hidden).stdout
+    assert "ordinary work" in substituted
+    assert "Onetree-Operation" not in substituted
+
+    # Command-scope config is lower precedence than onetree's explicit -c, but Git's
+    # test-only override is applied after config and must be removed from the child.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.multiPackIndex")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    monkeypatch.setenv("GIT_TEST_MULTI_PACK_INDEX", "1")
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == operation
+    assert coordinator.repo.landing_operation(hidden) == operation
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_an_ambient_object_directory_cannot_redirect_audit_reads(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "a" * 32)
+    ambient_objects = tmp_path / "ambient-objects"
+    ambient_objects.mkdir()
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(ambient_objects))
+
+    assert git_repo.git("log", "--format=%H", "HEAD", "--", check=False).returncode != 0
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    assert coordinator.repo.landing_operation(hidden) == "a" * 32
+
+
+def test_an_ambient_alternate_cannot_make_an_incomplete_repository_look_complete(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "b" * 32)
+    git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    git_repo.git("repack", "-a", "-d", "-q")
+
+    pack_directory = coordinator.repo.common_git_dir / "objects" / "pack"
+    alternate = tmp_path / "alternate-objects"
+    alternate_pack = alternate / "pack"
+    alternate_pack.mkdir(parents=True)
+    packed_files = list(pack_directory.glob("pack-*"))
+    assert packed_files
+    for packed_file in packed_files:
+        packed_file.replace(alternate_pack / packed_file.name)
+
+    assert git_repo.git("log", "--format=%H", "HEAD", "--", check=False).returncode != 0
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(alternate))
+    ambient_visible = git_repo.git("log", "--format=%H", "HEAD", "--").stdout.split()
+    assert hidden in ambient_visible
+
+    with pytest.raises(GitError, match="git log failed"):
+        list(coordinator.repo.marked_commits("HEAD"))
+
+
+@pytest.mark.parametrize("variable", ["GIT_DIR", "GIT_COMMON_DIR"])
+def test_ambient_repository_directories_cannot_change_audit_reads(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    operation = "c" * 32
+    hidden = _unrecorded_landing(coordinator, git_repo.base, operation)
+    alternate = _repository_with_ref_backend(tmp_path / "alternate", "files")
+    monkeypatch.setenv(variable, str(alternate.root / ".git"))
+
+    redirected = git_repo.git("log", "--format=%H", "HEAD", "--", check=False)
+    if variable == "GIT_DIR":
+        assert redirected.returncode == 0
+        assert redirected.stdout.split() == [alternate.base]
+    else:
+        assert redirected.returncode != 0
+        assert "bad object HEAD" in redirected.stderr
+
+    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == operation
+    assert coordinator.repo.landing_operation(hidden) == operation
+
+
+@pytest.mark.parametrize(
     "suffix",
     [
         pytest.param("\x1e" + "b" * 40 + "\x1f" + "c" * 32, id="forged-record"),
@@ -816,7 +1211,7 @@ def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
     raw_log = coordinator.repo.git(
         "log",
         "-z",
-        "--format=%H%x00%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)",
+        "--format=%H%x00",
         head,
         "--",
     ).stdout
@@ -835,7 +1230,7 @@ def test_a_malformed_stream_record_is_refused_before_it_can_become_an_object_id(
     repository = Repository(git_repo.root)
 
     with pytest.raises(GitError, match="malformed target object ID"):
-        repository._parse_marked_commit(
+        repository._parse_walked_commit(
             b"truncated-object-id",
             b"f" * 32,
             "refs/heads/main",
@@ -848,7 +1243,7 @@ def test_a_non_ascii_stream_object_id_is_a_typed_git_failure(
     repository = Repository(git_repo.root)
 
     with pytest.raises(GitError, match="commit listing object ID is not ASCII"):
-        repository._parse_marked_commit(
+        repository._parse_walked_commit(
             b"\xff" * 40,
             b"f" * 32,
             "refs/heads/main",
@@ -2376,7 +2771,9 @@ def test_an_ordinary_message_mention_is_not_a_landing_trailer(
     git_repo.external_commit(
         "a.txt",
         "ordinary\n",
-        "ordinary discussion\n\nThe text Onetree-Operation: is documentation.",
+        "ordinary discussion\n\n"
+        f"Onetree-Operation: {'d' * 32}\n\n"
+        "The exact line above is documentation, not a final trailer.",
     )
     coordinator = Coordinator(git_repo.root)
 
@@ -2555,15 +2952,33 @@ def test_a_valid_commit_graph_cannot_hide_an_unrecorded_landing(
     assert refused.value.kind == "unrecorded_landing"
 
 
+@pytest.mark.parametrize("graph_storage", ["monolithic", "split-chain"])
 def test_a_checksum_valid_commit_graph_cannot_hide_an_unrecorded_landing(
     git_repo: GitFixture,
+    graph_storage: str,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     hidden = _unrecorded_landing(coordinator, git_repo.base, "d" * 32)
     tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
-    git_repo.git("commit-graph", "write", "--reachable")
-    commit_graph = coordinator.repo.common_git_dir / "objects" / "info" / "commit-graph"
+    info = coordinator.repo.common_git_dir / "objects" / "info"
+    if graph_storage == "monolithic":
+        git_repo.git("commit-graph", "write", "--reachable")
+        commit_graph = info / "commit-graph"
+    else:
+        graph_directory = info / "commit-graphs"
+        git_repo.git("commit-graph", "write", "--reachable", "--split=no-merge")
+        first_hash = (graph_directory / "commit-graph-chain").read_text(
+            encoding="ascii"
+        ).strip()
+        git_repo.external_commit("c.txt", "new chain tip\n", "new chain tip")
+        git_repo.git("commit-graph", "write", "--reachable", "--split=no-merge")
+        graph_hashes = (graph_directory / "commit-graph-chain").read_text(
+            encoding="ascii"
+        ).splitlines()
+        assert len(graph_hashes) == 2
+        assert graph_hashes[0] == first_hash
+        commit_graph = graph_directory / f"graph-{first_hash}.graph"
     _make_commit_graph_entry_parentless(commit_graph, tip)
 
     raw_tip = coordinator.repo.git("cat-file", "commit", tip).stdout
@@ -2575,6 +2990,35 @@ def test_a_checksum_valid_commit_graph_cannot_hide_an_unrecorded_landing(
     ).stdout.split()
     assert hidden not in ordinary_visible
     assert hidden in raw_visible
+
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_an_ambient_git_test_override_cannot_reenable_commit_graphs(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Git's test override must not outrank the disabled commit-graph reader."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "9" * 32)
+    tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    git_repo.git("commit-graph", "write", "--reachable")
+    commit_graph = coordinator.repo.common_git_dir / "objects" / "info" / "commit-graph"
+    _make_commit_graph_entry_parentless(commit_graph, tip)
+    monkeypatch.setenv("GIT_TEST_COMMIT_GRAPH", "1")
+
+    overridden = git_repo.git(
+        "-c", "core.commitGraph=false", "log", "--format=%H", "HEAD", "--"
+    ).stdout.split()
+    assert hidden not in overridden
 
     report = coordinator.inspect_wal()
     assert [(item.kind, item.commit) for item in report.divergences] == [
