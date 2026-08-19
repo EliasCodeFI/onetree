@@ -112,13 +112,21 @@ class Repository:
     @staticmethod
     def _environment(index: Path | None = None) -> dict[str, str]:
         environment = os.environ.copy()
-        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+        for name in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_REPLACE_REF_BASE",
+        ):
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
         environment.setdefault("GIT_AUTHOR_EMAIL", "onetree@localhost")
         environment.setdefault("GIT_COMMITTER_NAME", "onetree broker")
         environment.setdefault("GIT_COMMITTER_EMAIL", "onetree@localhost")
         environment["GIT_OPTIONAL_LOCKS"] = "0"
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment["GIT_GRAFT_FILE"] = os.devnull
         if index is not None:
             environment["GIT_INDEX_FILE"] = str(index)
         return environment
@@ -564,12 +572,50 @@ class Repository:
         raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
 
     def is_shallow(self) -> bool:
-        """Whether Git's object view stops at a shallow-history boundary."""
+        """Whether the shallow marker names a commit whose real parent is absent."""
 
-        answer = self.git_text("rev-parse", "--is-shallow-repository")
-        if answer not in {"true", "false"}:
-            raise GitError("Git returned an invalid shallow-repository answer", value=answer)
-        return answer == "true"
+        marker = self.git_dir / "shallow"
+        try:
+            content = marker.read_bytes()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise GitError(
+                f"cannot read the shallow marker: {error}",
+                shallow_file=str(marker),
+            ) from error
+
+        for raw_commit in content.splitlines():
+            if not raw_commit.strip():
+                continue
+            try:
+                commit = raw_commit.strip().decode("ascii", errors="strict")
+            except UnicodeDecodeError as error:
+                raise GitError(
+                    "shallow marker contains a non-ASCII object ID",
+                    shallow_file=str(marker),
+                ) from error
+            commit = self.validate_oid(commit, label="shallow boundary")
+            if self.object_type(commit) != "commit":
+                return True
+            for parent in self.commit_parents(commit):
+                if self.object_type(parent) != "commit":
+                    return True
+        return False
+
+    def nonempty_graft_file(self) -> Path | None:
+        """Return the legacy graft boundary when it can alter Git's object graph."""
+
+        graft_file = self.git_dir / "info" / "grafts"
+        try:
+            return graft_file if graft_file.stat().st_size > 0 else None
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise GitError(
+                f"cannot inspect the legacy graft file: {error}",
+                graft_file=str(graft_file),
+            ) from error
 
     def ref_lock_paths(self, reference: str) -> tuple[Path, ...]:
         """Every lock file an update to ``reference`` can leave behind.
@@ -702,7 +748,8 @@ class Repository:
 
         arguments = (
             "log",
-            "--format=%H%x1f%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)%x1e",
+            "-z",
+            "--format=%H%x00%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)",
             target,
             *(f"^{oid}" for oid in excludes),
             "--",
@@ -729,6 +776,7 @@ class Repository:
                 raise GitError("could not capture git log output", operation="log")
 
             buffer = b""
+            pending_oid: bytes | None = None
             returncode: int | None = None
             try:
                 while True:
@@ -736,15 +784,15 @@ class Repository:
                     if not chunk:
                         break
                     buffer += chunk
-                    while b"\x1e" in buffer:
-                        raw_record, _, buffer = buffer.partition(b"\x1e")
-                        marked = self._parse_marked_commit(raw_record, target)
-                        if marked is not None:
-                            found.append(marked)
-                if buffer.strip():
-                    marked = self._parse_marked_commit(buffer, target)
-                    if marked is not None:
-                        found.append(marked)
+                    while b"\x00" in buffer:
+                        field, _, buffer = buffer.partition(b"\x00")
+                        if pending_oid is None:
+                            pending_oid = field
+                        else:
+                            found.append(self._parse_marked_commit(pending_oid, field, target))
+                            pending_oid = None
+                if buffer or pending_oid is not None:
+                    raise GitError("malformed commit listing stream", reference=target)
                 returncode = process.wait()
             finally:
                 if process.poll() is None:
@@ -765,19 +813,22 @@ class Repository:
                 )
         return iter(found)
 
-    def _parse_marked_commit(self, raw_record: bytes, target: str) -> MarkedCommit | None:
-        record = raw_record.strip()
-        if not record:
-            return None
+    def _parse_marked_commit(
+        self,
+        raw_oid: bytes,
+        raw_trailer: bytes,
+        target: str,
+    ) -> MarkedCommit:
         try:
-            text = record.decode("utf-8", errors="strict")
+            oid = raw_oid.strip().decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise GitError("commit listing object ID is not ASCII", reference=target) from error
+        try:
+            trailer = raw_trailer.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise GitError("commit listing is not UTF-8", reference=target) from error
-        oid, separator, trailer = text.partition("\x1f")
-        if not separator:
-            raise GitError("malformed commit listing record", reference=target)
         operation = trailer.strip() or None
-        return MarkedCommit(self.validate_oid(oid.strip(), label="target"), operation)
+        return MarkedCommit(self.validate_oid(oid, label="target"), operation)
 
     def landing_operation(self, commit: str) -> str | None:
         """Read the real landing trailer from exactly one commit."""

@@ -635,6 +635,95 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
     ).returncode == 0
 
 
+@pytest.mark.parametrize(
+    ("hidden_by", "expected_refusal"),
+    [("replace", "unrecorded_landing"), ("grafts", "git_error")],
+)
+def test_hidden_history_cannot_launder_an_unrecorded_landing(
+    git_repo: GitFixture,
+    hidden_by: str,
+    expected_refusal: str,
+) -> None:
+    """The audit sees the object graph that exists below local history rewrites."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "a" * 32)
+    tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    real_parent = git_repo.git("rev-parse", f"{hidden}^").stdout.strip()
+
+    if hidden_by == "replace":
+        git_repo.git("replace", "--graft", tip, real_parent)
+    else:
+        info = coordinator.repo.git_dir / "info"
+        info.mkdir(exist_ok=True)
+        info.joinpath("grafts").write_text(f"{tip} {real_parent}\n", encoding="ascii")
+
+    # Known-bad control: ordinary Git really does hide the broker landing.
+    visible = set(git_repo.git("log", "--format=%H", "refs/heads/main", "--").stdout.split())
+    assert hidden not in visible
+
+    report = coordinator.inspect_wal()
+    reported = [item.commit for item in report.divergences if item.commit is not None]
+    assert reported == [hidden]
+    assert not report.consistent
+    if hidden_by == "grafts":
+        assert "legacy_grafts" in {item.kind for item in report.divergences}
+
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == expected_refusal
+
+
+def test_a_nonempty_legacy_graft_file_is_an_explicit_mutation_boundary(
+    git_repo: GitFixture,
+) -> None:
+    """The graft fail-safe is independent of Git's undocumented environment override."""
+
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    parent = git_repo.git("rev-parse", f"{tip}^").stdout.strip()
+    info = coordinator.repo.git_dir / "info"
+    info.mkdir(exist_ok=True)
+    info.joinpath("grafts").write_text(f"{tip} {parent}\n", encoding="ascii")
+
+    report = coordinator.inspect_wal()
+    assert not report.consistent
+    assert {item.kind for item in report.divergences} == {"legacy_grafts"}
+    with pytest.raises(GitError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "git_error"
+    assert refused.value.details["graft_file"] == str(info / "grafts")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param("\x1e" + "b" * 40 + "\x1f" + "c" * 32, id="forged-record"),
+        pytest.param("\x1enot-an-oid", id="malformed-record"),
+    ],
+)
+def test_trailer_control_bytes_cannot_forge_or_break_audit_records(
+    git_repo: GitFixture,
+    suffix: str,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    unrecorded = _unrecorded_landing(
+        coordinator,
+        git_repo.base,
+        "a" * 32 + suffix,
+    )
+    raw_commit = coordinator.repo.git("cat-file", "commit", unrecorded).stdout
+    assert b"\x1e" in raw_commit
+
+    report = coordinator.inspect_wal()
+
+    assert [item.commit for item in report.divergences] == [unrecorded]
+    assert not report.consistent
+
+
 def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
     git_repo: GitFixture,
 ) -> None:
@@ -651,7 +740,8 @@ def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
     head = git_repo.oid()
     raw_log = coordinator.repo.git(
         "log",
-        "--format=%H%x1f%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)%x1e",
+        "-z",
+        "--format=%H%x00%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)",
         head,
         "--",
     ).stdout
@@ -671,7 +761,8 @@ def test_a_malformed_stream_record_is_refused_before_it_can_become_an_object_id(
 
     with pytest.raises(GitError, match="malformed target object ID"):
         repository._parse_marked_commit(
-            b"truncated-object-id\x1fffffffffffffffffffffffffffffffff",
+            b"truncated-object-id",
+            b"f" * 32,
             "refs/heads/main",
         )
 
@@ -714,7 +805,7 @@ def test_the_streamed_walk_cannot_deadlock_on_a_full_stderr_pipe(
         "import sys\n"
         "if 'log' in sys.argv:\n"
         "    os.write(2, b'w' * 200_000)\n"
-        f"    os.write(1, b'{head}\\x1f\\x1e')\n"
+        f"    os.write(1, b'{head}\\x00\\x00')\n"
         "    raise SystemExit(0)\n"
         f"os.execv({str(real_git)!r}, [{str(real_git)!r}, *sys.argv[1:]])\n",
         encoding="utf-8",
@@ -2201,6 +2292,25 @@ def test_shallow_history_is_an_explicit_audit_boundary(
     with pytest.raises(OnetreeError) as refused:
         coordinator.register_session("beta", pid=os.getpid(), ttl=300)
     assert refused.value.kind == "shallow_history"
+
+
+def test_a_stale_shallow_marker_does_not_truncate_complete_history(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "broker landing\n")
+    coordinator.land("alpha", message="broker landing")
+
+    root = git_repo.git("rev-list", "--max-parents=0", "HEAD").stdout.split()[0]
+    marker = coordinator.repo.git_path("shallow")
+    marker.write_text(root + "\n", encoding="ascii")
+
+    # Known-bad control: Git keys this answer on marker presence alone.
+    assert git_repo.git("rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+    assert coordinator.repo.is_shallow() is False
+    assert coordinator.inspect_wal().consistent
+    coordinator.register_session("beta", pid=os.getpid(), ttl=300)
 
 
 def test_linked_worktrees_are_refused_before_they_can_split_shared_wal_state(

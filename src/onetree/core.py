@@ -437,6 +437,7 @@ class Coordinator:
         snapshot = self.wal.read()
         state = self._fold(snapshot)
         targets = self._audit_targets(state, target)
+        self._refuse_legacy_grafts(targets)
         if self.repo.is_shallow():
             raise ShallowHistoryError(
                 "the repository is shallow, so broker landing history cannot be audited "
@@ -455,6 +456,18 @@ class Coordinator:
                 repair="onetree wal --adopt",
             )
         return snapshot
+
+    def _refuse_legacy_grafts(self, targets: Sequence[str]) -> None:
+        graft_file = self.repo.nonempty_graft_file()
+        if graft_file is None:
+            return
+        raise GitError(
+            "a non-empty legacy Git graft file can hide repository history; "
+            "convert or remove it before mutating",
+            targets=list(targets),
+            graft_file=str(graft_file),
+            repair="git replace --convert-graft-file, then review the replacement refs",
+        )
 
     def _canonical_path(self, raw_path: str) -> str:
         candidate = Path(raw_path).expanduser()
@@ -1581,8 +1594,20 @@ class Coordinator:
         state = self._fold(snapshot)
         self._verify_landed(state)
         targets = self._audit_targets(state, target)
-        boundaries = (
-            tuple(
+        boundaries: list[Divergence] = []
+        graft_file = self.repo.nonempty_graft_file()
+        if graft_file is not None:
+            boundaries.extend(
+                Divergence(
+                    "legacy_grafts",
+                    audit_target,
+                    f"the non-empty legacy graft file {graft_file} can hide history and "
+                    "must be converted or removed before mutation",
+                )
+                for audit_target in targets
+            )
+        if self.repo.is_shallow():
+            boundaries.extend(
                 Divergence(
                     "shallow_history",
                     audit_target,
@@ -1590,9 +1615,6 @@ class Coordinator:
                 )
                 for audit_target in targets
             )
-            if self.repo.is_shallow()
-            else ()
-        )
         divergences = (*boundaries, *self._divergences(state, targets))
         now = time.time()
         sessions = tuple(
@@ -1622,6 +1644,7 @@ class Coordinator:
             snapshot = self.wal.read()
             state = self._fold(snapshot)
             targets = self._audit_targets(state, target_ref)
+            self._refuse_legacy_grafts(targets)
             if self.repo.is_shallow():
                 raise ShallowHistoryError(
                     "the repository is shallow, so hidden landings cannot be adopted",
