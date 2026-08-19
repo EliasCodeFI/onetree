@@ -17,6 +17,12 @@ from onetree.errors import GitError, RefCorruptError, RefLockedError, Unsupporte
 from onetree.proc import process_tag
 
 _GIT_EXECUTABLE = shutil.which("git")
+_GIT_COMMON_OPTIONS = (
+    "-c",
+    "advice.graftFileDeprecated=false",
+    "-c",
+    "core.commitGraph=false",
+)
 
 #: Operation id carried by every broker-built candidate commit. It is what
 #: makes a landing self-identifying in ordinary Git history, so divergence
@@ -117,7 +123,7 @@ class Repository:
             "GIT_WORK_TREE",
             "GIT_COMMON_DIR",
             "GIT_INDEX_FILE",
-            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
         ):
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
@@ -145,7 +151,7 @@ class Repository:
             if _GIT_EXECUTABLE is None:
                 raise OSError("git executable was not found on PATH")
             completed = subprocess.run(  # noqa: S603 - argv-only Git plumbing
-                [_GIT_EXECUTABLE, "-C", str(cwd), *arguments],
+                [_GIT_EXECUTABLE, *_GIT_COMMON_OPTIONS, "-C", str(cwd), *arguments],
                 check=False,
                 capture_output=True,
                 input=input_bytes,
@@ -572,13 +578,24 @@ class Repository:
         raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
 
     def is_shallow(self) -> bool:
-        """Whether the shallow marker names a commit whose real parent is absent."""
+        """Whether Git's history walk is cut at any non-root shallow boundary."""
+
+        reported = self.git_text("rev-parse", "--is-shallow-repository")
+        if reported == "false":
+            return False
+        if reported != "true":
+            raise GitError(
+                "git returned an invalid shallow-repository status",
+                status=reported,
+            )
 
         marker = self.git_dir / "shallow"
         try:
             content = marker.read_bytes()
         except FileNotFoundError:
-            return False
+            # Git observed the marker first. Its disappearance is a concurrent
+            # state change, not evidence that the guarded walk was complete.
+            return True
         except OSError as error:
             raise GitError(
                 f"cannot read the shallow marker: {error}",
@@ -586,10 +603,8 @@ class Repository:
             ) from error
 
         for raw_commit in content.splitlines():
-            if not raw_commit.strip():
-                continue
             try:
-                commit = raw_commit.strip().decode("ascii", errors="strict")
+                commit = raw_commit.decode("ascii", errors="strict")
             except UnicodeDecodeError as error:
                 raise GitError(
                     "shallow marker contains a non-ASCII object ID",
@@ -598,9 +613,8 @@ class Repository:
             commit = self.validate_oid(commit, label="shallow boundary")
             if self.object_type(commit) != "commit":
                 return True
-            for parent in self.commit_parents(commit):
-                if self.object_type(parent) != "commit":
-                    return True
+            if self.commit_parents(commit):
+                return True
         return False
 
     def nonempty_graft_file(self) -> Path | None:
@@ -608,7 +622,7 @@ class Repository:
 
         graft_file = self.git_dir / "info" / "grafts"
         try:
-            return graft_file if graft_file.stat().st_size > 0 else None
+            content = graft_file.read_bytes()
         except FileNotFoundError:
             return None
         except OSError as error:
@@ -616,6 +630,10 @@ class Repository:
                 f"cannot inspect the legacy graft file: {error}",
                 graft_file=str(graft_file),
             ) from error
+        for line in content.splitlines():
+            if line.strip() and not line.startswith(b"#"):
+                return graft_file
+        return None
 
     def ref_lock_paths(self, reference: str) -> tuple[Path, ...]:
         """Every lock file an update to ``reference`` can leave behind.
@@ -762,7 +780,13 @@ class Repository:
                 if _GIT_EXECUTABLE is None:
                     raise OSError("git executable was not found on PATH")
                 process = subprocess.Popen(  # noqa: S603 - argv-only Git plumbing
-                    [_GIT_EXECUTABLE, "-C", str(self.root), *arguments],
+                    [
+                        _GIT_EXECUTABLE,
+                        *_GIT_COMMON_OPTIONS,
+                        "-C",
+                        str(self.root),
+                        *arguments,
+                    ],
                     stdout=subprocess.PIPE,
                     stderr=stderr_file,
                     env=self._environment(),
@@ -778,6 +802,7 @@ class Repository:
             buffer = b""
             pending_oid: bytes | None = None
             returncode: int | None = None
+            malformed_stream = False
             try:
                 while True:
                     chunk = process.stdout.read(64 * 1024)
@@ -791,8 +816,7 @@ class Repository:
                         else:
                             found.append(self._parse_marked_commit(pending_oid, field, target))
                             pending_oid = None
-                if buffer or pending_oid is not None:
-                    raise GitError("malformed commit listing stream", reference=target)
+                malformed_stream = bool(buffer or pending_oid is not None)
                 returncode = process.wait()
             finally:
                 if process.poll() is None:
@@ -811,6 +835,8 @@ class Repository:
                     operation="log",
                     returncode=returncode,
                 )
+            if malformed_stream:
+                raise GitError("malformed commit listing stream", reference=target)
         return iter(found)
 
     def _parse_marked_commit(

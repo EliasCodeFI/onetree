@@ -16,7 +16,7 @@ pre-push record.
 | `hidden-by-grafts` | Closed with two independent layers. Git is pointed at an empty graft file for the walk, while a non-empty `$GIT_DIR/info/grafts` is also reported as `legacy_grafts` and independently refuses mutation and adoption. | The hidden-landing fixture requires the real commit in the report. A separate clean-history fixture requires the non-empty graft boundary even if Git's undocumented override were to stop working. |
 | `trailer-carries-record-separator` | Closed. The stream is framed as repeating `(OID NUL trailer NUL)` fields. Raw `0x1e` and `0x1f` remain trailer data and cannot create a second record. | The known-bad commit still contains the control bytes, but exactly its real OID is reported. |
 | `trailer-malformed-record` | Closed by the same framing. The crafted bytes no longer interrupt the whole-branch walk. | The audit completes and reports the real landing instead of raising `malformed commit listing record`. |
-| `stale-shallow-marker-complete-repo` | Closed. `is_shallow()` now means that a commit listed in `$GIT_DIR/shallow` names a parent object that is absent, not merely that the marker exists. | The stale-root fixture proves Git says `true` while onetree permits the complete repository; the existing real depth-3/depth-4 clones still report and refuse `shallow_history`. |
+| `stale-shallow-marker-complete-repo` | Closed for the harmless case: a marker naming a genuine root commit removes no parent edge. A non-root marker is a real history cut even when every parent object is locally present. | The root-marker fixture proves Git says `true` while onetree permits the complete repository. The non-root control added in AF8B proves Git suppresses the parent edge despite retaining the parent object; real depth-3/depth-4 clones still report and refuse `shallow_history`. |
 
 The exact receipt comparison changed all 10 AF8 violations to conform. It left
 the 17 AF9 violations deferred, with zero regressions and zero vanished or
@@ -44,11 +44,13 @@ existing object-ID and UTF-8 validation. This changes framing only; it does not
 change the AF9 operation-identity skip set or audit-target selection.
 
 `Repository.is_shallow()` reads the repository's own shallow marker. For each
-listed commit it verifies that the object is a commit, reads its raw parent
-headers with replacement refs and grafts disabled, and asks whether every
-parent object is locally present as a commit. A missing boundary commit or
-parent remains fail-closed. A marker whose full parent graph is present is
-stale metadata, not truncated history.
+listed object it verifies that the object is a commit and reads its raw parent
+headers with replacement refs and grafts disabled. A valid listed commit with
+any parent is a history cut: Git suppresses that edge because of the marker,
+whether or not the parent object remains locally present. Only a listed genuine
+root has no edge to suppress. A missing or non-commit boundary remains
+fail-closed. Thus a marker whose full parent graph is present is not thereby
+stale metadata; AF8's broader claim was false and AF8B corrected it.
 
 AF8 does not change `_audit_targets`, the operation-ID recorded predicate,
 `adopted` event fields, the WAL/branch read order, root or merge adoption, or

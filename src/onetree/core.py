@@ -19,6 +19,7 @@ from onetree.errors import (
     IdentityError,
     InvalidPathError,
     LandingRefusedError,
+    LegacyGraftError,
     OnetreeError,
     RefCorruptError,
     RefLockedError,
@@ -461,7 +462,7 @@ class Coordinator:
         graft_file = self.repo.nonempty_graft_file()
         if graft_file is None:
             return
-        raise GitError(
+        raise LegacyGraftError(
             "a non-empty legacy Git graft file can hide repository history; "
             "convert or remove it before mutating",
             targets=list(targets),

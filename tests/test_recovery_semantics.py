@@ -9,10 +9,12 @@ docs/ROUND-AF2.md with the fixture it turns red.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -117,6 +119,33 @@ def _unrecorded_landing(coordinator: Coordinator, parent: str, operation: str) -
     )
     assert repository.update_ref("refs/heads/main", commit, parent)
     return commit
+
+
+def _make_commit_graph_entry_parentless(commit_graph: Path, commit: str) -> None:
+    """Make one SHA-1 commit-graph row a checksum-valid false root."""
+
+    content = bytearray(commit_graph.read_bytes())
+    assert content[:6] == b"CGPH\x01\x01"
+    chunks: dict[bytes, int] = {}
+    for index in range(content[6] + 1):
+        start = 8 + index * 12
+        chunk_id = bytes(content[start : start + 4])
+        chunks[chunk_id] = struct.unpack(">Q", content[start + 4 : start + 12])[0]
+    fanout = chunks[b"OIDF"]
+    commit_count = struct.unpack(">I", content[fanout + 255 * 4 : fanout + 256 * 4])[0]
+    oid_lookup = chunks[b"OIDL"]
+    commit_data = chunks[b"CDAT"]
+    oids = [
+        bytes(content[oid_lookup + index * 20 : oid_lookup + (index + 1) * 20])
+        for index in range(commit_count)
+    ]
+    row = commit_data + oids.index(bytes.fromhex(commit)) * 36
+    parent_slots = row + 20
+    assert content[parent_slots : parent_slots + 4] != b"\x70\x00\x00\x00"
+    content[parent_slots : parent_slots + 8] = struct.pack(">II", 0x70000000, 0x70000000)
+    content[-20:] = hashlib.sha1(content[:-20], usedforsecurity=False).digest()
+    commit_graph.chmod(0o644)
+    commit_graph.write_bytes(content)
 
 
 def _published_broker_repository(
@@ -637,7 +666,7 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
 
 @pytest.mark.parametrize(
     ("hidden_by", "expected_refusal"),
-    [("replace", "unrecorded_landing"), ("grafts", "git_error")],
+    [("replace", "unrecorded_landing"), ("grafts", "legacy_grafts")],
 )
 def test_hidden_history_cannot_launder_an_unrecorded_landing(
     git_repo: GitFixture,
@@ -691,10 +720,56 @@ def test_a_nonempty_legacy_graft_file_is_an_explicit_mutation_boundary(
     report = coordinator.inspect_wal()
     assert not report.consistent
     assert {item.kind for item in report.divergences} == {"legacy_grafts"}
-    with pytest.raises(GitError) as refused:
+    with pytest.raises(OnetreeError) as refused:
         coordinator.register_session("beta", pid=os.getpid(), ttl=300)
-    assert refused.value.kind == "git_error"
+    assert refused.value.kind == "legacy_grafts"
     assert refused.value.details["graft_file"] == str(info / "grafts")
+    with pytest.raises(OnetreeError) as adoption_refused:
+        coordinator.adopt_landings()
+    assert adoption_refused.value.kind == "legacy_grafts"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"\n", id="blank"),
+        pytest.param(b" \t\n", id="whitespace"),
+        pytest.param(b"# first comment\n# second comment\n", id="comments"),
+    ],
+)
+def test_a_graft_file_without_effective_entries_is_not_a_boundary(
+    git_repo: GitFixture,
+    content: bytes,
+) -> None:
+    """Git ignores blank and comment-only graft files, so the guard does too."""
+
+    coordinator = Coordinator(git_repo.root)
+    graft_file = coordinator.repo.git_dir / "info" / "grafts"
+    graft_file.parent.mkdir(exist_ok=True)
+    graft_file.write_bytes(content)
+
+    raw_history = git_repo.git("log", "--format=%H", "refs/heads/main", "--").stdout.split()
+    assert raw_history == [git_repo.oid()]
+    assert coordinator.repo.nonempty_graft_file() is None
+    assert coordinator.inspect_wal().consistent
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+
+
+def test_an_unreadable_graft_path_is_a_typed_git_failure(git_repo: GitFixture) -> None:
+    coordinator = Coordinator(git_repo.root)
+    graft_file = coordinator.repo.git_dir / "info" / "grafts"
+    graft_file.mkdir(parents=True)
+
+    with pytest.raises(GitError, match="cannot inspect the legacy graft file"):
+        coordinator.repo.nonempty_graft_file()
+
+
+def test_the_empty_graft_override_does_not_add_deprecation_advice(
+    git_repo: GitFixture,
+) -> None:
+    result = Repository(git_repo.root).git("log", "-1", "--format=%H", "HEAD", "--")
+
+    assert result.stderr == b""
 
 
 @pytest.mark.parametrize(
@@ -765,6 +840,56 @@ def test_a_malformed_stream_record_is_refused_before_it_can_become_an_object_id(
             b"f" * 32,
             "refs/heads/main",
         )
+
+
+def test_a_non_ascii_stream_object_id_is_a_typed_git_failure(
+    git_repo: GitFixture,
+) -> None:
+    repository = Repository(git_repo.root)
+
+    with pytest.raises(GitError, match="commit listing object ID is not ASCII"):
+        repository._parse_marked_commit(
+            b"\xff" * 40,
+            b"f" * 32,
+            "refs/heads/main",
+        )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected_message"),
+    [
+        pytest.param(0, "malformed commit listing stream", id="successful-child"),
+        pytest.param(23, "git log failed with exit 23: deliberate log failure", id="failed-child"),
+    ],
+)
+def test_an_incomplete_stream_defers_to_the_child_exit_status(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    expected_message: str,
+) -> None:
+    repository = Repository(git_repo.root)
+    real_git = git_module._GIT_EXECUTABLE
+    assert real_git is not None
+    head = git_repo.oid()
+    shim = tmp_path / "git"
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "if 'log' in sys.argv:\n"
+        f"    os.write(1, b'{head}\\x00')\n"
+        "    os.write(2, b'deliberate log failure')\n"
+        f"    raise SystemExit({returncode})\n"
+        f"os.execv({str(real_git)!r}, [{str(real_git)!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", str(shim))
+
+    with pytest.raises(GitError, match=expected_message):
+        list(repository.marked_commits("refs/heads/main"))
 
 
 def test_a_failed_git_log_cannot_return_a_partial_healthy_audit(
@@ -2294,7 +2419,101 @@ def test_shallow_history_is_an_explicit_audit_boundary(
     assert refused.value.kind == "shallow_history"
 
 
-def test_a_stale_shallow_marker_does_not_truncate_complete_history(
+def test_a_non_root_shallow_marker_refuses_with_its_parent_object_present(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "a" * 32)
+    boundary = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    marker = coordinator.repo.git_path("shallow")
+    marker.write_text(boundary + "\n", encoding="ascii")
+
+    raw_boundary = coordinator.repo.git("cat-file", "commit", boundary).stdout
+    assert f"parent {hidden}\n".encode() in raw_boundary
+    assert coordinator.repo.object_type(hidden) == "commit"
+    assert git_repo.git("rev-parse", f"{boundary}^", check=False).returncode == 128
+    visible = set(git_repo.git("log", "--format=%H", "HEAD", "--").stdout.split())
+    assert hidden not in visible
+
+    report = coordinator.inspect_wal()
+    assert not report.consistent
+    assert {item.kind for item in report.divergences} == {"shallow_history"}
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "shallow_history"
+
+
+def test_an_ambient_shallow_file_cannot_make_the_guard_and_walk_disagree(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "b" * 32)
+    boundary = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    ambient_marker = tmp_path / "ambient-shallow"
+    ambient_marker.write_text(boundary + "\n", encoding="ascii")
+    monkeypatch.setenv("GIT_SHALLOW_FILE", str(ambient_marker))
+
+    assert not coordinator.repo.git_path("shallow").exists()
+    ambient_visible = set(
+        git_repo.git("log", "--format=%H", "refs/heads/main", "--").stdout.split()
+    )
+    assert hidden not in ambient_visible
+
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+@pytest.mark.parametrize("boundary_kind", ["blob", "missing"])
+def test_a_non_commit_shallow_boundary_fails_closed(
+    git_repo: GitFixture,
+    boundary_kind: str,
+) -> None:
+    repository = Repository(git_repo.root)
+    boundary = (
+        git_repo.git("rev-parse", "HEAD:a.txt").stdout.strip()
+        if boundary_kind == "blob"
+        else "1" * repository.oid_length
+    )
+    repository.git_path("shallow").write_text(boundary + "\n", encoding="ascii")
+
+    assert repository.git_text("rev-parse", "--is-shallow-repository") == "true"
+    assert repository.is_shallow() is True
+
+
+def test_an_unreadable_shallow_marker_is_a_typed_git_failure(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(git_repo.root)
+    repository.git_path("shallow").mkdir()
+    monkeypatch.setattr(repository, "git_text", lambda *_args, **_kwargs: "true")
+
+    with pytest.raises(GitError, match="cannot read the shallow marker"):
+        repository.is_shallow()
+
+
+def test_a_non_ascii_shallow_marker_is_a_typed_git_failure(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(git_repo.root)
+    repository.git_path("shallow").write_bytes(b"\xff" * repository.oid_length + b"\n")
+    monkeypatch.setattr(repository, "git_text", lambda *_args, **_kwargs: "true")
+
+    with pytest.raises(GitError, match="shallow marker contains a non-ASCII object ID"):
+        repository.is_shallow()
+
+
+def test_a_root_shallow_marker_does_not_truncate_complete_history(
     git_repo: GitFixture,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
@@ -2306,11 +2525,73 @@ def test_a_stale_shallow_marker_does_not_truncate_complete_history(
     marker = coordinator.repo.git_path("shallow")
     marker.write_text(root + "\n", encoding="ascii")
 
-    # Known-bad control: Git keys this answer on marker presence alone.
+    # Git reports a shallow repository, but grafting a genuine root to zero
+    # parents cannot remove any history because its raw commit already has none.
     assert git_repo.git("rev-parse", "--is-shallow-repository").stdout.strip() == "true"
     assert coordinator.repo.is_shallow() is False
     assert coordinator.inspect_wal().consistent
     coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+
+
+def test_a_valid_commit_graph_cannot_hide_an_unrecorded_landing(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "c" * 32)
+    git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    git_repo.git("commit-graph", "write", "--reachable")
+    commit_graph = coordinator.repo.common_git_dir / "objects" / "info" / "commit-graph"
+
+    assert commit_graph.is_file()
+    assert git_repo.git("commit-graph", "verify", check=False).returncode == 0
+    assert hidden in git_repo.git("log", "--format=%H", "HEAD", "--").stdout.split()
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_a_checksum_valid_commit_graph_cannot_hide_an_unrecorded_landing(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    hidden = _unrecorded_landing(coordinator, git_repo.base, "d" * 32)
+    tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    git_repo.git("commit-graph", "write", "--reachable")
+    commit_graph = coordinator.repo.common_git_dir / "objects" / "info" / "commit-graph"
+    _make_commit_graph_entry_parentless(commit_graph, tip)
+
+    raw_tip = coordinator.repo.git("cat-file", "commit", tip).stdout
+    assert f"parent {hidden}\n".encode() in raw_tip
+    assert git_repo.git("commit-graph", "verify", check=False).returncode == 1
+    ordinary_visible = git_repo.git("log", "--format=%H", "HEAD", "--").stdout.split()
+    raw_visible = git_repo.git(
+        "-c", "core.commitGraph=false", "log", "--format=%H", "HEAD", "--"
+    ).stdout.split()
+    assert hidden not in ordinary_visible
+    assert hidden in raw_visible
+
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", hidden)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_git_log_z_terminates_every_audit_record(git_repo: GitFixture) -> None:
+    first = git_repo.oid()
+    second = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+
+    raw = git_repo.git("log", "-z", "--format=%H%x00", "HEAD", "--").stdout.encode()
+
+    assert raw == second.encode() + b"\x00\x00" + first.encode() + b"\x00\x00"
 
 
 def test_linked_worktrees_are_refused_before_they_can_split_shared_wal_state(

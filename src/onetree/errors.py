@@ -43,6 +43,12 @@ class ShallowHistoryError(OnetreeError):
     kind = "shallow_history"
 
 
+class LegacyGraftError(OnetreeError):
+    """A legacy graft can make the stored commit graph incomplete to an audit."""
+
+    kind = "legacy_grafts"
+
+
 class IdentityError(OnetreeError):
     """A session identity is absent, ambiguous, or malformed."""
 
