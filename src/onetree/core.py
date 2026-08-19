@@ -23,10 +23,11 @@ from onetree.errors import (
     RefCorruptError,
     RefLockedError,
     ReleaseRefusedError,
+    ShallowHistoryError,
+    UnrecordedLandingError,
     WalAppendRefusedError,
     WalCorruptError,
     WalDivergedError,
-    WalHistoryMissingError,
 )
 from onetree.git import MarkedCommit, Repository, TempIndex, TreeEntry
 from onetree.proc import process_alive as _pid_alive
@@ -182,6 +183,12 @@ class GcResult:
     removed_claims: int
     removed_sessions: int
     removed_temp_indexes: int = 0
+
+
+@dataclass(frozen=True)
+class AdoptionResult:
+    adopted: tuple[EventRecord, ...]
+    report: WalReport
 
 
 @dataclass(frozen=True)
@@ -373,45 +380,79 @@ class Coordinator:
         self.repo = Repository(repository)
         self.wal = Wal(self.repo)
 
-    def _missing_wal_history(self, snapshot: WalSnapshot) -> Divergence | None:
-        """Name the default-clone shape before a new WAL event can adopt it."""
+    def _audit_targets(
+        self,
+        state: _FoldedState,
+        target: str | None = None,
+    ) -> tuple[str, ...]:
+        """Targets whose Git-visible histories this operation can affect or adopt."""
 
-        if snapshot.head is not None:
-            return None
-        # A local crash before the first WAL write produces the same branch
-        # marker with no WAL, and AF4 deliberately audits that state after the
-        # first registration. The ordinary clone shape is distinguishable: its
-        # default ``origin`` retains the missing WAL ref while the clone fetched
-        # only branches. Quarantine that state without suppressing local crash
-        # detection.
-        if not self.repo.has_remote("origin"):
-            return None
-        target = self.repo.symbolic_head()
-        if target is None:
-            return None
-        commit = self.repo.first_marked_commit(target)
-        if commit is None:
-            return None
-        return Divergence(
-            "wal_history_missing",
-            target,
-            "the branch contains broker landings but refs/onetree/wal is absent; "
-            "a default git clone does not fetch that ref",
-            commit=commit,
-        )
+        targets = set(state.target_positions)
+        if target is not None:
+            targets.add(self.repo.validate_branch_ref(target))
+        else:
+            # A detached checkout still has a readable history. ``HEAD`` is a
+            # report-only audit target; adoption requires an explicit branch ref.
+            targets.add(self.repo.symbolic_head() or "HEAD")
+        return tuple(sorted(targets))
 
-    def _read_wal(self) -> WalSnapshot:
-        """Read only a WAL whose absence cannot silently adopt broker history."""
+    def _unrecorded_landings(
+        self,
+        state: _FoldedState,
+        targets: Sequence[str],
+    ) -> tuple[Divergence, ...]:
+        """Broker-marked branch commits for which this WAL has no terminal record."""
+
+        found: list[Divergence] = []
+        seen: set[str] = set()
+        for target in targets:
+            head = self.repo.resolve_ref(target, missing_ok=True)
+            if head is None:
+                continue
+            for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
+                operation = marked.operation or ""
+                if (
+                    not operation
+                    or operation in seen
+                    or operation in state.landed_operations
+                    or operation in state.pending
+                    or operation in state.refused_intents
+                ):
+                    continue
+                seen.add(operation)
+                found.append(
+                    Divergence(
+                        "unrecorded_landing",
+                        target,
+                        "a broker landing is on the branch with no WAL record of it",
+                        commit=marked.commit,
+                        operation=operation,
+                    )
+                )
+        return tuple(found)
+
+    def _read_wal(self, target: str | None = None) -> WalSnapshot:
+        """Read a WAL for mutation only after auditing the histories it would adopt."""
 
         snapshot = self.wal.read()
-        missing = self._missing_wal_history(snapshot)
-        if missing is not None:
-            raise WalHistoryMissingError(
-                "the branch contains broker history but refs/onetree/wal is missing; "
-                "run `onetree wal --repair` before mutating",
-                target=missing.target,
-                commit=missing.commit,
-                repair="onetree wal --repair",
+        state = self._fold(snapshot)
+        targets = self._audit_targets(state, target)
+        if self.repo.is_shallow():
+            raise ShallowHistoryError(
+                "the repository is shallow, so broker landing history cannot be audited "
+                "completely; deepen it before mutating",
+                targets=list(targets),
+                repair="deepen the repository, then run `onetree wal --adopt` if needed",
+            )
+        unrecorded = self._unrecorded_landings(state, targets)
+        if unrecorded:
+            raise UnrecordedLandingError(
+                "the branch carries broker landings that refs/onetree/wal does not record; "
+                "run `onetree wal --adopt` before mutating",
+                targets=sorted({item.target for item in unrecorded}),
+                commits=[item.commit for item in unrecorded],
+                divergences=[item.payload() for item in unrecorded],
+                repair="onetree wal --adopt",
             )
         return snapshot
 
@@ -663,6 +704,24 @@ class Coordinator:
                     "land_intent fences do not match its payload", oid=event.oid
                 )
             state.pending[operation] = event
+        elif event.kind == "adopted":
+            if frozenset(data) != {"operation", "target", "expected_head", "commit", "tree"}:
+                raise WalCorruptError("adopted event has unexpected fields", oid=event.oid)
+            _validate_actor(event.actor)
+            operation = _string(data, "operation", event)
+            if operation in state.pending or state.terminal(operation):
+                raise WalCorruptError("duplicate landing operation", oid=event.oid)
+            target = self.repo.validate_branch_ref(_string(data, "target", event))
+            expected_head = self.repo.validate_oid(
+                _string(data, "expected_head", event), label="adopted base"
+            )
+            commit = self.repo.validate_oid(
+                _string(data, "commit", event), label="adopted commit"
+            )
+            self.repo.validate_oid(_string(data, "tree", event), label="adopted tree")
+            state.observe_position(target, expected_head, commit)
+            state.landed_operations[operation] = event
+            state.landed.append(event)
         elif event.kind == "landed":
             operation = _string(data, "operation", event)
             intent = state.pending.get(operation)
@@ -768,7 +827,7 @@ class Coordinator:
             },
         )
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self._read_wal()
+            snapshot = self._read_wal(target_ref)
             state = self._fold(snapshot)
             existing = self._active_session(state, actor, time.time())
             if existing is not None:
@@ -879,7 +938,9 @@ class Coordinator:
     def check(self, actor: str, path: str) -> CheckResult:
         actor = _validate_actor(actor)
         canonical = self._canonical_path(path)
-        state = self._fold(self._read_wal())
+        # Checking ownership is read-only: an unrecorded landing is reported by
+        # ``wal`` and blocks writes, but cannot erase the claims the WAL does have.
+        state = self._fold(self.wal.read())
         relevant = tuple(
             claim for claim in state.active_claims(time.time()) if _overlaps(claim.path, canonical)
         )
@@ -1028,7 +1089,7 @@ class Coordinator:
         attempts = 0
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
-            snapshot = self._read_wal()
+            snapshot = self._read_wal(target_ref)
             state = self._fold(snapshot)
             # A landing operation is one attempt. Retries mint a new id so the
             # WAL keeps every attempt's intent and its terminal event distinct.
@@ -1390,8 +1451,20 @@ class Coordinator:
             actual_tree = self.repo.git_text("show", "-s", "--format=%T", commit)
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
+            if event.kind == "adopted" and self.repo.landing_operation(commit) != event.data.get(
+                "operation"
+            ):
+                raise WalCorruptError(
+                    "adopted commit does not carry the recorded landing trailer",
+                    oid=event.oid,
+                    commit=commit,
+                )
 
-    def _divergences(self, state: _FoldedState) -> tuple[Divergence, ...]:
+    def _divergences(
+        self,
+        state: _FoldedState,
+        targets: Sequence[str] = (),
+    ) -> tuple[Divergence, ...]:
         """Compare every target the WAL knows against what the WAL says landed.
 
         Two directions matter. The WAL can claim a landing the branch does not
@@ -1412,7 +1485,8 @@ class Coordinator:
         """
 
         found: list[Divergence] = []
-        for target in sorted(state.target_positions):
+        audit_targets = tuple(sorted(set(state.target_positions).union(targets)))
+        for target in audit_targets:
             head = self.repo.resolve_ref(target, missing_ok=True)
             landed_here = [
                 event for event in state.landed if event.data.get("target") == target
@@ -1456,25 +1530,7 @@ class Coordinator:
                             operation=operation,
                         )
                     )
-            for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
-                operation = marked.operation or ""
-                if not operation:
-                    continue
-                if (
-                    operation in state.landed_operations
-                    or operation in state.pending
-                    or operation in state.refused_intents
-                ):
-                    continue
-                found.append(
-                    Divergence(
-                        "unrecorded_landing",
-                        target,
-                        "a broker landing is on the branch with no WAL record of it",
-                        commit=marked.commit,
-                        operation=operation,
-                    )
-                )
+        found.extend(self._unrecorded_landings(state, audit_targets))
         return tuple(found)
 
     def _audit_marked_commits(
@@ -1487,7 +1543,7 @@ class Coordinator:
         yield from self.repo.marked_commits(head, excludes)
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
-        """History the branch-side audit may skip: none of it.
+        """Git-visible history the branch-side audit may skip: none of it.
 
         Every exclusion this walk can express is ``git log ^X``, which drops X
         *and its entire ancestry*. The WAL has audited none of that ancestry, so
@@ -1506,32 +1562,38 @@ class Coordinator:
         is left is the empty floor. The history walk is one streamed Git process,
         so a complete walk costs linear traversal rather than repeated pages.
 
-        A repository holding broker landings from a WAL it does not have is not
-        allowed to append a new event and thereby adopt that history. The
-        preflight in ``_read_wal`` names the ordinary ``git clone`` case and the
-        CLI exposes an explicit fetch-only repair path.
+        A shallow boundary is different: the omitted objects are not visible to
+        any local history walk. Inspection reports that boundary explicitly and
+        every mutating entry point refuses until the repository is deepened.
+
+        A repository holding broker landings its WAL does not record is not
+        allowed to append a new event and thereby adopt that history. The same
+        streamed trailer audit enforces that property for every repository
+        shape; ``wal --adopt`` is the explicit, local operator escape.
         """
 
         return ()
 
-    def inspect_wal(self) -> WalReport:
+    def inspect_wal(self, target: str | None = None) -> WalReport:
+        """Inspect without mutating, including states that mutation must refuse."""
+
         snapshot = self.wal.read()
-        missing = self._missing_wal_history(snapshot)
-        if missing is not None:
-            return WalReport(
-                snapshot.head,
-                snapshot.events,
-                False,
-                0,
-                (),
-                (),
-                (missing,),
-                (),
-                self.repo.temp_indexes(),
-            )
         state = self._fold(snapshot)
         self._verify_landed(state)
-        divergences = self._divergences(state)
+        targets = self._audit_targets(state, target)
+        boundaries = (
+            tuple(
+                Divergence(
+                    "shallow_history",
+                    audit_target,
+                    "the repository is shallow, so history below its boundary was not audited",
+                )
+                for audit_target in targets
+            )
+            if self.repo.is_shallow()
+            else ()
+        )
+        divergences = (*boundaries, *self._divergences(state, targets))
         now = time.time()
         sessions = tuple(
             sorted(actor for actor in state.sessions if state.session_active(actor, now))
@@ -1550,18 +1612,60 @@ class Coordinator:
             self.repo.temp_indexes(),
         )
 
-    def repair_wal_history(self) -> WalReport:
-        """Fetch the missing WAL ref explicitly, then inspect the repaired view."""
+    def adopt_landings(self, target: str | None = None) -> AdoptionResult:
+        """Explicitly record every unrecorded landing found by the local audit."""
 
-        snapshot = self.wal.read()
-        missing = self._missing_wal_history(snapshot)
-        if missing is None:
-            raise WalHistoryMissingError(
-                "there is no missing WAL history to repair",
-                repair="onetree wal --repair",
-            )
-        self.repo.fetch_wal()
-        return self.inspect_wal()
+        target_ref = (
+            self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
+        )
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self.wal.read()
+            state = self._fold(snapshot)
+            targets = self._audit_targets(state, target_ref)
+            if self.repo.is_shallow():
+                raise ShallowHistoryError(
+                    "the repository is shallow, so hidden landings cannot be adopted",
+                    targets=list(targets),
+                    repair="deepen the repository before adopting",
+                )
+            unrecorded = self._unrecorded_landings(state, targets)
+            if not unrecorded:
+                raise UnrecordedLandingError(
+                    "the audit found no unrecorded broker landings to adopt",
+                    targets=list(targets),
+                    divergences=[],
+                    repair="onetree wal --adopt",
+                )
+            documents: list[dict[str, Any]] = []
+            for item in unrecorded:
+                if item.commit is None or item.operation is None:
+                    raise AssertionError("unrecorded landing has no commit or operation")
+                parents = self.repo.commit_parents(item.commit)
+                if len(parents) != 1:
+                    raise GitError(
+                        "cannot adopt a broker landing without exactly one parent",
+                        commit=item.commit,
+                        parents=list(parents),
+                    )
+                tree = self.repo.git_text("show", "-s", "--format=%T", item.commit)
+                documents.append(
+                    self.wal.document(
+                        "adopted",
+                        "operator",
+                        {
+                            "operation": item.operation,
+                            "target": item.target,
+                            "expected_head": parents[0],
+                            "commit": item.commit,
+                            "tree": tree,
+                        },
+                    )
+                )
+            records = self._try_append(state, snapshot, documents)
+            if records is None:
+                continue
+            return AdoptionResult(records, self.inspect_wal(target_ref))
+        raise GitError("landing adoption CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
 
     def _held_locks(self, state: _FoldedState) -> tuple[str, ...]:
         """Every ref lock, WAL and target, that will refuse the next write."""
@@ -1660,7 +1764,7 @@ class Coordinator:
                 refused += 1
         return documents, repaired, refused, in_flight
 
-    def recover(self) -> RecoveryResult:
+    def recover(self, target: str | None = None) -> RecoveryResult:
         # A ref lock left by a crashed process names no owner, so it cannot be
         # liveness-checked and must not be deleted: a live peer may hold it.
         # Recovery names it in a typed refusal instead of letting the next WAL
@@ -1676,7 +1780,7 @@ class Coordinator:
         repaired = 0
         refused = 0
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self._read_wal()
+            snapshot = self._read_wal(target)
             state = self._fold(snapshot)
             documents, batch_repaired, batch_refused, in_flight = self._recovery_documents(
                 state, time.time()
@@ -1692,7 +1796,7 @@ class Coordinator:
             # to leave unexamined while reporting an all-clear.
             locks = self._held_locks(state)
             self._verify_landed(state)
-            divergences = self._divergences(state)
+            divergences = self._divergences(state, self._audit_targets(state, target))
             if not divergences:
                 if in_flight:
                     return RecoveryResult(False, in_flight, repaired, refused, locks)

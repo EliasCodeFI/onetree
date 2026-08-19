@@ -31,10 +31,16 @@ class UnsupportedWorktreeError(OnetreeError):
     kind = "unsupported_worktree"
 
 
-class WalHistoryMissingError(OnetreeError):
-    """A branch carries broker history but its WAL ref was not fetched."""
+class UnrecordedLandingError(OnetreeError):
+    """A branch carries broker landings that the local WAL does not record."""
 
-    kind = "wal_history_missing"
+    kind = "unrecorded_landing"
+
+
+class ShallowHistoryError(OnetreeError):
+    """The repository's shallow boundary prevents a complete landing audit."""
+
+    kind = "shallow_history"
 
 
 class IdentityError(OnetreeError):

@@ -21,6 +21,7 @@ EVENT_KINDS = frozenset(
         "release",
         "land_intent",
         "landed",
+        "adopted",
         "refused",
         "gc",
     }

@@ -30,6 +30,7 @@ from onetree.core import Coordinator
 from onetree.errors import (
     GitError,
     LandingRefusedError,
+    OnetreeError,
     RefCorruptError,
     RefLockedError,
     ReleaseRefusedError,
@@ -37,7 +38,6 @@ from onetree.errors import (
     WalAppendRefusedError,
     WalCorruptError,
     WalDivergedError,
-    WalHistoryMissingError,
 )
 from onetree.git import Repository
 from onetree.proc import process_alive, process_start
@@ -117,6 +117,41 @@ def _unrecorded_landing(coordinator: Coordinator, parent: str, operation: str) -
     )
     assert repository.update_ref("refs/heads/main", commit, parent)
     return commit
+
+
+def _published_broker_repository(
+    tmp_path: Path,
+    *,
+    hand_commits: int = 0,
+) -> tuple[GitFixture, Path, str]:
+    """Publish broker history through ordinary Git, which deliberately omits the WAL."""
+
+    source = _repository_with_ref_backend(tmp_path / "source", "files")
+    coordinator = Coordinator(source.root)
+    session = _register(coordinator, source, "alpha", "a.txt")
+    _stage(source, session, "a.txt", "broker landing before clone\n")
+    landed = coordinator.land("alpha", message="broker landing before clone").commit
+    for index in range(hand_commits):
+        source.external_commit("b.txt", f"hand {index}\n", f"hand commit {index}")
+    source.git("branch", "clean", source.base)
+
+    remote = tmp_path / "published.git"
+    subprocess.run(
+        [_GIT_EXECUTABLE, "init", "--bare", "--quiet", "--initial-branch=main", remote],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source.git("remote", "add", "published", str(remote))
+    source.git("push", "--quiet", "published", "refs/heads/main", "refs/heads/clean")
+    published_refs = subprocess.run(
+        [_GIT_EXECUTABLE, "-C", str(remote), "for-each-ref", "--format=%(refname)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert published_refs == ["refs/heads/clean", "refs/heads/main"]
+    return source, remote, landed
 
 
 def _pending_intent(
@@ -531,46 +566,48 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
 
     The scan excluded every position the WAL had ever seen, and a crash-left
     commit becomes such a position the moment anyone registers on top of it or
-    lands above it. Detection therefore expired through ordinary use.
+    lands above it. Detection therefore expired through ordinary use. AF6
+    refuses those acts until explicit adoption, so they cannot mask the fact.
     """
 
     coordinator = Coordinator(git_repo.root)
-    if order != "first_sight":
+    if order == "later_registration":
         coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
-    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
-    if order != "first_sight":
-        assert [item.kind for item in coordinator.inspect_wal().divergences] == [
-            "unrecorded_landing"
-        ]
-
-    if order == "later_landing":
+    elif order == "later_landing":
         session = _register(coordinator, git_repo, "beta", "b.txt")
         _stage(git_repo, session, "b.txt", "legit\n")
-        landed = coordinator.land("beta", message="one more legit landing")
-        assert git_repo.git(
-            "merge-base", "--is-ancestor", unrecorded, landed.commit, check=False
-        ).returncode == 0
-    else:
-        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+
+    def routine_act() -> object:
+        if order == "later_landing":
+            return coordinator.land("beta", message="one more legit landing")
+        return coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+
+    wal_before = coordinator.wal.head()
+    with pytest.raises(OnetreeError) as refused:
+        routine_act()
+    assert refused.value.kind == "unrecorded_landing"
+    assert coordinator.wal.head() == wal_before
+    if order == "later_landing":
+        assert coordinator.check("gamma", str(git_repo.root / "b.txt")).blocked
 
     report = coordinator.inspect_wal()
     assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
     assert report.divergences[0].commit == unrecorded
     assert not report.consistent
-    with pytest.raises(WalDivergedError):
+    with pytest.raises(OnetreeError) as recovery_refused:
         coordinator.recover()
+    assert recovery_refused.value.kind == "unrecorded_landing"
 
-    # RED control (mutation M16): restore the shipped floor -- every position
-    # the WAL has ever seen -- and the same on-disk state reads clean. This is
-    # also what keeps the empty floor falsifiable: a floor is one monkeypatch
-    # away, and installing one loses the finding.
+    # RED control: deleting the shared predicate both lets the routine write
+    # and turns the exact same branch/WAL mismatch into a clean report.
     monkeypatch.setattr(
         Coordinator,
-        "_scan_floor",
-        lambda _self, state, target: tuple(state.target_positions[target]),
+        "_unrecorded_landings",
+        lambda _self, _state, _targets: (),
     )
+    routine_act()
     assert coordinator.inspect_wal().consistent
-    assert coordinator.recover().consistent
 
 
 def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
@@ -588,8 +625,9 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
     assert kinds == ["unrecorded_landing"]
     assert not report.consistent
     assert report.divergences[0].commit == unrecorded
-    with pytest.raises(WalDivergedError):
+    with pytest.raises(OnetreeError) as refused:
         coordinator.recover()
+    assert refused.value.kind == "unrecorded_landing"
 
     # The marked commit is below the ordinary hand history and really is on the target.
     assert git_repo.git(
@@ -600,6 +638,8 @@ def test_an_unrecorded_landing_beyond_one_scan_page_is_still_reported(
 def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
     git_repo: GitFixture,
 ) -> None:
+    """A real log larger than one read chunk retains every complete record."""
+
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     _advance_with_ordinary_commits(
@@ -608,8 +648,124 @@ def test_honest_history_past_the_scan_page_never_becomes_inconsistent(
         4_100,
     )
 
+    head = git_repo.oid()
+    raw_log = coordinator.repo.git(
+        "log",
+        "--format=%H%x1f%(trailers:key=Onetree-Operation,valueonly,separator=%x2C)%x1e",
+        head,
+        "--",
+    ).stdout
+    expected = git_repo.git("log", "--format=%H", head, "--").stdout.splitlines()
+    marked = list(coordinator.repo.marked_commits(head))
+
+    assert len(raw_log) > 64 * 1024
+    assert [item.commit for item in marked] == expected
     assert coordinator.inspect_wal().consistent
     assert coordinator.recover().consistent
+
+
+def test_a_malformed_stream_record_is_refused_before_it_can_become_an_object_id(
+    git_repo: GitFixture,
+) -> None:
+    repository = Repository(git_repo.root)
+
+    with pytest.raises(GitError, match="malformed target object ID"):
+        repository._parse_marked_commit(
+            b"truncated-object-id\x1fffffffffffffffffffffffffffffffff",
+            "refs/heads/main",
+        )
+
+
+def test_a_failed_git_log_cannot_return_a_partial_healthy_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", unrecorded)
+    first = coordinator.repo.commit_tree(tree, "ordinary one", (unrecorded,))
+    second = coordinator.repo.commit_tree(tree, "ordinary two", (first,))
+    assert coordinator.repo.update_ref("refs/heads/main", second, unrecorded)
+
+    loose_object = coordinator.repo.git_dir / "objects" / first[:2] / first[2:]
+    assert loose_object.is_file()
+    loose_object.chmod(0o644)
+    loose_object.write_bytes(b"not a git object")
+    failed_log = git_repo.git("log", "--format=%H", "refs/heads/main", "--", check=False)
+    assert failed_log.returncode != 0
+
+    with pytest.raises(GitError, match="git log failed with exit"):
+        coordinator.inspect_wal()
+
+
+def test_the_streamed_walk_cannot_deadlock_on_a_full_stderr_pipe(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(git_repo.root)
+    real_git = git_module._GIT_EXECUTABLE
+    assert real_git is not None
+    head = git_repo.oid()
+    shim = tmp_path / "git"
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "if 'log' in sys.argv:\n"
+        "    os.write(2, b'w' * 200_000)\n"
+        f"    os.write(1, b'{head}\\x1f\\x1e')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({str(real_git)!r}, [{str(real_git)!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", str(shim))
+
+    original_popen = git_module.subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def recording_popen(arguments: Sequence[str], *args: Any, **kwargs: Any) -> Any:
+        child = original_popen(arguments, *args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(git_module.subprocess, "Popen", recording_popen)
+    finished = threading.Event()
+    result: list[object] = []
+
+    def walk() -> None:
+        try:
+            result.extend(repository.marked_commits("refs/heads/main"))
+        except BaseException as error:  # noqa: BLE001 - the worker reports every failure
+            result.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=walk, daemon=True)
+    worker.start()
+    completed_without_cleanup = finished.wait(timeout=5)
+    if not completed_without_cleanup:
+        assert children
+        children[0].kill()
+        worker.join(timeout=5)
+
+    assert completed_without_cleanup, "marked_commits deadlocked on a full stderr pipe"
+    assert result == [git_module.MarkedCommit(head, None)]
+
+
+def test_a_partially_consumed_walk_retains_no_git_process_descriptors(
+    git_repo: GitFixture,
+) -> None:
+    repository = Repository(git_repo.root)
+    descriptor_directory = Path("/proc/self/fd")
+    assert descriptor_directory.is_dir()
+    baseline = len(tuple(descriptor_directory.iterdir()))
+
+    walks = [repository.marked_commits("refs/heads/main") for _ in range(30)]
+    assert all(next(walk).commit == git_repo.oid() for walk in walks)
+
+    assert len(tuple(descriptor_directory.iterdir())) <= baseline
 
 
 def test_the_commit_immediately_below_first_sight_stays_inside_the_audit(
@@ -618,7 +774,9 @@ def test_the_commit_immediately_below_first_sight_stays_inside_the_audit(
     coordinator = Coordinator(git_repo.root)
     unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
     git_repo.external_commit("b.txt", "hand\n", "permitted hand commit")
-    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
 
     report = coordinator.inspect_wal()
     assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
@@ -858,6 +1016,8 @@ def test_a_pruned_landed_object_names_the_restore_path_before_recovery_can_audit
 def test_probing_a_diverged_repository_records_one_refusal_per_divergence(
     git_repo: GitFixture,
 ) -> None:
+    """Historical name: AF6 now refuses before writing even one probe event."""
+
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     first = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
@@ -869,19 +1029,24 @@ def test_probing_a_diverged_repository_records_one_refusal_per_divergence(
             if event.kind == "refused" and event.data.get("reason") == "branch_diverged"
         ]
 
+    wal_before = coordinator.wal.head()
     for _ in range(3):
-        with pytest.raises(WalDivergedError):
+        with pytest.raises(OnetreeError) as refused:
             coordinator.recover()
-    assert len(refusals()) == 1
+        assert refused.value.kind == "unrecorded_landing"
+    assert coordinator.wal.head() == wal_before
+    assert refusals() == []
 
-    # A different divergence set is a different fact and is recorded again.
+    # A different divergence set is still reported without growing the WAL.
     _unrecorded_landing(coordinator, first, "a" * 32)
-    with pytest.raises(WalDivergedError):
+    with pytest.raises(OnetreeError) as refused:
         coordinator.recover()
-    assert len(refusals()) == 2
-    with pytest.raises(WalDivergedError):
+    assert refused.value.kind == "unrecorded_landing"
+    assert len(coordinator.inspect_wal().divergences) == 2
+    assert refusals() == []
+    with pytest.raises(OnetreeError):
         coordinator.recover()
-    assert len(refusals()) == 2
+    assert coordinator.wal.head() == wal_before
 
 
 # --------------------------------------------------------------------------
@@ -1407,17 +1572,26 @@ def test_a_crash_left_landing_is_found_under_any_number_of_hand_commits(
 
     git_repo = _repository_with_ref_backend(tmp_path, ref_format)
     coordinator = Coordinator(git_repo.root)
+    git_repo.git("remote", "add", "origin", str(tmp_path / "ordinary-remote.git"))
     unrecorded = _unrecorded_landing(coordinator, git_repo.base, "f" * 32)
     for index in range(hand_commits):
         git_repo.external_commit("b.txt", f"hand {index}\n", f"permitted hand commit {index}")
-    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
 
     report = coordinator.inspect_wal()
     assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
     assert report.divergences[0].commit == unrecorded
     assert not report.consistent
-    with pytest.raises(WalDivergedError):
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+    with pytest.raises(OnetreeError) as recovery_refused:
         coordinator.recover()
+    assert recovery_refused.value.kind == "unrecorded_landing"
+
+    adoption = coordinator.adopt_landings()
+    assert [event.data["commit"] for event in adoption.adopted] == [unrecorded]
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    assert coordinator.inspect_wal().consistent
 
 
 @pytest.mark.parametrize("hand_commits", [1, 2, 3, 4, 5, 6])
@@ -1425,12 +1599,7 @@ def test_page_boundaries_never_drop_the_commit_they_land_on(
     git_repo: GitFixture,
     hand_commits: int,
 ) -> None:
-    """Contiguity across the former page offsets, swept through one stream.
-
-    AF4's offsets 1--6 remain the compact regression sweep. The implementation
-    no longer emits ``--skip`` pages, but a stream parser seam that dropped or
-    duplicated a record would still lose the marked commit at one of them.
-    """
+    """AF4's former pagination offsets remain inside the complete audit."""
 
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
@@ -1558,14 +1727,16 @@ def test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted(
     assert intent.data["lander"] == {"pid": os.getpid(), "start": start, "warnings": warnings}
 
 
+@pytest.mark.parametrize("empty_table_list", [b"", b"\n", b"\n\n"])
 def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    empty_table_list: bytes,
 ) -> None:
-    """The next D1 variant, and the one reftable can actually decide.
+    """A table list naming no table is the reftable state onetree can decide.
 
     ``show-ref --exists`` answers "no table names this ref" with the same status
-    for a truncated table list as for a ref that was never written, while the
+    for an empty table list as for a ref that was never written, while the
     WAL's bytes sit in the orphaned ``*.ref`` tables beside it. Trusting that
     status without looking at storage answers every claim question over an
     empty log at exit 0.
@@ -1579,15 +1750,15 @@ def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
 
     table_list = coordinator.repo.git_dir / "reftable" / "tables.list"
     original = table_list.read_bytes()
-    # A fresh reftable repository always writes a non-empty list, so zero bytes
-    # is not a state Git ever leaves behind -- it is decidable, not ambiguous.
+    # A fresh reftable repository always names at least one table, so contents
+    # naming none are not a state Git leaves behind -- decidable, not ambiguous.
     assert original
-    table_list.write_bytes(b"")
+    table_list.write_bytes(empty_table_list)
     try:
         # Git's own verdict on this state, measured rather than assumed: the ref
         # reads absent and both integrity checks bless the repository, so the
         # refusal below is strictly stronger than anything Git will say.
-        assert git_repo.git("show-ref", "--exists", WAL_REF, check=False).returncode == 2
+        assert git_repo.git("show-ref", "--exists", WAL_REF, check=False).returncode in {1, 2}
         assert git_repo.git("fsck", check=False).returncode == 0
         assert git_repo.git("refs", "verify", check=False).returncode == 0
         assert sorted(table_list.parent.glob("*.ref"))
@@ -1683,7 +1854,7 @@ def test_land_warnings_reach_both_cli_output_modes(
 
 
 @pytest.mark.parametrize("ref_format", ["files", "reftable"])
-@pytest.mark.parametrize("hand_commits", [0, 1, 3])
+@pytest.mark.parametrize("hand_commits", [0, 1, 2, 3, 5, 10, 40])
 def test_a_status_lost_branch_cas_stays_a_win_above_any_hand_commits(
     tmp_path: Path,
     ref_format: str,
@@ -1798,7 +1969,7 @@ def test_an_absent_wal_stays_absent_under_two_thousand_ordinary_ref_writes(
     tmp_path: Path,
     ref_format: str,
 ) -> None:
-    """The ordinary absent path must not manufacture corruption under ref traffic."""
+    """Historical name; AF6 raises the measured sweep to 2,500 attempts."""
 
     git_repo = _repository_with_ref_backend(tmp_path, ref_format)
     repository = Repository(git_repo.root)
@@ -1820,7 +1991,7 @@ def test_an_absent_wal_stays_absent_under_two_thousand_ordinary_ref_writes(
     peer.start()
     errors: list[RefCorruptError] = []
     try:
-        for _ in range(2_000):
+        for _ in range(2_500):
             try:
                 assert repository.resolve_ref(WAL_REF, missing_ok=True) is None
             except RefCorruptError as error:
@@ -1867,17 +2038,13 @@ def test_the_branch_audit_uses_one_log_without_skip_pagination(
 def test_a_plain_clone_missing_the_wal_is_quarantined_before_it_can_append(
     tmp_path: Path,
 ) -> None:
-    """Default ``git clone`` omits the WAL ref, so it must not adopt history silently."""
+    """An ordinary push omits the WAL; local adoption is the explicit escape."""
 
-    source = _repository_with_ref_backend(tmp_path / "source", "files")
-    source_coordinator = Coordinator(source.root)
-    session = _register(source_coordinator, source, "alpha", "a.txt")
-    _stage(source, session, "a.txt", "broker landing before clone\n")
-    source_coordinator.land("alpha", message="broker landing before clone")
+    _, remote, landed = _published_broker_repository(tmp_path)
 
     clone = tmp_path / "clone"
     subprocess.run(
-        [_GIT_EXECUTABLE, "clone", "--quiet", str(source.root), str(clone)],
+        [_GIT_EXECUTABLE, "clone", "--quiet", str(remote), str(clone)],
         check=True,
         capture_output=True,
         text=True,
@@ -1887,23 +2054,153 @@ def test_a_plain_clone_missing_the_wal_is_quarantined_before_it_can_append(
 
     report = coordinator.inspect_wal()
     assert not report.consistent
-    assert [item.kind for item in report.divergences] == ["wal_history_missing"]
-    with pytest.raises(WalHistoryMissingError) as refused:
+    assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
+    assert report.divergences[0].commit == landed
+    clear = coordinator.check("beta", str(clone / "a.txt"))
+    assert not clear.blocked
+
+    with pytest.raises(OnetreeError) as refused:
         coordinator.register_session("beta", pid=os.getpid(), ttl=300)
-    assert refused.value.kind == "wal_history_missing"
+    assert refused.value.kind == "unrecorded_landing"
     assert coordinator.wal.read().events == ()
 
-    with pytest.raises(WalHistoryMissingError):
+    with pytest.raises(OnetreeError) as recovery_refused:
         coordinator.recover()
+    assert recovery_refused.value.kind == "unrecorded_landing"
     code, output, error = _cli("wal", "--repo", str(clone), "--json")
     assert (code, error) == (1, "")
-    assert json.loads(output)["wal"]["divergences"][0]["kind"] == "wal_history_missing"
+    assert json.loads(output)["wal"]["divergences"][0]["kind"] == "unrecorded_landing"
 
-    code, output, error = _cli("wal", "--repo", str(clone), "--repair", "--json")
+    code, output, error = _cli("wal", "--repo", str(clone), "--adopt", "--json")
     assert (code, error) == (0, "")
-    assert json.loads(output)["repair"]["consistent"] is True
+    adoption = json.loads(output)["adoption"]
+    assert adoption["consistent"] is True
+    assert adoption["commits"] == [landed]
     coordinator.register_session("beta", pid=os.getpid(), ttl=300)
     assert coordinator.recover().consistent
+
+
+@pytest.mark.parametrize(
+    "clone_shape",
+    ["upstream", "renamed", "detached", "non_head_target"],
+)
+def test_missing_wal_detection_and_adoption_do_not_depend_on_clone_shape(
+    tmp_path: Path,
+    clone_shape: str,
+) -> None:
+    _, remote, landed = _published_broker_repository(tmp_path)
+    clone = tmp_path / "clone"
+    clone_command = [_GIT_EXECUTABLE, "clone", "--quiet"]
+    if clone_shape == "upstream":
+        clone_command.extend(("--origin", "upstream"))
+    clone_command.extend((str(remote), str(clone)))
+    subprocess.run(clone_command, check=True, capture_output=True, text=True)
+    fixture = GitFixture(clone, landed)
+    target = "refs/heads/main"
+    if clone_shape == "renamed":
+        fixture.git("remote", "rename", "origin", "upstream")
+    elif clone_shape == "detached":
+        fixture.git("checkout", "--quiet", "--detach", target)
+    elif clone_shape == "non_head_target":
+        fixture.git("checkout", "--quiet", "clean")
+
+    coordinator = Coordinator(clone)
+    report = coordinator.inspect_wal(target=target)
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", landed)
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300, target=target)
+    assert refused.value.kind == "unrecorded_landing"
+
+    code, output, error = _cli(
+        "wal", "--repo", str(clone), "--target", target, "--adopt", "--json"
+    )
+    assert (code, error) == (0, "")
+    assert json.loads(output)["adoption"]["commits"] == [landed]
+    coordinator.register_session("beta", pid=os.getpid(), ttl=300, target=target)
+
+
+def test_a_first_wal_append_on_another_branch_does_not_disarm_the_guard(
+    tmp_path: Path,
+) -> None:
+    _, remote, landed = _published_broker_repository(tmp_path)
+    clone = tmp_path / "clone"
+    subprocess.run(
+        [_GIT_EXECUTABLE, "clone", "--quiet", str(remote), str(clone)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fixture = GitFixture(clone, landed)
+    fixture.git("checkout", "--quiet", "clean")
+    coordinator = Coordinator(clone)
+    coordinator.register_session(
+        "clean-session", pid=os.getpid(), ttl=300, target="refs/heads/clean"
+    )
+    assert coordinator.wal.head() is not None
+
+    fixture.git("checkout", "--quiet", "main")
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session(
+            "main-session", pid=os.getpid(), ttl=300, target="refs/heads/main"
+        )
+    assert refused.value.kind == "unrecorded_landing"
+    adoption = coordinator.adopt_landings("refs/heads/main")
+    assert [event.data["commit"] for event in adoption.adopted] == [landed]
+    coordinator.register_session(
+        "main-session", pid=os.getpid(), ttl=300, target="refs/heads/main"
+    )
+
+
+def test_an_ordinary_message_mention_is_not_a_landing_trailer(
+    git_repo: GitFixture,
+) -> None:
+    git_repo.git("remote", "add", "origin", "unused://ordinary-remote")
+    git_repo.external_commit(
+        "a.txt",
+        "ordinary\n",
+        "ordinary discussion\n\nThe text Onetree-Operation: is documentation.",
+    )
+    coordinator = Coordinator(git_repo.root)
+
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+
+    assert coordinator.inspect_wal().consistent
+
+
+@pytest.mark.parametrize(("depth", "landing_visible"), [(3, False), (4, True)])
+def test_shallow_history_is_an_explicit_audit_boundary(
+    tmp_path: Path,
+    depth: int,
+    landing_visible: bool,
+) -> None:
+    _, remote, landed = _published_broker_repository(tmp_path, hand_commits=3)
+    clone = tmp_path / "clone"
+    subprocess.run(
+        [
+            _GIT_EXECUTABLE,
+            "clone",
+            "--quiet",
+            f"--depth={depth}",
+            f"file://{remote}",
+            str(clone),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    coordinator = Coordinator(clone)
+    visible = {item.commit for item in coordinator.repo.marked_commits("refs/heads/main")}
+    assert (landed in visible) is landing_visible
+
+    report = coordinator.inspect_wal()
+    kinds = [item.kind for item in report.divergences]
+    assert "shallow_history" in kinds
+    assert ("unrecorded_landing" in kinds) is landing_visible
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "shallow_history"
 
 
 def test_linked_worktrees_are_refused_before_they_can_split_shared_wal_state(
@@ -1920,3 +2217,64 @@ def test_linked_worktrees_are_refused_before_they_can_split_shared_wal_state(
 
     assert refused.value.kind == "unsupported_worktree"
     assert not (git_repo.root / ".git" / "onetree").exists()
+
+
+def test_primary_repository_shapes_are_not_misclassified_as_linked_worktrees(
+    tmp_path: Path,
+) -> None:
+    """The one-worktree rule is about shared Git dirs, not unusual paths."""
+
+    primary = _repository_with_ref_backend(tmp_path / "primary", "files")
+
+    separate_work = tmp_path / "separate-work"
+    separate_git = tmp_path / "separate.git"
+    subprocess.run(
+        [
+            _GIT_EXECUTABLE,
+            "init",
+            "--quiet",
+            "--initial-branch=main",
+            f"--separate-git-dir={separate_git}",
+            separate_work,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    separate = GitFixture(separate_work, "")
+    separate.git("config", "user.name", "Round AF6 Tests")
+    separate.git("config", "user.email", "round-af6@example.invalid")
+    separate.write("a.txt", "a\n")
+    separate.git("add", "a.txt")
+    separate.git("commit", "--quiet", "-m", "baseline")
+
+    symlinked_git = _repository_with_ref_backend(tmp_path / "symlinked-git", "files")
+    real_git = tmp_path / "real-symlinked.git"
+    symlinked_git.root.joinpath(".git").rename(real_git)
+    symlinked_git.root.joinpath(".git").symlink_to(real_git, target_is_directory=True)
+
+    symlinked_root = tmp_path / "repository-link"
+    symlinked_root.symlink_to(primary.root, target_is_directory=True)
+
+    outer = _repository_with_ref_backend(tmp_path / "outer", "files")
+    inner = _repository_with_ref_backend(tmp_path / "inner", "files")
+    outer.git(
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--quiet",
+        str(inner.root),
+        "sub",
+    )
+    outer.git("commit", "--quiet", "-m", "add submodule")
+
+    for path in (
+        primary.root,
+        separate_work,
+        symlinked_git.root,
+        symlinked_root,
+        outer.root / "sub",
+    ):
+        repository = Repository(path)
+        assert repository.git_dir == repository.common_git_dir

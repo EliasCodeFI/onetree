@@ -72,10 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
     wal_action = wal.add_mutually_exclusive_group()
     wal_action.add_argument("--recover", action="store_true", help="Resolve any exposed intent.")
     wal_action.add_argument(
-        "--repair",
+        "--adopt",
         action="store_true",
-        help="Fetch a WAL ref omitted by a default git clone, then re-inspect.",
+        help="Record broker landings found by the local branch audit.",
     )
+    wal.add_argument("--target", help="Branch ref to inspect or adopt (default: symbolic HEAD).")
     _add_output(wal)
 
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")
@@ -195,21 +196,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             human = f"landed {land_result.commit} on {land_result.target}"
             if land_result.warnings:
                 human += f" [warning: {', '.join(land_result.warnings)}]"
-        elif args.command == "wal" and args.repair:
-            wal_result = coordinator.repair_wal_history()
+        elif args.command == "wal" and args.adopt:
+            adoption_result = coordinator.adopt_landings(args.target)
+            wal_result = adoption_result.report
             return_code = 0 if wal_result.consistent else 1
             payload = {
                 "ok": wal_result.consistent,
-                "repair": {
+                "adoption": {
                     "ref": "refs/onetree/wal",
                     "head": wal_result.head,
                     "consistent": wal_result.consistent,
                     "pending_intents": wal_result.pending_intents,
                     "divergences": [item.payload() for item in wal_result.divergences],
+                    "commits": [event.data["commit"] for event in adoption_result.adopted],
                 },
             }
             human = (
-                f"WAL repair fetched refs/onetree/wal: "
+                f"WAL adoption recorded {len(adoption_result.adopted)} landing(s): "
                 f"{'consistent' if wal_result.consistent else 'INCONSISTENT'}"
             )
         elif args.command == "wal" and args.recover:
@@ -218,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # a diff reports difference. Recovery is an action: a divergence it
             # cannot repair raises, and a raised OnetreeError exits 2, because the
             # command it was asked to complete did not complete.
-            recovery_result = coordinator.recover()
+            recovery_result = coordinator.recover(args.target)
             return_code = 0 if recovery_result.consistent else 1
             payload = {
                 "ok": recovery_result.consistent,
@@ -244,7 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{', '.join(recovery_result.locks)}"
                 )
         elif args.command == "wal":
-            wal_result = coordinator.inspect_wal()
+            wal_result = coordinator.inspect_wal(args.target)
             return_code = 0 if wal_result.consistent else 1
             payload = {
                 "ok": True,

@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
+
+
 @dataclass(frozen=True, order=True)
 class TreeEntry:
     """One recursive tree entry relevant to a payload audit."""
@@ -285,8 +288,8 @@ class Repository:
         """Return the one storage fact reftable absence needs from us.
 
         Git decides whether a nonempty table set names a ref. The broker only
-        adds the stable zero-byte sentinel: Git 2.53.0 writes a nonempty
-        ``tables.list`` at init and replaces it atomically thereafter. Parsing
+        adds the stable no-table-named sentinel: Git 2.53.0 writes a list that
+        names at least one table at init and replaces it atomically thereafter. Parsing
         names, opening listed tables, or comparing two valid list snapshots
         would turn compaction and ordinary writes into false corruption.
         """
@@ -296,7 +299,7 @@ class Repository:
             contents = table_list.read_bytes()
         except OSError as error:
             return f"reftable tables.list cannot be read: {error.strerror}"
-        if not contents:
+        if not contents.split():
             return "reftable tables.list is empty"
         return None
 
@@ -560,6 +563,14 @@ class Repository:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
 
+    def is_shallow(self) -> bool:
+        """Whether Git's object view stops at a shallow-history boundary."""
+
+        answer = self.git_text("rev-parse", "--is-shallow-repository")
+        if answer not in {"true", "false"}:
+            raise GitError("Git returned an invalid shallow-repository answer", value=answer)
+        return answer == "true"
+
     def ref_lock_paths(self, reference: str) -> tuple[Path, ...]:
         """Every lock file an update to ``reference`` can leave behind.
 
@@ -680,12 +691,13 @@ class Repository:
         target: str,
         excludes: Sequence[str] = (),
     ) -> Iterator[MarkedCommit]:
-        """Stream every marked commit on a stable target in one Git walk.
+        """Return every marked commit found by one linear Git walk.
 
         The former ``--skip`` pagination restarted ``git log`` from ``target``
         for every page, making an otherwise linear audit quadratic in branch
-        depth. One process emits the identical record format incrementally, so
-        the Git walk and the parser both retain only a bounded buffer.
+        depth. The parser reads bounded chunks, but retains the marked results
+        until Git exits so a caller can neither observe a partial failed walk
+        nor retain the child process descriptors by abandoning an iterator.
         """
 
         arguments = (
@@ -695,56 +707,63 @@ class Repository:
             *(f"^{oid}" for oid in excludes),
             "--",
         )
-        try:
-            if _GIT_EXECUTABLE is None:
-                raise OSError("git executable was not found on PATH")
-            process = subprocess.Popen(  # noqa: S603 - argv-only Git plumbing
-                [_GIT_EXECUTABLE, "-C", str(self.root), *arguments],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self._environment(),
-            )
-        except OSError as error:
-            raise GitError("could not execute git: " + str(error), operation="log") from error
+        # stderr goes to a file rather than a pipe. Git can therefore fill it
+        # without blocking before it closes stdout.
+        found: list[MarkedCommit] = []
+        with tempfile.TemporaryFile() as stderr_file:
+            try:
+                if _GIT_EXECUTABLE is None:
+                    raise OSError("git executable was not found on PATH")
+                process = subprocess.Popen(  # noqa: S603 - argv-only Git plumbing
+                    [_GIT_EXECUTABLE, "-C", str(self.root), *arguments],
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    env=self._environment(),
+                )
+            except OSError as error:
+                raise GitError("could not execute git: " + str(error), operation="log") from error
 
-        if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE is explicit
-            process.kill()
-            process.wait()
-            raise GitError("could not capture git log output", operation="log")
-
-        buffer = b""
-        returncode: int | None = None
-        stderr = b""
-        try:
-            while True:
-                chunk = process.stdout.read(64 * 1024)
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"\x1e" in buffer:
-                    raw_record, _, buffer = buffer.partition(b"\x1e")
-                    marked = self._parse_marked_commit(raw_record, target)
-                    if marked is not None:
-                        yield marked
-            if buffer.strip():
-                marked = self._parse_marked_commit(buffer, target)
-                if marked is not None:
-                    yield marked
-            returncode = process.wait()
-            stderr = process.stderr.read()
-        finally:
-            if process.poll() is None:
+            if process.stdout is None:  # pragma: no cover - PIPE is explicit
                 process.kill()
                 process.wait()
-            if returncode is None:
-                stderr = process.stderr.read()
-        if returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            raise GitError(
-                f"git log failed with exit {returncode}: {detail}",
-                operation="log",
-                returncode=returncode,
-            )
+                raise GitError("could not capture git log output", operation="log")
+
+            buffer = b""
+            returncode: int | None = None
+            try:
+                while True:
+                    chunk = process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\x1e" in buffer:
+                        raw_record, _, buffer = buffer.partition(b"\x1e")
+                        marked = self._parse_marked_commit(raw_record, target)
+                        if marked is not None:
+                            found.append(marked)
+                if buffer.strip():
+                    marked = self._parse_marked_commit(buffer, target)
+                    if marked is not None:
+                        found.append(marked)
+                returncode = process.wait()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdout.close()
+            if returncode != 0:
+                stderr_file.seek(0)
+                stderr = stderr_file.read(64 * 1024 + 1)
+                truncated = len(stderr) > 64 * 1024
+                detail = stderr[: 64 * 1024].decode("utf-8", errors="replace").strip()
+                if truncated:
+                    detail += " [stderr truncated]"
+                raise GitError(
+                    f"git log failed with exit {returncode}: {detail}",
+                    operation="log",
+                    returncode=returncode,
+                )
+        return iter(found)
 
     def _parse_marked_commit(self, raw_record: bytes, target: str) -> MarkedCommit | None:
         record = raw_record.strip()
@@ -760,49 +779,19 @@ class Repository:
         operation = trailer.strip() or None
         return MarkedCommit(self.validate_oid(oid.strip(), label="target"), operation)
 
-    def first_marked_commit(self, target: str) -> str | None:
-        """Return one broker-marked commit on ``target``, if history has one."""
+    def landing_operation(self, commit: str) -> str | None:
+        """Read the real landing trailer from exactly one commit."""
 
-        result = self.git(
-            "log",
-            "--format=%H",
-            "--max-count=1",
-            "--fixed-strings",
-            "--grep=Onetree-Operation:",
-            target,
-            "--",
-        )
-        raw = result.stdout.strip()
+        raw = self.git(
+            "show",
+            "-s",
+            "--format=%(trailers:key=" + LANDING_TRAILER + ",valueonly,separator=%x2C)",
+            commit,
+        ).stdout.strip()
         if not raw:
             return None
         try:
-            oid = raw.decode("ascii", errors="strict")
+            operation = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
-            raise GitError("marked commit ID is not ASCII", reference=target) from error
-        return self.validate_oid(oid, label="marked commit")
-
-    def fetch_wal(self, remote: str = "origin") -> None:
-        """Fetch only the WAL ref, never an implicit remote branch update."""
-
-        self.git(
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            remote,
-            "refs/onetree/wal:refs/onetree/wal",
-        )
-
-    def has_remote(self, remote: str) -> bool:
-        """Whether ``remote`` is configured without treating a missing one as Git failure."""
-
-        result = self.git("config", "--get", f"remote.{remote}.url", check=False)
-        if result.returncode == 0:
-            return bool(result.stdout.strip())
-        if result.returncode == 1:
-            return False
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise GitError(
-            f"cannot inspect remote {remote}: {detail}",
-            operation="config",
-            remote=remote,
-        )
+            raise GitError("landing trailer is not UTF-8", commit=commit) from error
+        return operation
