@@ -38,7 +38,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(session)
     session.add_argument("--pid", type=int, help="Long-lived session body PID (default: parent).")
     session.add_argument("--ttl", type=float, default=86400.0, help="Session lease seconds.")
-    session.add_argument("--target", help="Full refs/heads target (default: symbolic HEAD).")
+    session.add_argument(
+        "--target",
+        help="Full refs/heads target (default: HEAD branch or unique same-tip branch).",
+    )
     _add_output(session)
 
     claim = subparsers.add_parser("claim", help="Claim one or more absolute existing paths.")
@@ -63,7 +66,10 @@ def _build_parser() -> argparse.ArgumentParser:
     land = subparsers.add_parser("land", help="Audit and CAS-land the session index.")
     _add_repo(land)
     _add_actor(land)
-    land.add_argument("--target", help="Full refs/heads target (default: symbolic HEAD).")
+    land.add_argument(
+        "--target",
+        help="Full refs/heads target (required while HEAD is detached).",
+    )
     land.add_argument("-m", "--message", help="Commit message.")
     _add_output(land)
 
@@ -76,7 +82,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Record broker landings found by the local branch audit.",
     )
-    wal.add_argument("--target", help="Branch ref to inspect or adopt (default: symbolic HEAD).")
+    wal.add_argument(
+        "--target",
+        help="With --adopt, limit records to one refs/heads branch; audit stays repository-wide.",
+    )
     _add_output(wal)
 
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")

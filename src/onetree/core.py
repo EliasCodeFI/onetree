@@ -427,12 +427,24 @@ class Coordinator:
                 continue
             walked_heads.add(head)
             for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
-                operation = marked.operation or ""
-                if not operation or marked.commit in seen:
+                if not marked.operations or marked.commit in seen:
                     continue
                 seen.add(marked.commit)
-                if (marked.commit, operation) in recorded:
+                if any(
+                    (marked.commit, operation) in recorded
+                    for operation in marked.operations
+                ):
                     continue
+                # Divergence and adopted-event schemas are intentionally scalar.
+                # ANY consistency means one deterministic recorded witness is
+                # sufficient. Prefer an id not pending for another candidate so
+                # the operator's adoption escape does not collide with that
+                # independent intent.
+                ordered = sorted(marked.operations)
+                operation = next(
+                    (candidate for candidate in ordered if candidate not in state.pending),
+                    ordered[0],
+                )
                 found.append(
                     Divergence(
                         "unrecorded_landing",
@@ -740,8 +752,11 @@ class Coordinator:
                 raise WalCorruptError("adopted event has unexpected fields", oid=event.oid)
             _validate_actor(event.actor)
             operation = _string(data, "operation", event)
-            if operation in state.pending:
-                raise WalCorruptError("duplicate landing operation", oid=event.oid)
+            # An over-detected commit may quote the id of an independent intent
+            # that is still live. Adoption records this distinct commit/id pair
+            # without consuming that intent; its later landed/refused event
+            # closes pending in the ordinary way. Adopted commits already share
+            # ids safely, with exact duplicate pairs rejected below.
             target_value = _string(data, "target", event)
             target = (
                 "HEAD"
@@ -1083,10 +1098,14 @@ class Coordinator:
         return self._try_append(state, snapshot, (document,)) is not None
 
     def _append_document(self, document: Mapping[str, Any], *, what: str) -> EventRecord:
-        """CAS-append one prepared document, re-reading the head on every loss."""
+        """CAS-append one terminal document, re-reading the WAL on every loss."""
 
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self._read_wal()
+            # Every caller has already crossed its mutation audit. A landing's
+            # branch CAS may also have become irreversible, so a new unrelated
+            # divergence must not prevent this terminal event from being
+            # recorded or relabel success as failure.
+            snapshot = self.wal.read()
             records = self._try_append(self._fold(snapshot), snapshot, (document,))
             if records is not None:
                 return records[0]
@@ -1128,7 +1147,7 @@ class Coordinator:
 
         actor = _validate_actor(actor)
         target_ref = (
-            self.repo.default_branch_ref()
+            self.repo.head_ref()
             if target is None
             else self.repo.validate_branch_ref(target)
         )
@@ -1467,7 +1486,7 @@ class Coordinator:
     def _landing_recorded(self, operation: str, document: Mapping[str, Any]) -> bool:
         """Is this exact landing already recorded, field for field, by someone else?"""
 
-        recorded = self._fold(self._read_wal()).landed_operations.get(operation)
+        recorded = self._fold(self.wal.read()).landed_operations.get(operation)
         if recorded is None:
             return False
         return all(
@@ -1503,9 +1522,9 @@ class Coordinator:
             actual_tree = self.repo.git_text("show", "-s", "--format=%T", commit)
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
-            if event.kind == "adopted" and self.repo.landing_operation(commit) != event.data.get(
+            if event.kind == "adopted" and event.data.get(
                 "operation"
-            ):
+            ) not in self.repo.landing_operations(commit):
                 raise WalCorruptError(
                     "adopted commit does not carry the recorded landing trailer",
                     oid=event.oid,
@@ -1695,9 +1714,12 @@ class Coordinator:
                     targets=list(targets),
                     repair="deepen the repository before adopting",
                 )
-            unrecorded = self._unrecorded_landings(state, heads)
-            if self.wal.head() != snapshot.head or self._audit_heads(state, target_ref) != heads:
-                continue
+            adoption_heads = (
+                heads
+                if target_ref is None
+                else tuple(item for item in heads if item[0] == target_ref)
+            )
+            unrecorded = self._unrecorded_landings(state, adoption_heads)
             if not unrecorded:
                 raise UnrecordedLandingError(
                     "the audit found no unrecorded broker landings to adopt",
@@ -1724,8 +1746,6 @@ class Coordinator:
                         },
                     )
                 )
-            if self._audit_heads(state, target_ref) != heads:
-                continue
             records = self._try_append(state, snapshot, documents)
             if records is None:
                 continue

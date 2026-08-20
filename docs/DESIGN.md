@@ -66,6 +66,18 @@ never failed is not evidence.
   allow.
 - **INV7** Kill the landing process at any point: no partial state survives;
   recovery replays the WAL to a consistent view.
+- **INV8** Landing identity is a set parsed from the raw commit-object message,
+  never from a patch stream. The parser unions every non-empty value reachable
+  from a column-zero, case-insensitive literal `Onetree-Operation` marker over
+  pinned separator and folded-continuation settings, across the whole message;
+  the empty set is the ordinary non-landing result. Against the config-pinned
+  Git commit-object oracle for that literal marker, onetree may see more
+  candidates but never fewer. Every deliberate extra shape must have a tested
+  `wal --adopt` escape that restores consistency and permits mutation. A marked
+  commit is consistent when any candidate forms a recorded `(commit,
+  operation)` pair. The measured predicate and the deliberate exclusion of
+  key-alias configurations that rename unrelated markers are recorded in
+  `docs/ROUND-AF10.md`.
 
 ## Non-goals for Round A
 

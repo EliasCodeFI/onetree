@@ -413,6 +413,82 @@ def test_a_landing_recovery_completed_first_is_this_landings_own_outcome(
     assert not lander._landing_recorded(result.operation, forged)
 
 
+def test_an_unrelated_landing_after_branch_cas_does_not_relabel_success(
+    git_repo: GitFixture,
+) -> None:
+    """An irreversible target move still receives its terminal WAL event."""
+
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "landed before unrelated audit failure\n")
+    interleaved: dict[str, str] = {}
+
+    def plant_unrelated(point: str, _context: Mapping[str, Any]) -> None:
+        if point == "after_branch":
+            interleaved["commit"] = _marked_commit(
+                coordinator,
+                "refs/heads/topic",
+                "9" * 32,
+                (git_repo.base,),
+            )
+
+    result = coordinator.land(
+        "alpha",
+        message="completed landing",
+        checkpoint=plant_unrelated,
+    )
+
+    assert git_repo.oid() == result.commit
+    snapshot = coordinator.wal.read()
+    assert not coordinator._fold(snapshot).pending
+    assert [
+        event.data["commit"]
+        for event in snapshot.events
+        if event.kind == "landed" and event.data.get("operation") == result.operation
+    ] == [result.commit]
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.target, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", "refs/heads/topic", interleaved["commit"])
+    ]
+    with pytest.raises(OnetreeError) as refused:
+        coordinator.register_session("beta", pid=os.getpid(), ttl=300)
+    assert refused.value.kind == "unrecorded_landing"
+
+
+def test_a_recovered_duplicate_mark_survives_an_unrelated_divergence(
+    git_repo: GitFixture,
+) -> None:
+    """The duplicate-success check reads the WAL, not the mutation audit."""
+
+    lander = Coordinator(git_repo.root)
+    operator = Coordinator(git_repo.root)
+    session = _register(lander, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "recovered with unrelated divergence\n")
+    interleaved: dict[str, str] = {}
+
+    def repair_then_diverge(point: str, _context: Mapping[str, Any]) -> None:
+        if point == "after_branch":
+            assert operator.recover().repaired == 1
+            interleaved["commit"] = _marked_commit(
+                operator,
+                "refs/heads/topic",
+                "8" * 32,
+                (git_repo.base,),
+            )
+
+    result = lander.land(
+        "alpha",
+        message="recovered first",
+        checkpoint=repair_then_diverge,
+    )
+
+    assert git_repo.oid() == result.commit
+    landed = [event for event in lander.wal.read().events if event.kind == "landed"]
+    assert len(landed) == 1
+    assert landed[0].data["commit"] == result.commit
+    assert lander.inspect_wal().divergences[0].commit == interleaved["commit"]
+
+
 def test_a_landed_mark_with_no_matching_intent_is_refused_at_write_time(
     git_repo: GitFixture,
 ) -> None:
@@ -838,7 +914,295 @@ def test_repository_wide_audit_and_adoption_cover_every_landing_shape(
     if shape == "detached":
         coordinator.claim("beta", [str(git_repo.root / "nested/c.txt")])
         _stage(git_repo, registered, "nested/c.txt", "post-adoption landing\n")
-        assert coordinator.land("beta", message="post-adoption landing").target == target
+        assert coordinator.land(
+            "beta", message="post-adoption landing", target=target
+        ).target == target
+
+
+def test_targeted_adoption_records_only_the_named_branch(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    wanted = _marked_commit(
+        coordinator,
+        "refs/heads/main",
+        "1" * 32,
+        (git_repo.base,),
+    )
+    unwanted = _marked_commit(
+        coordinator,
+        "refs/heads/topic",
+        "2" * 32,
+        (git_repo.base,),
+    )
+
+    adoption = coordinator.adopt_landings("refs/heads/main")
+
+    assert [event.data["commit"] for event in adoption.adopted] == [wanted]
+    assert not adoption.report.consistent
+    assert [(item.target, item.commit) for item in adoption.report.divergences] == [
+        ("refs/heads/topic", unwanted)
+    ]
+
+
+def test_targeted_adoption_attributes_a_shared_commit_to_the_named_branch(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    candidate = _marked_commit(
+        coordinator,
+        "refs/heads/main",
+        "3" * 32,
+        (git_repo.base,),
+    )
+    assert coordinator.repo.update_ref("refs/heads/aaa", candidate, None)
+
+    adoption = coordinator.adopt_landings("refs/heads/main")
+
+    assert len(adoption.adopted) == 1
+    assert adoption.adopted[0].data["target"] == "refs/heads/main"
+    assert adoption.adopted[0].data["commit"] == candidate
+    assert adoption.report.consistent
+
+
+def test_land_refuses_detached_head_without_an_explicit_target(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "detached payload\n")
+    git_repo.git("checkout", "--quiet", "--detach", git_repo.base)
+    wal_before = coordinator.wal.head()
+
+    with pytest.raises(GitError, match="HEAD is detached; pass a branch ref"):
+        coordinator.land("alpha", message="must name the target")
+
+    assert coordinator.wal.head() == wal_before
+    assert coordinator.repo.resolve_ref("HEAD") == git_repo.base
+    assert coordinator.repo.resolve_ref("refs/heads/main") == git_repo.base
+    result = coordinator.land(
+        "alpha",
+        message="explicit detached landing",
+        target="refs/heads/main",
+    )
+    assert result.target == "refs/heads/main"
+    assert coordinator.repo.resolve_ref("refs/heads/main") == result.commit
+    assert coordinator.repo.resolve_ref("HEAD") == git_repo.base
+
+
+def test_a_malformed_loose_ref_does_not_hide_valid_audit_heads(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    candidate = _marked_commit(
+        coordinator,
+        "refs/heads/topic",
+        "4" * 32,
+        (git_repo.base,),
+    )
+    malformed = coordinator.repo.git_dir / "refs" / "heads" / "bad..name"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+
+    report = coordinator.inspect_wal()
+
+    assert [(item.target, item.commit) for item in report.divergences] == [
+        ("refs/heads/topic", candidate)
+    ]
+    adoption = coordinator.adopt_landings("refs/heads/topic")
+    assert [event.data["commit"] for event in adoption.adopted] == [candidate]
+    assert adoption.report.consistent
+
+    code, output, error = _cli("wal", "--repo", str(git_repo.root), "--json")
+    assert (code, error) == (0, "")
+    assert json.loads(output)["wal"]["consistent"] is True
+    code, output, error = _cli(
+        "session",
+        "--repo",
+        str(git_repo.root),
+        "--session",
+        "beta",
+        "--pid",
+        str(os.getpid()),
+        "--json",
+    )
+    assert (code, error) == (0, "")
+    assert json.loads(output)["session"]["actor"] == "beta"
+    code, output, error = _cli(
+        "claim",
+        str(git_repo.root / "b.txt"),
+        "--repo",
+        str(git_repo.root),
+        "--session",
+        "beta",
+        "--json",
+    )
+    assert (code, error) == (0, "")
+    assert len(json.loads(output)["claim"]["claims"]) == 1
+
+
+def test_a_malformed_out_of_scope_ref_name_does_not_brick_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    malformed = coordinator.repo.git_dir / "refs" / "tags" / "bad..name"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_control_character_in_a_malformed_ref_name_does_not_brick_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    malformed = coordinator.repo.git_dir / "refs" / "heads" / "bad\n..name"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_warning_shaped_non_utf8_bytes_in_a_malformed_name_do_not_brick_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    relative = (
+        Path("bad\nwarning: ignoring broken ref refs")
+        / "heads"
+        / os.fsdecode(b"\xff..")
+    )
+    malformed = coordinator.repo.git_dir / "refs" / "heads" / relative
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_validly_named_broken_ref_still_refuses_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    broken = coordinator.repo.git_dir / "refs" / "heads" / "broken"
+    broken.write_text("not-an-object-id\n", encoding="ascii")
+
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.inspect_wal()
+
+
+def test_a_malformed_name_cannot_mask_a_validly_named_broken_branch(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    malformed = coordinator.repo.git_dir / "refs" / "tags" / "bad..name"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+    broken = coordinator.repo.git_dir / "refs" / "heads" / "broken"
+    broken.write_text("not-an-object-id\n", encoding="ascii")
+
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.inspect_wal()
+
+
+def test_a_malformed_name_cannot_mask_a_non_utf8_broken_branch(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    malformed = coordinator.repo.git_dir / "refs" / "heads" / "00..bad"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+    non_utf8_name = os.fsdecode(b"\xff")
+    broken = coordinator.repo.git_dir / "refs" / "heads" / non_utf8_name
+    broken.write_text("not-an-object-id\n", encoding="ascii")
+
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.inspect_wal()
+
+
+def test_a_dangling_symbolic_branch_cannot_disappear_from_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    broken = coordinator.repo.git_dir / "refs" / "heads" / "broken"
+    broken.write_text("ref: refs/heads/missing\n", encoding="ascii")
+
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.inspect_wal()
+
+
+def test_a_malformed_symbolic_head_cannot_disappear_from_the_audit(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    malformed = coordinator.repo.git_dir / "refs" / "heads" / "bad..name"
+    malformed.write_text(git_repo.base + "\n", encoding="ascii")
+    (coordinator.repo.git_dir / "HEAD").write_text(
+        "ref: refs/heads/bad..name\n", encoding="ascii"
+    )
+
+    with pytest.raises(RefCorruptError):
+        coordinator.repo.audit_heads()
+
+
+def test_git_plumbing_pins_diagnostic_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+
+    assert Repository._environment()["LC_ALL"] == "C"
+
+
+def test_adoption_can_share_an_id_with_an_independent_pending_intent(
+    git_repo: GitFixture,
+) -> None:
+    """Adoption records the commit pair without cancelling a live lander."""
+
+    lander = Coordinator(git_repo.root)
+    operator = Coordinator(git_repo.root)
+    session = _register(lander, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "live landing\n")
+    adopted: dict[str, str] = {}
+
+    def adopt_during_intent(point: str, context: Mapping[str, Any]) -> None:
+        if point != "after_intent":
+            return
+        operation = str(context["operation"])
+        commit = _marked_commit(
+            operator,
+            "refs/heads/topic",
+            operation,
+            (git_repo.base,),
+        )
+        result = operator.adopt_landings("refs/heads/topic")
+        assert [(event.data["commit"], event.data["operation"]) for event in result.adopted] == [
+            (commit, operation)
+        ]
+        assert result.report.pending_intents == 1
+        adopted["commit"] = commit
+
+    landed = lander.land(
+        "alpha",
+        message="complete after peer adoption",
+        checkpoint=adopt_during_intent,
+    )
+
+    report = lander.inspect_wal()
+    assert adopted
+    assert report.consistent
+    assert report.pending_intents == 0
+    assert {
+        (event.data["commit"], event.data["operation"])
+        for event in report.events
+        if event.kind in {"adopted", "landed"}
+    } >= {
+        (adopted["commit"], landed.operation),
+        (landed.commit, landed.operation),
+    }
 
 
 def test_a_completed_peer_landing_restarts_the_audit_snapshot(
@@ -850,26 +1214,94 @@ def test_a_completed_peer_landing_restarts_the_audit_snapshot(
     coordinator = Coordinator(git_repo.root)
     peer = _register(coordinator, git_repo, "peer", "b.txt")
     _stage(git_repo, peer, "b.txt", "peer landing\n")
-    original = Coordinator._unrecorded_landings
+    original = Coordinator._audit_heads
     fired: list[bool] = []
 
     def interleave(
         self: Coordinator,
         state: Any,
-        targets: Any,
+        target: str | None = None,
     ) -> Any:
         if not fired:
             fired.append(True)
             coordinator.land("peer", message="complete peer landing")
-        return original(self, state, targets)
+        return original(self, state, target)
 
-    monkeypatch.setattr(Coordinator, "_unrecorded_landings", interleave)
+    monkeypatch.setattr(Coordinator, "_audit_heads", interleave)
 
     registered = coordinator.register_session("beta", pid=os.getpid(), ttl=300)
 
     assert fired == [True]
     assert registered.actor == "beta"
     assert coordinator.inspect_wal().consistent
+
+
+def test_inspection_restarts_when_a_peer_lands_before_head_capture(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    peer = _register(coordinator, git_repo, "peer", "b.txt")
+    _stage(git_repo, peer, "b.txt", "peer landing during inspection\n")
+    original = Coordinator._audit_heads
+    fired: list[bool] = []
+
+    def interleave(
+        self: Coordinator,
+        state: Any,
+        target: str | None = None,
+    ) -> Any:
+        if not fired:
+            fired.append(True)
+            coordinator.land("peer", message="complete peer landing")
+        return original(self, state, target)
+
+    monkeypatch.setattr(Coordinator, "_audit_heads", interleave)
+
+    report = coordinator.inspect_wal()
+
+    assert fired == [True]
+    assert report.consistent
+    assert report.divergences == ()
+
+
+def test_inspection_rechecks_heads_after_computing_a_clean_result(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    main = git_repo.oid()
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", main)
+    candidate = coordinator.repo.commit_tree(
+        tree,
+        coordinator.repo.landing_message(
+            "unrecorded during inspection", "5" * 32, "6" * 32, "ghost"
+        ),
+        (main,),
+    )
+    original = Coordinator._divergences
+    fired: list[bool] = []
+
+    def move_after_comparison(
+        self: Coordinator,
+        state: Any,
+        heads: Any,
+    ) -> Any:
+        result = original(self, state, heads)
+        if not fired:
+            fired.append(True)
+            assert coordinator.repo.update_ref("refs/heads/main", candidate, main)
+        return result
+
+    monkeypatch.setattr(Coordinator, "_divergences", move_after_comparison)
+
+    report = coordinator.inspect_wal()
+
+    assert fired == [True]
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", candidate)
+    ]
 
 
 def test_a_branch_move_without_a_wal_write_restarts_the_audit_snapshot(
@@ -910,6 +1342,80 @@ def test_a_branch_move_without_a_wal_write_restarts_the_audit_snapshot(
     assert fired == [True]
     assert refused.value.kind == "unrecorded_landing"
     assert coordinator.wal.read().events[-1].actor == "alpha"
+
+
+def test_recovery_rechecks_heads_after_computing_a_clean_result(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = _register(coordinator, git_repo, "alpha", "a.txt")
+    _stage(git_repo, session, "a.txt", "land before rollback\n")
+    landed = coordinator.land("alpha", message="land before rollback")
+    original = Coordinator._divergences
+    fired: list[bool] = []
+
+    def rollback_after_comparison(
+        self: Coordinator,
+        state: Any,
+        heads: Any,
+    ) -> Any:
+        result = original(self, state, heads)
+        if not fired:
+            fired.append(True)
+            assert coordinator.repo.update_ref(
+                "refs/heads/main", git_repo.base, landed.commit
+            )
+        return result
+
+    monkeypatch.setattr(Coordinator, "_divergences", rollback_after_comparison)
+
+    with pytest.raises(WalDivergedError) as refused:
+        coordinator.recover()
+
+    assert fired == [True]
+    assert [item["kind"] for item in refused.value.details["divergences"]] == [
+        "landed_not_on_target"
+    ]
+
+
+def test_recovery_rechecks_the_wal_after_computing_a_clean_result(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    peer = _register(coordinator, git_repo, "peer", "b.txt")
+    _stage(git_repo, peer, "b.txt", "intent during recovery\n")
+    original = Coordinator._divergences
+    fired: list[bool] = []
+
+    class StopAfterIntentError(RuntimeError):
+        pass
+
+    def append_intent_after_comparison(
+        self: Coordinator,
+        state: Any,
+        heads: Any,
+    ) -> Any:
+        result = original(self, state, heads)
+        if not fired:
+            fired.append(True)
+
+            def stop(point: str, _context: Mapping[str, Any]) -> None:
+                if point == "after_intent":
+                    raise StopAfterIntentError
+
+            with pytest.raises(StopAfterIntentError):
+                coordinator.land("peer", message="paused peer", checkpoint=stop)
+        return result
+
+    monkeypatch.setattr(Coordinator, "_divergences", append_intent_after_comparison)
+
+    recovery = coordinator.recover()
+
+    assert fired == [True]
+    assert not recovery.consistent
+    assert recovery.pending == 1
 
 
 @pytest.mark.parametrize(
@@ -1109,9 +1615,9 @@ def test_trailer_configuration_cannot_hide_a_landing(
     hidden_position = unpinned_fields.index(hidden)
     assert unpinned_fields[hidden_position + 1] == ""
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[hidden] == operation
-    assert coordinator.repo.landing_operation(hidden) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == frozenset({operation})
+    assert coordinator.repo.landing_operations(hidden) == frozenset({operation})
     report = coordinator.inspect_wal()
     assert [(item.kind, item.commit) for item in report.divergences] == [
         ("unrecorded_landing", hidden)
@@ -1122,7 +1628,7 @@ def test_trailer_configuration_cannot_hide_a_landing(
 
 
 @pytest.mark.parametrize(
-    ("raw_message", "expected"),
+    "raw_message",
     [
         pytest.param(
             b"subject\n\nOnetree-Operation: "
@@ -1130,18 +1636,15 @@ def test_trailer_configuration_cannot_hide_a_landing(
             + b"\n(cherry picked from commit "
             + b"1" * 40
             + b")\n",
-            "a" * 32,
             id="git-generated-line",
         ),
         pytest.param(
             b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n# fixed comment\n",
-            "a" * 32,
             id="fixed-comment-line",
         ),
         pytest.param(
             b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\nordinary prose\n",
-            None,
-            id="ordinary-prose-negative-control",
+            id="ordinary-prose-union",
         ),
         pytest.param(
             b"subject\n\nOnetree-Operation: "
@@ -1151,7 +1654,6 @@ def test_trailer_configuration_cannot_hide_a_landing(
             + b")\n"
             + b"\n".join(f"prose {index}".encode() for index in range(6))
             + b"\n",
-            "a" * 32,
             id="exactly-25-percent-trailers",
         ),
         pytest.param(
@@ -1162,33 +1664,26 @@ def test_trailer_configuration_cannot_hide_a_landing(
             + b")\n"
             + b"\n".join(f"prose {index}".encode() for index in range(7))
             + b"\n",
-            None,
-            id="below-25-percent-negative-control",
+            id="below-25-percent-union",
         ),
         pytest.param(
             b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n---\npatch text\n",
-            "a" * 32,
             id="divider-ends-message",
         ),
         pytest.param(
             b"Onetree-Operation: " + b"a" * 32 + b"\n",
-            None,
-            id="title-is-not-a-trailer-block",
+            id="title-marker-union",
         ),
         pytest.param(
             b"subject\n\nOnetree-Operation: " + b"a" * 32 + b"\n",
-            "a" * 32,
             id="all-trailers-control",
         ),
     ],
 )
-def test_fixed_trailer_block_boundary_matches_the_audit_contract(
+def test_line_union_does_not_inherit_git_trailer_block_boundaries(
     raw_message: bytes,
-    expected: str | None,
 ) -> None:
-    """The fixed parser accepts Git's stable shapes without reading repository config."""
-
-    assert Repository._landing_operation_from_message(raw_message, commit="a" * 40) == expected
+    assert git_module.landing_ids(raw_message) == frozenset({"a" * 32})
 
 
 def test_configured_log_encoding_cannot_reframe_audit_messages(
@@ -1206,9 +1701,9 @@ def test_configured_log_encoding_cannot_reframe_audit_messages(
     assert unpinned.startswith(b"\xff\xfe")
     assert unpinned.count(b"\x00") > 40
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[hidden] == operation
-    assert coordinator.repo.landing_operation(hidden) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == frozenset({operation})
+    assert coordinator.repo.landing_operations(hidden) == frozenset({operation})
 
 
 def test_a_nul_in_a_commit_message_cannot_hide_its_final_trailer(
@@ -1248,9 +1743,9 @@ def test_a_nul_in_a_commit_message_cannot_hide_its_final_trailer(
     assert b"Onetree-Operation" not in pretty
     assert b"\x00" in coordinator.repo.git("cat-file", "commit", nul_hidden).stdout
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[nul_hidden] == operation
-    assert coordinator.repo.landing_operation(nul_hidden) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[nul_hidden] == frozenset({operation})
+    assert coordinator.repo.landing_operations(nul_hidden) == frozenset({operation})
     report = coordinator.inspect_wal()
     assert [(item.kind, item.commit) for item in report.divergences] == [
         ("unrecorded_landing", nul_hidden)
@@ -1306,9 +1801,9 @@ def test_signature_display_configuration_cannot_precede_audit_records(
     assert marker.is_file()
     marker.unlink()
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[signed] == operation
-    assert coordinator.repo.landing_operation(signed) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[signed] == frozenset({operation})
+    assert coordinator.repo.landing_operations(signed) == frozenset({operation})
     assert not marker.exists()
 
 
@@ -1422,9 +1917,9 @@ def test_a_midx_cannot_substitute_landing_bytes(
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
     monkeypatch.setenv("GIT_TEST_MULTI_PACK_INDEX", "1")
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[hidden] == operation
-    assert coordinator.repo.landing_operation(hidden) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == frozenset({operation})
+    assert coordinator.repo.landing_operations(hidden) == frozenset({operation})
     report = coordinator.inspect_wal()
     assert [(item.kind, item.commit) for item in report.divergences] == [
         ("unrecorded_landing", hidden)
@@ -1451,7 +1946,7 @@ def test_an_ambient_object_directory_cannot_redirect_audit_reads(
     assert [(item.kind, item.commit) for item in report.divergences] == [
         ("unrecorded_landing", hidden)
     ]
-    assert coordinator.repo.landing_operation(hidden) == "a" * 32
+    assert coordinator.repo.landing_operations(hidden) == frozenset({"a" * 32})
 
 
 def test_an_ambient_alternate_cannot_make_an_incomplete_repository_look_complete(
@@ -1505,9 +2000,9 @@ def test_ambient_repository_directories_cannot_change_audit_reads(
         assert redirected.returncode != 0
         assert "bad object HEAD" in redirected.stderr
 
-    marked = {item.commit: item.operation for item in coordinator.repo.marked_commits("HEAD")}
-    assert marked[hidden] == operation
-    assert coordinator.repo.landing_operation(hidden) == operation
+    marked = {item.commit: item.operations for item in coordinator.repo.marked_commits("HEAD")}
+    assert marked[hidden] == frozenset({operation})
+    assert coordinator.repo.landing_operations(hidden) == frozenset({operation})
 
 
 @pytest.mark.parametrize(
@@ -1705,7 +2200,7 @@ def test_the_streamed_walk_cannot_deadlock_on_a_full_stderr_pipe(
         worker.join(timeout=5)
 
     assert completed_without_cleanup, "marked_commits deadlocked on a full stderr pipe"
-    assert result == [git_module.MarkedCommit(head, None)]
+    assert result == [git_module.MarkedCommit(head, frozenset())]
 
 
 def test_a_partially_consumed_walk_retains_no_git_process_descriptors(
@@ -3103,11 +3598,11 @@ def test_a_landing_on_another_local_branch_blocks_the_first_wal_append(
     )
 
 
-def test_an_ordinary_message_mention_is_not_a_landing_trailer(
+def test_an_ordinary_message_mention_has_an_adoption_escape(
     git_repo: GitFixture,
 ) -> None:
     git_repo.git("remote", "add", "origin", "unused://ordinary-remote")
-    git_repo.external_commit(
+    commit = git_repo.external_commit(
         "a.txt",
         "ordinary\n",
         "ordinary discussion\n\n"
@@ -3116,9 +3611,14 @@ def test_an_ordinary_message_mention_is_not_a_landing_trailer(
     )
     coordinator = Coordinator(git_repo.root)
 
+    report = coordinator.inspect_wal()
+    assert [(item.kind, item.commit) for item in report.divergences] == [
+        ("unrecorded_landing", commit)
+    ]
+    adoption = coordinator.adopt_landings()
+    assert [event.data["commit"] for event in adoption.adopted] == [commit]
+    assert adoption.report.consistent
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
-
-    assert coordinator.inspect_wal().consistent
 
 
 @pytest.mark.parametrize(("depth", "landing_visible"), [(3, False), (4, True)])

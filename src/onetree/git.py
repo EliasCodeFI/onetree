@@ -33,18 +33,98 @@ _GIT_COMMON_OPTIONS = (
 #: detection can tell a broker commit apart from a permitted hand commit.
 LANDING_TRAILER = "Onetree-Operation"
 _LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
-_TRAILER_LINE = re.compile(
-    rb"(?P<key>[A-Za-z0-9-]+)[ \t]*:[ \t]*(?P<value>.*)"
-)
-_GIT_GENERATED_TRAILER_PREFIXES = (
-    b"Signed-off-by: ",
-    b"(cherry picked from commit ",
-)
-_FIXED_COMMENT_PREFIX = b"#"
+_LANDING_TRAILER_WHITESPACE = b" \t"
+_MALFORMED_AUDIT_REF_WARNING = b"warning: ignoring ref with broken name "
+_BROKEN_AUDIT_REF_WARNING = b"warning: ignoring broken ref "
 _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
+
+
+def _landing_candidate_values(lines: Sequence[bytes], index: int) -> tuple[bytes, ...]:
+    """Values one column-zero marker can expose under pinned Git parsing settings."""
+
+    line = lines[index]
+    if line[:1] in (b" ", b"\t"):
+        return ()
+    token_length = len(_LANDING_TRAILER_BYTES)
+    token = line[:token_length]
+    if token.lower() != _LANDING_TRAILER_BYTES or len(line) <= token_length:
+        return ()
+
+    positions = [token_length]
+    separator = token_length
+    while (
+        separator < len(line)
+        and line[separator : separator + 1] in (b" ", b"\t")
+    ):
+        separator += 1
+    if separator < len(line) and separator != token_length:
+        positions.append(separator)
+
+    continuation_prefixes = [b""]
+    continuation = b""
+    following = index + 1
+    while following < len(lines) and lines[following][:1] in (b" ", b"\t"):
+        continuation += b" " + lines[following].strip(_LANDING_TRAILER_WHITESPACE)
+        continuation_prefixes.append(continuation)
+        following += 1
+
+    token_bytes = set(token)
+    values: list[bytes] = []
+    for position in positions:
+        if line[position] in token_bytes:
+            continue
+        for folded in continuation_prefixes:
+            value = (line[position + 1 :] + folded).strip(
+                _LANDING_TRAILER_WHITESPACE
+            )
+            if value:
+                values.append(value)
+    return tuple(values)
+
+
+def landing_ids(raw_message: bytes) -> frozenset[str]:
+    """Return every landing identity carried by raw commit-message bytes.
+
+    This is a union over the Git commit-object parser settings that can steer
+    literal ``Onetree-Operation`` lines. It deliberately reads the whole
+    message: patch-stream dividers, paragraph position, comments, scissors and
+    generated-trailer ratios do not gate landing identity. Invalid UTF-8 is
+    represented with surrogate escapes so parsing never turns a marker into an
+    operational error.
+    """
+
+    raw_lines = tuple(raw_message.split(b"\n"))
+    normalized_lines = tuple(
+        line[:-1] if line.endswith(b"\r") else line
+        for line in raw_lines
+    )
+    found: set[str] = set()
+    # Git trims a CR that terminates the final value line but preserves a CR
+    # made internal by unfolding a later continuation. Union that exact raw
+    # form with the normalized-CRLF form: the latter is the deliberate safe-side
+    # expansion measured by INV8.
+    for lines, raw_crlf in (
+        (normalized_lines, False),
+        (raw_lines, True),
+    ):
+        for index in range(len(lines)):
+            for candidate in _landing_candidate_values(lines, index):
+                raw_value = (
+                    candidate[:-1]
+                    if raw_crlf and candidate.endswith(b"\r")
+                    else candidate
+                )
+                if not raw_value:
+                    continue
+                try:
+                    value = raw_value.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    value = raw_value.decode("utf-8", errors="surrogateescape")
+                found.add(value)
+    return frozenset(found)
 
 
 @dataclass(frozen=True, order=True)
@@ -72,10 +152,10 @@ class TempIndex:
 
 @dataclass(frozen=True)
 class MarkedCommit:
-    """A commit on a target ref that carries the broker's landing trailer."""
+    """One walked commit and the landing identities its raw message carries."""
 
     commit: str
-    operation: str | None
+    operations: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -150,6 +230,9 @@ class Repository:
         environment["GIT_OPTIONAL_LOCKS"] = "0"
         environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         environment["GIT_GRAFT_FILE"] = os.devnull
+        # audit_heads classifies one Git 2.53 diagnostic by its exact plumbing
+        # wording. Pin every invocation so an ambient locale cannot reframe it.
+        environment["LC_ALL"] = "C"
         if index is not None:
             environment["GIT_INDEX_FILE"] = str(index)
         return environment
@@ -436,35 +519,193 @@ class Repository:
         self._valid_branch_refs.add(reference)
         return reference
 
+    def _stored_file_branch_refs(self) -> frozenset[str]:
+        """Return valid branch names present in the files ref backend.
+
+        Git's ref-filter can omit a dangling symbolic ref without a diagnostic,
+        so stderr cannot prove that the listing is complete. This inventory
+        reads names only; Git still resolves and validates every emitted value.
+        Invalid loose filenames are deliberately excluded by check-ref-format.
+        """
+
+        if self.ref_format != "files":
+            return frozenset()
+
+        candidates: set[str] = set()
+        loose_root = self.git_path("refs/heads")
+        try:
+            root_status = loose_root.lstat()
+        except FileNotFoundError:
+            root_status = None
+        except OSError as error:
+            raise GitError(
+                f"cannot inspect loose branch refs: {error.strerror or error}",
+                operation="audit-ref-storage",
+            ) from error
+        if root_status is not None:
+            if not stat.S_ISDIR(root_status.st_mode):
+                raise GitError(
+                    "cannot inspect loose branch refs: refs/heads is not a directory",
+                    operation="audit-ref-storage",
+                )
+            walk_errors: list[OSError] = []
+            for directory, directories, filenames in os.walk(
+                loose_root,
+                topdown=True,
+                onerror=walk_errors.append,
+                followlinks=False,
+            ):
+                directory_path = Path(directory)
+                leaves = list(filenames)
+                for name in tuple(directories):
+                    child = directory_path / name
+                    try:
+                        child_status = child.lstat()
+                    except OSError as error:
+                        raise GitError(
+                            f"cannot inspect loose branch refs: {error.strerror or error}",
+                            operation="audit-ref-storage",
+                        ) from error
+                    if stat.S_ISLNK(child_status.st_mode):
+                        directories.remove(name)
+                        leaves.append(name)
+                for name in leaves:
+                    relative = (directory_path / name).relative_to(loose_root)
+                    candidates.add(f"refs/heads/{relative.as_posix()}")
+            if walk_errors:
+                walk_error = walk_errors[0]
+                raise GitError(
+                    "cannot inspect loose branch refs: "
+                    f"{walk_error.strerror or walk_error}",
+                    operation="audit-ref-storage",
+                )
+
+        packed = self.git_path("packed-refs")
+        try:
+            packed_content = packed.read_bytes()
+        except FileNotFoundError:
+            packed_content = b""
+        except OSError as error:
+            raise GitError(
+                f"cannot inspect packed branch refs: {error.strerror or error}",
+                operation="audit-ref-storage",
+            ) from error
+        for raw_reference in self._packed_refs_names(packed_content):
+            if raw_reference.startswith(b"refs/heads/"):
+                candidates.add(os.fsdecode(raw_reference))
+
+        valid: set[str] = set()
+        for reference in candidates:
+            check_name = self.git("check-ref-format", reference, check=False)
+            if check_name.returncode == 0:
+                valid.add(reference)
+            elif check_name.returncode != 1:
+                raise GitError(
+                    "cannot validate a stored branch name",
+                    operation="check-ref-format",
+                    returncode=check_name.returncode,
+                )
+        return frozenset(valid)
+
     def audit_heads(self) -> dict[str, str]:
         """Resolve every local branch plus HEAD in one parseable ref listing."""
 
-        result = self.git("show-ref", "--head", "--branches", check=False)
-        if result.returncode not in {0, 1} or (result.returncode == 1 and result.stdout):
+        stored_before = self._stored_file_branch_refs()
+        result = self.git(
+            "for-each-ref",
+            "--include-root-refs",
+            "--sort=refname",
+            "--format=%(objectname)%00%(refname)",
+            "--",
+            "HEAD",
+            "refs/heads",
+            check=False,
+        )
+        stored_after = self._stored_file_branch_refs()
+        if result.returncode != 0:
             detail = result.stderr.decode("utf-8", errors="replace").strip()
             raise GitError(
                 f"cannot list audit refs: {detail or 'unknown error'}",
-                operation="show-ref",
+                operation="for-each-ref",
                 returncode=result.returncode,
             )
+        if result.stderr:
+            # Git's ref-filter deliberately skips malformed *names* at rc 0,
+            # which prevents one loose bad..name file from denying service.
+            # The same command also skips validly named refs whose contents are
+            # broken. Those stay fail-closed: accepting every warning would
+            # silently remove a real branch from the audit scope. A malformed
+            # name can itself contain newlines (and warning-shaped text), so
+            # only Git's first diagnostic prefix frames the byte stream. Any
+            # warning-shaped continuation that names a valid local branch is
+            # checked against the ref store before it can be tolerated.
+            if not result.stderr.endswith(b"\n"):
+                raise GitError(
+                    "cannot list audit refs: incomplete for-each-ref diagnostic",
+                    operation="for-each-ref",
+                    returncode=result.returncode,
+                )
+            saw_malformed_name = False
+            for raw_warning in result.stderr.split(b"\n"):
+                if not raw_warning:
+                    continue
+                if raw_warning.startswith(_MALFORMED_AUDIT_REF_WARNING):
+                    saw_malformed_name = True
+                    continue
+                if raw_warning.startswith(_BROKEN_AUDIT_REF_WARNING):
+                    raw_reference = raw_warning[len(_BROKEN_AUDIT_REF_WARNING) :]
+                    try:
+                        broken_reference = raw_reference.decode(
+                            "utf-8", errors="strict"
+                        )
+                    except UnicodeDecodeError as error:
+                        if self.ref_format != "files":
+                            raise GitError(
+                                "cannot list audit refs: broken-ref diagnostic is not UTF-8",
+                                operation="for-each-ref",
+                                returncode=result.returncode,
+                            ) from error
+                        broken_reference = os.fsdecode(raw_reference)
+                    if (
+                        self.ref_format != "files"
+                        and broken_reference.startswith("refs/heads/")
+                    ):
+                        raise GitError(
+                            "cannot list audit refs: Git ignored a broken branch",
+                            operation="for-each-ref",
+                            returncode=result.returncode,
+                            reference=broken_reference,
+                        )
+                    # Broken refs outside refs/heads are outside INV1's audit
+                    # scope. Files-backend branches are reconciled against the
+                    # stable storage-name snapshots below, which also covers a
+                    # non-UTF-8 diagnostic and warningless dangling symrefs.
+                    continue
+                if not saw_malformed_name:
+                    detail = result.stderr.decode("utf-8", errors="replace").strip()
+                    raise GitError(
+                        f"cannot list audit refs: {detail or 'unexpected diagnostic'}",
+                        operation="for-each-ref",
+                        returncode=result.returncode,
+                    )
         heads: dict[str, str] = {}
         for raw_line in result.stdout.splitlines():
-            raw_oid, separator, raw_reference = raw_line.partition(b" ")
+            raw_oid, separator, raw_reference = raw_line.partition(b"\x00")
             if not separator or not raw_oid or not raw_reference:
-                raise GitError("malformed audit ref listing", operation="show-ref")
+                raise GitError("malformed audit ref listing", operation="for-each-ref")
             try:
                 reference = raw_reference.decode("utf-8", errors="strict")
                 oid = raw_oid.decode("ascii", errors="strict").lower()
             except UnicodeDecodeError as error:
                 raise GitError(
-                    "audit ref listing is not UTF-8/ASCII", operation="show-ref"
+                    "audit ref listing is not UTF-8/ASCII", operation="for-each-ref"
                 ) from error
             if reference != "HEAD":
                 self.validate_branch_ref(reference)
             if reference in heads:
                 raise GitError(
                     "audit ref listing repeats a reference",
-                    operation="show-ref",
+                    operation="for-each-ref",
                     reference=reference,
                 )
             commit = self.validate_oid(oid, label="audit ref")
@@ -477,6 +718,39 @@ class Repository:
                     object_type=object_type,
                 )
             heads[reference] = commit
+        omitted = sorted((stored_before & stored_after).difference(heads))
+        if omitted:
+            raise GitError(
+                "cannot list audit refs: Git omitted a stored local branch",
+                operation="for-each-ref",
+                returncode=result.returncode,
+                references=omitted,
+            )
+        if self.ref_format == "files" and "HEAD" not in heads:
+            symbolic = self.git("symbolic-ref", "--quiet", "HEAD", check=False)
+            if symbolic.returncode == 0:
+                try:
+                    target = symbolic.stdout.decode("utf-8", errors="strict").strip()
+                except UnicodeDecodeError as error:
+                    raise GitError(
+                        "HEAD symbolic ref is not UTF-8", operation="symbolic-ref"
+                    ) from error
+                self.validate_branch_ref(target)
+                if self.resolve_ref(target, missing_ok=True) is not None:
+                    raise GitError(
+                        "audit ref listing omitted a resolvable HEAD",
+                        operation="for-each-ref",
+                        reference="HEAD",
+                    )
+            else:
+                # A valid detached HEAD is emitted by --include-root-refs. If it
+                # was omitted, distinguish corruption before refusing the list.
+                self.require_commit("HEAD")
+                raise GitError(
+                    "audit ref listing omitted detached HEAD",
+                    operation="for-each-ref",
+                    reference="HEAD",
+                )
         return heads
 
     def default_branch_ref(self) -> str:
@@ -1010,8 +1284,7 @@ class Repository:
                         commit=commit,
                     )
                 raw_message = self._commit_message(raw_object, commit=commit)
-                operation = self._landing_operation_from_message(raw_message, commit=commit)
-                found.append(MarkedCommit(commit, operation))
+                found.append(MarkedCommit(commit, landing_ids(raw_message)))
             if output_file.read(1):
                 raise GitError("unexpected cat-file batch output", reference=reference)
         return found
@@ -1023,94 +1296,9 @@ class Repository:
             raise GitError("commit object has no header terminator", commit=commit)
         return raw_message
 
-    @staticmethod
-    def _landing_operation_from_message(raw_message: bytes, *, commit: str) -> str | None:
-        """Parse the fixed, Git-compatible trailer-block subset onetree owns.
-
-        Git also lets repository configuration add separators, comment bytes and
-        recognized trailer keys. Those inputs are deliberately excluded here:
-        the broker's identity cannot change with ``.git/config``. The stable
-        subset retains Git's all-trailer rule, its 25% generated-trailer rule,
-        its two built-in generated prefixes, ``#`` comments, and the ``---``
-        message divider.
-        """
-
-        lines = [
-            line[:-1] if line.endswith(b"\r") else line
-            for line in raw_message.split(b"\n")
-        ]
-        for index, line in enumerate(lines):
-            if line.startswith(b"---") and (
-                len(line) == 3 or (len(line) > 3 and line[3] in b" \t\v\f\r")
-            ):
-                lines = lines[:index]
-                break
-        while lines and not lines[-1].strip(b" \t"):
-            lines.pop()
-        if not lines:
-            return None
-
-        block_start: int | None = None
-        for index in range(len(lines) - 1, -1, -1):
-            if not lines[index].strip(b" \t"):
-                block_start = index + 1
-                break
-        if block_start is None:
-            return None
-
-        parsed: list[tuple[bytes, bytes]] = []
-        trailer_lines = 0
-        non_trailer_lines = 0
-        recognized_prefix = False
-        previous_kind: str | None = None
-        for line in lines[block_start:]:
-            if line.startswith(_FIXED_COMMENT_PREFIX):
-                previous_kind = None
-                continue
-            if line.startswith((b" ", b"\t")):
-                if previous_kind == "trailer" and parsed:
-                    key, value = parsed[-1]
-                    parsed[-1] = (key, value + b" " + line.strip(b" \t"))
-                elif previous_kind not in {"trailer", "generated"}:
-                    non_trailer_lines += 1
-                continue
-            if line.startswith(_GIT_GENERATED_TRAILER_PREFIXES):
-                trailer_lines += 1
-                recognized_prefix = True
-                previous_kind = "generated"
-                continue
-            match = _TRAILER_LINE.fullmatch(line)
-            if match is None:
-                non_trailer_lines += 1
-                previous_kind = "non_trailer"
-                continue
-            trailer_lines += 1
-            parsed.append((match.group("key"), match.group("value")))
-            previous_kind = "trailer"
-
-        all_trailers = trailer_lines > 0 and non_trailer_lines == 0
-        generated_quorum = (
-            recognized_prefix and trailer_lines * 3 >= non_trailer_lines
-        )
-        if not all_trailers and not generated_quorum:
-            return None
-
-        values = [
-            value.strip(b" \t")
-            for key, value in parsed
-            if key.lower() == _LANDING_TRAILER_BYTES
-        ]
-        if not values:
-            return None
-        try:
-            operation = b",".join(values).decode("utf-8", errors="strict").strip()
-        except UnicodeDecodeError as error:
-            raise GitError("landing trailer is not UTF-8", commit=commit) from error
-        return operation or None
-
-    def landing_operation(self, commit: str) -> str | None:
-        """Read the real landing trailer from exactly one commit."""
+    def landing_operations(self, commit: str) -> frozenset[str]:
+        """Read every landing identity from exactly one raw commit object."""
 
         raw_object = self.git("cat-file", "commit", commit).stdout
         raw_message = self._commit_message(raw_object, commit=commit)
-        return self._landing_operation_from_message(raw_message, commit=commit)
+        return landing_ids(raw_message)
