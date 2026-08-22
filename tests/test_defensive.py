@@ -109,7 +109,12 @@ def test_land_refuses_nothing_staged_wrong_target_and_diverged_target(
     assert diverged.value.details["reason"] == "target_diverged"
 
 
-def test_claim_expiry_at_transaction_fence_refuses(git_repo: GitFixture) -> None:
+def test_claim_expiry_at_transaction_fence_refuses(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_000_000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
     coordinator = Coordinator(git_repo.root)
     session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     coordinator.claim("alpha", [str(git_repo.root / "a.txt")], ttl=0.2)
@@ -118,7 +123,7 @@ def test_claim_expiry_at_transaction_fence_refuses(git_repo: GitFixture) -> None
 
     def expire(point: str, _context: Mapping[str, Any]) -> None:
         if point == "before_intent":
-            time.sleep(0.25)
+            clock[0] += 0.25
 
     with pytest.raises(LandingRefusedError) as refused:
         coordinator.land("alpha", checkpoint=expire)
