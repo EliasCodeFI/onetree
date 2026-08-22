@@ -49,6 +49,20 @@ enforces every invariant via WAL/ref CAS, so correctness never depends on a
 long-lived process. A daemon may later serialize queueing as a performance
 optimization only.
 
+Repository history is audited across every local branch plus HEAD. On the
+files ref backend, valid loose and packed branch names are reconciled around
+Git's listing. A loose symbolic ref or filesystem symlink whose terminal
+exact ref is absent is not a branch head and is excluded. A namespace
+directory or a dangling alias pathname is not exact terminal storage; a
+resolving alias is audited, and a same-name packed ref prevents exclusion.
+Resolving namespace symlinks are traversed under every exposed ref name with
+per-path inode ancestry; a cycle refuses, and a malformed descendant remains
+in storage reconciliation even when Git omits it. Stored malformed values
+remain fail-closed. Successful Git stderr is not treated as ref truth:
+warnings and traces unrelated to refs cannot deny every OneTree command. The
+storage reconciliation carries that decision for files refs; reftable retains
+its explicit broken-branch diagnostic guard.
+
 ## Invariants — each ships with a red-first fixture
 
 A fixture must be observed FAILING before its guard exists; a test that has
@@ -75,9 +89,22 @@ never failed is not evidence.
   candidates but never fewer. Every deliberate extra shape must have a tested
   `wal --adopt` escape that restores consistency and permits mutation. A marked
   commit is consistent when any candidate forms a recorded `(commit,
-  operation)` pair. The measured predicate and the deliberate exclusion of
-  key-alias configurations that rename unrelated markers are recorded in
-  `docs/ROUND-AF10.md`.
+  operation)` pair. Folded candidates are decoded directly from one reusable
+  byte buffer. The exact `landing_ids` interface emits them into its
+  output-sized set one at a time rather than retaining a second cumulative
+  byte collection. Repository audit does not materialize or decode that whole
+  set. It scans each marker-position prefix family once, indexes finite
+  recorded identities by round-trippable byte length, and decodes only a first
+  witness, candidates still needed to escape the pending set, and lengths that
+  can match a recorded identity. It stops on any recorded pair match; otherwise
+  it retains only the lexicographically smallest nonpending witness (falling
+  back to the overall minimum). Adopted-record verification uses the same
+  bounded exact-membership reduction. Raw parsing is skipped only when the
+  message contains no CR byte; horizontal trimming can otherwise expose a raw
+  terminal CR even when line splitting did not remove one. The measured
+  predicate and deliberate exclusion of key-alias configurations that rename
+  unrelated markers are recorded in `docs/ROUND-AF10.md`; the bounded large
+  folded-input fixture is recorded in `docs/ROUND-AF11.md`.
 
 ## Non-goals for Round A
 

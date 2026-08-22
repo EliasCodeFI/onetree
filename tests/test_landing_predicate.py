@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
 import subprocess
+import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from conftest import GitFixture
 
+import onetree.git as git_module
 from onetree.core import Coordinator
 from onetree.git import Repository, landing_ids
 
@@ -342,6 +347,222 @@ def test_generated_landing_shapes_match_the_independent_inv8_model() -> None:
     assert len(generated) == 1502 - len(_cases())
     for case in generated:
         assert landing_ids(case.message) == case.expected, case.name
+
+
+def test_landing_ids_preserve_every_folded_prefix() -> None:
+    operation = "a" * 32
+    raw_message = (
+        f"subject\n\nOnetree-Operation: {operation}\n"
+        "  first\n"
+        "\tsecond\n"
+        " third\n"
+    ).encode()
+
+    assert landing_ids(raw_message) == frozenset(
+        {
+            operation,
+            f"{operation} first",
+            f"{operation} first second",
+            f"{operation} first second third",
+        }
+    )
+
+
+def test_landing_ids_preserve_raw_semantics_when_trimming_exposes_a_cr() -> None:
+    operation = "a" * 32
+    raw_message = f"Onetree-Operation: {operation}\r ".encode()
+
+    assert landing_ids(raw_message) == frozenset({operation, f"{operation}\r"})
+    assert landing_ids(raw_message) == _predicate_model(raw_message)
+
+
+def test_audit_identity_reduction_preserves_any_match_and_witness_order() -> None:
+    raw_message = f"Onetree-Operation: {_B}\nOnetree-Operation: {_A}\n".encode()
+    exact = landing_ids(raw_message)
+    assert exact == frozenset({_A, _B})
+
+    assert git_module._audit_landing_ids(
+        raw_message,
+        recorded=set(),
+        pending=set(),
+    ) == frozenset({_A})
+    assert git_module._audit_landing_ids(
+        raw_message,
+        recorded=set(),
+        pending={_A},
+    ) == frozenset({_B})
+    assert git_module._audit_landing_ids(
+        raw_message,
+        recorded=set(),
+        pending=exact,
+    ) == frozenset({_A})
+    assert git_module._audit_landing_ids(
+        raw_message,
+        recorded={_B},
+        pending=set(),
+    ) == frozenset({_B})
+
+
+def test_audit_identity_reduction_matches_the_exact_contract_corpus() -> None:
+    for case in _all_cases():
+        expected = case.expected
+        witness = frozenset() if not expected else frozenset({min(expected)})
+        assert git_module._audit_landing_ids(
+            case.message,
+            recorded=set(),
+            pending=set(),
+        ) == witness, case.name
+        if not expected:
+            continue
+        for recorded in expected:
+            assert git_module._audit_landing_ids(
+                case.message,
+                recorded={recorded},
+                pending=set(),
+            ) == frozenset({recorded}), (case.name, case.message, expected)
+        recorded_witness = git_module._audit_landing_ids(
+            case.message,
+            recorded=expected,
+            pending=set(),
+        )
+        assert len(recorded_witness) == 1
+        assert recorded_witness <= expected
+        for pending in expected:
+            remaining = expected.difference({pending})
+            pending_witness = min(remaining) if remaining else pending
+            assert git_module._audit_landing_ids(
+                case.message,
+                recorded=set(),
+                pending={pending},
+            ) == frozenset({pending_witness}), case.name
+
+        longest = max(expected, key=len)
+        missing_recorded = f"not-recorded-{len(longest):08d}"
+        assert missing_recorded not in expected
+        assert git_module._audit_landing_ids(
+            case.message,
+            recorded={missing_recorded},
+            pending=set(),
+        ) == witness, case.name
+
+
+def test_audit_identity_reduction_does_not_consume_the_exact_prefix_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation = "a" * 32
+    raw_message = (
+        f"Onetree-Operation : {operation}\n".encode()
+        + b"  cont\r\n" * 1_000
+    )
+    original_values = git_module._landing_values
+    original_decode = git_module._decode_landing_slice
+    exact_prefix_characters = 0
+    decoded_characters = 0
+
+    def measured_values(message: bytes) -> Iterator[str]:
+        nonlocal exact_prefix_characters
+        for value in original_values(message):
+            exact_prefix_characters += len(value)
+            yield value
+
+    def measured_decode(candidate: bytearray, start: int, end: int) -> str:
+        nonlocal decoded_characters
+        decoded_characters += end - start
+        return original_decode(candidate, start, end)
+
+    monkeypatch.setattr(git_module, "_landing_values", measured_values)
+    monkeypatch.setattr(git_module, "_decode_landing_slice", measured_decode)
+
+    assert git_module._audit_landing_ids(
+        raw_message,
+        recorded=set(),
+        pending=set(),
+    ) == frozenset({f": {operation}"})
+    assert exact_prefix_characters == 0
+    assert decoded_characters <= len(raw_message) * 4
+
+
+def _bounded_cli(repository: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ.copy()
+    inherited_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{source_root}{os.pathsep}{inherited_path}" if inherited_path else str(source_root)
+    )
+    child = (
+        "import resource\n"
+        "import sys\n"
+        f"limit = {1536 * 1024 * 1024}\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (limit, limit))\n"
+        "from onetree.cli import main\n"
+        "raise SystemExit(main(sys.argv[1:]))\n"
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child,
+            *arguments,
+            "--repo",
+            str(repository),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize(
+    ("marker", "continuation"),
+    [
+        pytest.param(b"Onetree-Operation: ", b"  cont\n", id="direct-lf"),
+        pytest.param(b"Onetree-Operation: ", b"  cont\r\n", id="direct-crlf"),
+        pytest.param(b"Onetree-Operation : ", b"  cont\n", id="spaced-lf"),
+        pytest.param(b"Onetree-Operation : ", b"  cont\r\n", id="spaced-crlf"),
+    ],
+)
+def test_folded_prefix_audit_and_adoption_fit_the_bounded_process(
+    git_repo: GitFixture,
+    marker: bytes,
+    continuation: bytes,
+) -> None:
+    repository = Repository(git_repo.root)
+    tree = repository.git_text("show", "-s", "--format=%T", git_repo.base)
+    operation = "a" * 32
+    raw_message = b"subject\n\n" + marker + operation.encode() + b"\n"
+    raw_message += continuation * 16_000
+    assert len(raw_message) < 128 * 1024
+    commit = repository.git_text(
+        "commit-tree",
+        tree,
+        "-p",
+        git_repo.base,
+        input_bytes=raw_message,
+    )
+    assert repository.update_ref("refs/heads/main", commit, git_repo.base)
+
+    inspection = _bounded_cli(git_repo.root, "wal")
+    assert inspection.returncode == 1, inspection.stderr
+    assert inspection.stdout, inspection.stderr
+    inspected = json.loads(inspection.stdout)
+    assert inspected["wal"]["consistent"] is False
+    assert [item["commit"] for item in inspected["wal"]["divergences"]] == [commit]
+
+    adoption = _bounded_cli(git_repo.root, "wal", "--adopt")
+    assert adoption.returncode == 0, adoption.stderr
+    adopted = json.loads(adoption.stdout)
+    assert adopted["adoption"]["commits"] == [commit]
+    assert adopted["adoption"]["consistent"] is True
+    expected_operation = operation if marker == b"Onetree-Operation: " else f": {operation}"
+    events = Coordinator(git_repo.root).wal.read().events
+    assert [
+        event.data["operation"]
+        for event in events
+        if event.kind == "adopted" and event.data.get("commit") == commit
+    ] == [expected_operation]
 
 
 OracleConfig = tuple[tuple[str, str], ...]

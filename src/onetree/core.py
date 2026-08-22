@@ -426,7 +426,12 @@ class Coordinator:
             if head is None or head in walked_heads:
                 continue
             walked_heads.add(head)
-            for marked in self._audit_marked_commits(head, self._scan_floor(state, target)):
+            for marked in self._audit_marked_commits(
+                head,
+                self._scan_floor(state, target),
+                recorded,
+                state.pending,
+            ):
                 if not marked.operations or marked.commit in seen:
                     continue
                 seen.add(marked.commit)
@@ -436,15 +441,12 @@ class Coordinator:
                 ):
                     continue
                 # Divergence and adopted-event schemas are intentionally scalar.
-                # ANY consistency means one deterministic recorded witness is
-                # sufficient. Prefer an id not pending for another candidate so
-                # the operator's adoption escape does not collide with that
-                # independent intent.
-                ordered = sorted(marked.operations)
-                operation = next(
-                    (candidate for candidate in ordered if candidate not in state.pending),
-                    ordered[0],
-                )
+                # The repository has already reduced this unrecorded identity
+                # stream to the deterministic nonpending witness (or overall
+                # minimum) that the scalar schema can carry.
+                if len(marked.operations) != 1:
+                    raise AssertionError("audit identity reduction returned multiple witnesses")
+                operation = next(iter(marked.operations))
                 found.append(
                     Divergence(
                         "unrecorded_landing",
@@ -1522,14 +1524,14 @@ class Coordinator:
             actual_tree = self.repo.git_text("show", "-s", "--format=%T", commit)
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
-            if event.kind == "adopted" and event.data.get(
-                "operation"
-            ) not in self.repo.landing_operations(commit):
-                raise WalCorruptError(
-                    "adopted commit does not carry the recorded landing trailer",
-                    oid=event.oid,
-                    commit=commit,
-                )
+            if event.kind == "adopted":
+                operation = _string(event.data, "operation", event)
+                if not self.repo.commit_has_landing_operation(commit, operation):
+                    raise WalCorruptError(
+                        "adopted commit does not carry the recorded landing trailer",
+                        oid=event.oid,
+                        commit=commit,
+                    )
 
     def _divergences(
         self,
@@ -1608,10 +1610,17 @@ class Coordinator:
         self,
         head: str,
         excludes: Sequence[str],
+        recorded: set[tuple[str, str]],
+        pending: Mapping[str, EventRecord],
     ) -> Iterator[MarkedCommit]:
-        """Read one stable branch head in one complete streamed history walk."""
+        """Read one stable head while retaining only audit-relevant identities."""
 
-        yield from self.repo.marked_commits(head, excludes)
+        yield from self.repo.audit_marked_commits(
+            head,
+            excludes,
+            recorded=recorded,
+            pending=pending,
+        )
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
         """Git-visible history the branch-side audit may skip: none of it.

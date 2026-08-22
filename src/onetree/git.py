@@ -9,7 +9,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +34,6 @@ _GIT_COMMON_OPTIONS = (
 LANDING_TRAILER = "Onetree-Operation"
 _LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
 _LANDING_TRAILER_WHITESPACE = b" \t"
-_MALFORMED_AUDIT_REF_WARNING = b"warning: ignoring ref with broken name "
 _BROKEN_AUDIT_REF_WARNING = b"warning: ignoring broken ref "
 _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
@@ -42,10 +41,9 @@ _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
 
 
-def _landing_candidate_values(lines: Sequence[bytes], index: int) -> tuple[bytes, ...]:
-    """Values one column-zero marker can expose under pinned Git parsing settings."""
+def _landing_marker_positions(line: bytes) -> tuple[int, ...]:
+    """Separator positions one column-zero marker exposes to the parser."""
 
-    line = lines[index]
     if line[:1] in (b" ", b"\t"):
         return ()
     token_length = len(_LANDING_TRAILER_BYTES)
@@ -63,26 +61,96 @@ def _landing_candidate_values(lines: Sequence[bytes], index: int) -> tuple[bytes
     if separator < len(line) and separator != token_length:
         positions.append(separator)
 
-    continuation_prefixes = [b""]
-    continuation = b""
+    token_bytes = frozenset(token)
+    return tuple(position for position in positions if line[position] not in token_bytes)
+
+
+def _landing_candidate_slices(
+    lines: Sequence[bytes],
+    index: int,
+    position: int,
+    *,
+    raw_crlf: bool,
+) -> Iterator[tuple[bytearray, int, int]]:
+    """Byte-buffer slices one marker-position family exposes."""
+
+    line = lines[index]
+    horizontal = frozenset(_LANDING_TRAILER_WHITESPACE)
+    candidate = bytearray(line[position + 1 :])
+    start = 0
+    while start < len(candidate) and candidate[start] in horizontal:
+        start += 1
+    end = len(candidate)
+    while end > start and candidate[end - 1] in horizontal:
+        end -= 1
     following = index + 1
-    while following < len(lines) and lines[following][:1] in (b" ", b"\t"):
-        continuation += b" " + lines[following].strip(_LANDING_TRAILER_WHITESPACE)
-        continuation_prefixes.append(continuation)
+    while True:
+        value_end = end
+        if raw_crlf and value_end > start and candidate[value_end - 1] == 0x0D:
+            value_end -= 1
+        if value_end > start:
+            yield candidate, start, value_end
+        if following >= len(lines) or lines[following][:1] not in (b" ", b"\t"):
+            break
+        continuation = lines[following].strip(_LANDING_TRAILER_WHITESPACE)
+        candidate.extend(b" ")
+        candidate.extend(continuation)
+        if continuation:
+            end = len(candidate)
+            while start < end and candidate[start] in horizontal:
+                start += 1
         following += 1
 
-    token_bytes = set(token)
-    values: list[bytes] = []
-    for position in positions:
-        if line[position] in token_bytes:
-            continue
-        for folded in continuation_prefixes:
-            value = (line[position + 1 :] + folded).strip(
-                _LANDING_TRAILER_WHITESPACE
-            )
-            if value:
-                values.append(value)
-    return tuple(values)
+
+def _decode_landing_slice(candidate: bytearray, start: int, end: int) -> str:
+    """Decode one candidate slice with the exact non-UTF-8 identity policy."""
+
+    view = memoryview(candidate)[start:end]
+    try:
+        try:
+            return str(view, "utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return str(view, "utf-8", errors="surrogateescape")
+    finally:
+        view.release()
+
+
+def _landing_candidate_values(
+    lines: Sequence[bytes],
+    index: int,
+    *,
+    raw_crlf: bool,
+) -> Iterator[str]:
+    """Values one column-zero marker can expose under pinned parsing settings."""
+
+    for position in _landing_marker_positions(lines[index]):
+        for candidate, start, end in _landing_candidate_slices(
+            lines, index, position, raw_crlf=raw_crlf
+        ):
+            yield _decode_landing_slice(candidate, start, end)
+
+
+def _landing_line_views(
+    raw_message: bytes,
+) -> tuple[tuple[Sequence[bytes], bool], ...]:
+    """Normalized and raw line views required by the exact identity union."""
+
+    raw_lines = tuple(raw_message.split(b"\n"))
+    if b"\r" in raw_message:
+        normalized_lines = tuple(
+            line[:-1] if line.endswith(b"\r") else line
+            for line in raw_lines
+        )
+        return ((normalized_lines, False), (raw_lines, True))
+    return ((raw_lines, False),)
+
+
+def _landing_values(raw_message: bytes) -> Iterator[str]:
+    """Yield the exact landing-identity union without retaining its prefixes."""
+
+    for lines, raw_crlf in _landing_line_views(raw_message):
+        for index in range(len(lines)):
+            yield from _landing_candidate_values(lines, index, raw_crlf=raw_crlf)
 
 
 def landing_ids(raw_message: bytes) -> frozenset[str]:
@@ -96,35 +164,116 @@ def landing_ids(raw_message: bytes) -> frozenset[str]:
     operational error.
     """
 
-    raw_lines = tuple(raw_message.split(b"\n"))
-    normalized_lines = tuple(
-        line[:-1] if line.endswith(b"\r") else line
-        for line in raw_lines
+    return frozenset(_landing_values(raw_message))
+
+
+@dataclass(frozen=True)
+class _LandingQueries:
+    """Finite identity queries indexed by their round-trippable byte lengths."""
+
+    values: frozenset[str]
+    byte_lengths: frozenset[int]
+    max_byte_length: int
+
+
+_EMPTY_LANDING_QUERIES = _LandingQueries(frozenset(), frozenset(), -1)
+
+
+def _landing_queries(values: Collection[str]) -> _LandingQueries:
+    unique = frozenset(values)
+    lengths: set[int] = set()
+    for value in unique:
+        try:
+            encoded = value.encode("utf-8", errors="surrogateescape")
+        except UnicodeEncodeError:
+            continue
+        lengths.add(len(encoded))
+    byte_lengths = frozenset(lengths)
+    return _LandingQueries(
+        unique,
+        byte_lengths,
+        max(byte_lengths, default=-1),
     )
-    found: set[str] = set()
-    # Git trims a CR that terminates the final value line but preserves a CR
-    # made internal by unfolding a later continuation. Union that exact raw
-    # form with the normalized-CRLF form: the latter is the deliberate safe-side
-    # expansion measured by INV8.
-    for lines, raw_crlf in (
-        (normalized_lines, False),
-        (raw_lines, True),
-    ):
+
+
+def _reduce_landing_ids(
+    raw_message: bytes,
+    *,
+    recorded: _LandingQueries,
+    pending: _LandingQueries,
+) -> frozenset[str]:
+    """Reduce identities without decoding every cumulative folded prefix."""
+
+    smallest: str | None = None
+    smallest_not_pending: str | None = None
+    for lines, raw_crlf in _landing_line_views(raw_message):
         for index in range(len(lines)):
-            for candidate in _landing_candidate_values(lines, index):
-                raw_value = (
-                    candidate[:-1]
-                    if raw_crlf and candidate.endswith(b"\r")
-                    else candidate
-                )
-                if not raw_value:
-                    continue
-                try:
-                    value = raw_value.decode("utf-8", errors="strict")
-                except UnicodeDecodeError:
-                    value = raw_value.decode("utf-8", errors="surrogateescape")
-                found.add(value)
-    return frozenset(found)
+            for position in _landing_marker_positions(lines[index]):
+                previous: tuple[int, int] | None = None
+                family_smallest: str | None = None
+                family_not_pending: str | None = None
+                for candidate, start, end in _landing_candidate_slices(
+                    lines, index, position, raw_crlf=raw_crlf
+                ):
+                    state = (start, end)
+                    if state == previous:
+                        continue
+                    previous = state
+                    length = end - start
+                    operation: str | None = None
+                    if (
+                        family_smallest is None
+                        or family_not_pending is None
+                        or length in recorded.byte_lengths
+                    ):
+                        operation = _decode_landing_slice(candidate, start, end)
+                    if length in recorded.byte_lengths:
+                        if operation is None:  # pragma: no cover - condition decodes
+                            raise AssertionError(
+                                "recorded-length candidate was not decoded"
+                            )
+                        if operation in recorded.values:
+                            return frozenset({operation})
+                    if family_smallest is None:
+                        if operation is None:  # pragma: no cover - first candidate decodes
+                            raise AssertionError("first candidate was not decoded")
+                        family_smallest = operation
+                    if family_not_pending is None:
+                        if operation is None:  # pragma: no cover - pending candidate decodes
+                            raise AssertionError("pending candidate was not decoded")
+                        if operation not in pending.values:
+                            family_not_pending = operation
+                    if (
+                        family_not_pending is not None
+                        and length >= recorded.max_byte_length
+                    ):
+                        break
+                if family_smallest is not None and (
+                    smallest is None or family_smallest < smallest
+                ):
+                    smallest = family_smallest
+                if family_not_pending is not None and (
+                    smallest_not_pending is None
+                    or family_not_pending < smallest_not_pending
+                ):
+                    smallest_not_pending = family_not_pending
+    witness = smallest_not_pending if smallest_not_pending is not None else smallest
+    return frozenset() if witness is None else frozenset({witness})
+
+
+def _audit_landing_ids(
+    raw_message: bytes,
+    *,
+    recorded: Collection[str],
+    pending: Collection[str],
+) -> frozenset[str]:
+    """Reduce an exact identity stream to the one witness repository audit needs."""
+
+    return _reduce_landing_ids(
+        raw_message,
+        recorded=_landing_queries(recorded),
+        pending=_landing_queries(pending),
+    )
 
 
 @dataclass(frozen=True, order=True)
@@ -519,6 +668,73 @@ class Repository:
         self._valid_branch_refs.add(reference)
         return reference
 
+    def _loose_ref_path_is_exact_storage(self, path: Path, reference: str) -> bool:
+        """Whether a loose pathname stores an exact ref rather than a namespace."""
+
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise GitError(
+                f"cannot inspect loose branch ref: {error.strerror or error}",
+                operation="audit-ref-storage",
+                reference=reference,
+            ) from error
+        if stat.S_ISDIR(status.st_mode):
+            return False
+        if not stat.S_ISLNK(status.st_mode):
+            return True
+        try:
+            target_status = path.stat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise GitError(
+                f"cannot inspect loose branch symlink: {error.strerror or error}",
+                operation="audit-ref-storage",
+                reference=reference,
+            ) from error
+        return not stat.S_ISDIR(target_status.st_mode)
+
+    def _file_ref_is_exactly_stored(
+        self,
+        reference: str,
+        packed_names: Collection[bytes],
+    ) -> bool:
+        """Whether the files backend stores this exact name in loose or packed form."""
+
+        return self._loose_ref_path_is_exact_storage(
+            self.git_path(reference), reference
+        ) or os.fsencode(reference) in packed_names
+
+    def _loose_branch_alias_is_dangling(
+        self,
+        path: Path,
+        reference: str,
+        packed_names: Collection[bytes],
+    ) -> bool:
+        """Return whether a loose branch alias has no stored terminal target."""
+
+        if os.fsencode(reference) in packed_names:
+            # A broken loose alias must not hide an exact packed branch with the
+            # same name. Git decides whether that conflicting storage resolves.
+            return False
+        if not self._loose_ref_path_is_exact_storage(path, reference):
+            return True
+
+        symbolic = self.git("symbolic-ref", "--quiet", reference, check=False)
+        if symbolic.returncode != 0:
+            return False
+        raw_target = symbolic.stdout.removesuffix(b"\n")
+        if not raw_target or b"\n" in raw_target:
+            return False
+        target = os.fsdecode(raw_target)
+        target_probe = self._rev_parse(target)
+        if target_probe.returncode != 1:
+            return False
+        return not self._file_ref_is_exactly_stored(target, packed_names)
+
     def _stored_file_branch_refs(self) -> frozenset[str]:
         """Return valid branch names present in the files ref backend.
 
@@ -531,7 +747,7 @@ class Repository:
         if self.ref_format != "files":
             return frozenset()
 
-        candidates: set[str] = set()
+        loose_candidates: dict[str, Path] = {}
         loose_root = self.git_path("refs/heads")
         try:
             root_status = loose_root.lstat()
@@ -549,13 +765,22 @@ class Repository:
                     operation="audit-ref-storage",
                 )
             walk_errors: list[OSError] = []
+            directory_ancestry: dict[Path, frozenset[tuple[int, int]]] = {
+                loose_root: frozenset({(root_status.st_dev, root_status.st_ino)})
+            }
             for directory, directories, filenames in os.walk(
                 loose_root,
                 topdown=True,
                 onerror=walk_errors.append,
-                followlinks=False,
+                followlinks=True,
             ):
                 directory_path = Path(directory)
+                ancestors = directory_ancestry.get(directory_path)
+                if ancestors is None:
+                    raise GitError(
+                        "cannot inspect loose branch refs: unbound namespace traversal",
+                        operation="audit-ref-storage",
+                    )
                 leaves = list(filenames)
                 for name in tuple(directories):
                     child = directory_path / name
@@ -567,11 +792,35 @@ class Repository:
                             operation="audit-ref-storage",
                         ) from error
                     if stat.S_ISLNK(child_status.st_mode):
+                        try:
+                            child_status = child.stat()
+                        except FileNotFoundError:
+                            directories.remove(name)
+                            leaves.append(name)
+                            continue
+                        except OSError as error:
+                            raise GitError(
+                                "cannot inspect loose branch namespace symlink: "
+                                f"{error.strerror or error}",
+                                operation="audit-ref-storage",
+                            ) from error
+                    if not stat.S_ISDIR(child_status.st_mode):
                         directories.remove(name)
                         leaves.append(name)
+                        continue
+                    identity = (child_status.st_dev, child_status.st_ino)
+                    if identity in ancestors:
+                        relative = child.relative_to(loose_root)
+                        raise GitError(
+                            "cannot inspect loose branch refs: namespace symlink cycle",
+                            operation="audit-ref-storage",
+                            reference=f"refs/heads/{relative.as_posix()}",
+                        )
+                    directory_ancestry[child] = ancestors.union({identity})
                 for name in leaves:
-                    relative = (directory_path / name).relative_to(loose_root)
-                    candidates.add(f"refs/heads/{relative.as_posix()}")
+                    path = directory_path / name
+                    relative = path.relative_to(loose_root)
+                    loose_candidates[f"refs/heads/{relative.as_posix()}"] = path
             if walk_errors:
                 walk_error = walk_errors[0]
                 raise GitError(
@@ -590,14 +839,25 @@ class Repository:
                 f"cannot inspect packed branch refs: {error.strerror or error}",
                 operation="audit-ref-storage",
             ) from error
-        for raw_reference in self._packed_refs_names(packed_content):
-            if raw_reference.startswith(b"refs/heads/"):
-                candidates.add(os.fsdecode(raw_reference))
+        packed_names = self._packed_refs_names(packed_content)
+        packed_candidates = {
+            os.fsdecode(raw_reference)
+            for raw_reference in packed_names
+            if raw_reference.startswith(b"refs/heads/")
+        }
 
         valid: set[str] = set()
-        for reference in candidates:
+        for reference in set(loose_candidates).union(packed_candidates):
             check_name = self.git("check-ref-format", reference, check=False)
             if check_name.returncode == 0:
+                loose = loose_candidates.get(reference)
+                if (
+                    loose is not None
+                    and self._loose_branch_alias_is_dangling(
+                        loose, reference, packed_names
+                    )
+                ):
+                    continue
                 valid.add(reference)
             elif check_name.returncode != 1:
                 raise GitError(
@@ -629,64 +889,30 @@ class Repository:
                 operation="for-each-ref",
                 returncode=result.returncode,
             )
-        if result.stderr:
-            # Git's ref-filter deliberately skips malformed *names* at rc 0,
-            # which prevents one loose bad..name file from denying service.
-            # The same command also skips validly named refs whose contents are
-            # broken. Those stay fail-closed: accepting every warning would
-            # silently remove a real branch from the audit scope. A malformed
-            # name can itself contain newlines (and warning-shaped text), so
-            # only Git's first diagnostic prefix frames the byte stream. Any
-            # warning-shaped continuation that names a valid local branch is
-            # checked against the ref store before it can be tolerated.
-            if not result.stderr.endswith(b"\n"):
-                raise GitError(
-                    "cannot list audit refs: incomplete for-each-ref diagnostic",
-                    operation="for-each-ref",
-                    returncode=result.returncode,
-                )
-            saw_malformed_name = False
+        if result.stderr and self.ref_format != "files":
+            # Successful Git commands may write unrelated warnings or traces.
+            # The files backend gets its completeness decision from the stable
+            # storage-name snapshots, not from diagnostic prose. Reftable has no
+            # equivalent inventory, so retain only Git's explicit broken-branch
+            # diagnostic as a fail-closed signal there.
             for raw_warning in result.stderr.split(b"\n"):
-                if not raw_warning:
+                if not raw_warning.startswith(_BROKEN_AUDIT_REF_WARNING):
                     continue
-                if raw_warning.startswith(_MALFORMED_AUDIT_REF_WARNING):
-                    saw_malformed_name = True
-                    continue
-                if raw_warning.startswith(_BROKEN_AUDIT_REF_WARNING):
-                    raw_reference = raw_warning[len(_BROKEN_AUDIT_REF_WARNING) :]
-                    try:
-                        broken_reference = raw_reference.decode(
-                            "utf-8", errors="strict"
-                        )
-                    except UnicodeDecodeError as error:
-                        if self.ref_format != "files":
-                            raise GitError(
-                                "cannot list audit refs: broken-ref diagnostic is not UTF-8",
-                                operation="for-each-ref",
-                                returncode=result.returncode,
-                            ) from error
-                        broken_reference = os.fsdecode(raw_reference)
-                    if (
-                        self.ref_format != "files"
-                        and broken_reference.startswith("refs/heads/")
-                    ):
-                        raise GitError(
-                            "cannot list audit refs: Git ignored a broken branch",
-                            operation="for-each-ref",
-                            returncode=result.returncode,
-                            reference=broken_reference,
-                        )
-                    # Broken refs outside refs/heads are outside INV1's audit
-                    # scope. Files-backend branches are reconciled against the
-                    # stable storage-name snapshots below, which also covers a
-                    # non-UTF-8 diagnostic and warningless dangling symrefs.
-                    continue
-                if not saw_malformed_name:
-                    detail = result.stderr.decode("utf-8", errors="replace").strip()
+                raw_reference = raw_warning[len(_BROKEN_AUDIT_REF_WARNING) :]
+                try:
+                    broken_reference = raw_reference.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as error:
                     raise GitError(
-                        f"cannot list audit refs: {detail or 'unexpected diagnostic'}",
+                        "cannot list audit refs: broken-ref diagnostic is not UTF-8",
                         operation="for-each-ref",
                         returncode=result.returncode,
+                    ) from error
+                if broken_reference.startswith("refs/heads/"):
+                    raise GitError(
+                        "cannot list audit refs: Git ignored a broken branch",
+                        operation="for-each-ref",
+                        returncode=result.returncode,
+                        reference=broken_reference,
                     )
         heads: dict[str, str] = {}
         for raw_line in result.stdout.splitlines():
@@ -1109,13 +1335,43 @@ class Repository:
         target: str,
         excludes: Sequence[str] = (),
     ) -> Iterator[MarkedCommit]:
-        """Return every marked commit found by one linear Git walk.
+        """Return every walked commit with its exact landing-identity set."""
+
+        commits = self._walked_commit_oids(target, excludes)
+        return iter(self._marked_commits_from_oids(commits, reference=target))
+
+    def audit_marked_commits(
+        self,
+        target: str,
+        excludes: Sequence[str],
+        *,
+        recorded: Collection[tuple[str, str]],
+        pending: Collection[str],
+    ) -> Iterator[MarkedCommit]:
+        """Return compact identity witnesses sufficient for repository audit."""
+
+        commits = self._walked_commit_oids(target, excludes)
+        return iter(
+            self._marked_commits_from_oids(
+                commits,
+                reference=target,
+                recorded=recorded,
+                pending=pending,
+            )
+        )
+
+    def _walked_commit_oids(
+        self,
+        target: str,
+        excludes: Sequence[str],
+    ) -> list[str]:
+        """Read one complete linear Git walk before exposing any object IDs.
 
         The former ``--skip`` pagination restarted ``git log`` from ``target``
         for every page, making an otherwise linear audit quadratic in branch
-        depth. The parser reads bounded chunks, but retains the marked results
-        until Git exits so a caller can neither observe a partial failed walk
-        nor retain the child process descriptors by abandoning an iterator.
+        depth. This retains the object IDs until Git exits so a caller can
+        neither observe a partial failed walk nor retain the child process
+        descriptors by abandoning an iterator.
         """
 
         arguments = (
@@ -1193,7 +1449,7 @@ class Repository:
                 )
             if malformed_stream:
                 raise GitError("malformed commit listing stream", reference=target)
-        return iter(self._marked_commits_from_oids(found, reference=target))
+        return found
 
     def _parse_walked_commit(
         self,
@@ -1215,11 +1471,24 @@ class Repository:
         commits: Sequence[str],
         *,
         reference: str,
+        recorded: Collection[tuple[str, str]] | None = None,
+        pending: Collection[str] = (),
     ) -> list[MarkedCommit]:
         """Read raw commits through Git's size-framed batch protocol."""
 
         if not commits:
             return []
+        recorded_queries: dict[str, _LandingQueries] | None = None
+        pending_queries = _EMPTY_LANDING_QUERIES
+        if recorded is not None:
+            recorded_values: dict[str, set[str]] = {}
+            for recorded_commit, operation in recorded:
+                recorded_values.setdefault(recorded_commit, set()).add(operation)
+            recorded_queries = {
+                recorded_commit: _landing_queries(operations)
+                for recorded_commit, operations in recorded_values.items()
+            }
+            pending_queries = _landing_queries(pending)
         requests = b"".join(commit.encode("ascii") + b"\n" for commit in commits)
         with tempfile.TemporaryFile() as output_file, tempfile.TemporaryFile() as stderr_file:
             try:
@@ -1282,9 +1551,20 @@ class Repository:
                         "truncated cat-file batch object",
                         reference=reference,
                         commit=commit,
-                    )
+                )
                 raw_message = self._commit_message(raw_object, commit=commit)
-                found.append(MarkedCommit(commit, landing_ids(raw_message)))
+                operations = (
+                    landing_ids(raw_message)
+                    if recorded_queries is None
+                    else _reduce_landing_ids(
+                        raw_message,
+                        recorded=recorded_queries.get(
+                            commit, _EMPTY_LANDING_QUERIES
+                        ),
+                        pending=pending_queries,
+                    )
+                )
+                found.append(MarkedCommit(commit, operations))
             if output_file.read(1):
                 raise GitError("unexpected cat-file batch output", reference=reference)
         return found
@@ -1302,3 +1582,14 @@ class Repository:
         raw_object = self.git("cat-file", "commit", commit).stdout
         raw_message = self._commit_message(raw_object, commit=commit)
         return landing_ids(raw_message)
+
+    def commit_has_landing_operation(self, commit: str, operation: str) -> bool:
+        """Test exact identity membership without retaining unrelated prefixes."""
+
+        raw_object = self.git("cat-file", "commit", commit).stdout
+        raw_message = self._commit_message(raw_object, commit=commit)
+        return _reduce_landing_ids(
+            raw_message,
+            recorded=_landing_queries({operation}),
+            pending=_EMPTY_LANDING_QUERIES,
+        ) == frozenset({operation})

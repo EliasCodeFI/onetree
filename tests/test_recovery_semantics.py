@@ -1126,15 +1126,233 @@ def test_a_malformed_name_cannot_mask_a_non_utf8_broken_branch(
         coordinator.inspect_wal()
 
 
-def test_a_dangling_symbolic_branch_cannot_disappear_from_the_audit(
+def test_a_dangling_symbolic_branch_is_not_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    git_repo.git("symbolic-ref", "refs/heads/current", "refs/heads/missing")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+    assert coordinator.register_session("after-symref", pid=os.getpid(), ttl=300).actor == (
+        "after-symref"
+    )
+
+
+def test_a_dangling_symbolic_branch_targeting_a_namespace_is_not_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    git_repo.git("branch", "group/child", git_repo.base)
+    git_repo.git("symbolic-ref", "refs/heads/current", "refs/heads/group")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/group/child": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+    assert coordinator.register_session("after-namespace", pid=os.getpid(), ttl=300).actor == (
+        "after-namespace"
+    )
+
+
+def test_a_dangling_symbolic_branch_ending_at_a_dangling_symlink_is_not_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    ghost = coordinator.repo.git_dir / "refs" / "heads" / "ghost"
+    ghost.symlink_to("nowhere")
+    git_repo.git("symbolic-ref", "refs/heads/current", "refs/heads/ghost")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+    assert coordinator.register_session("after-alias-chain", pid=os.getpid(), ttl=300).actor == (
+        "after-alias-chain"
+    )
+
+
+def test_a_filesystem_namespace_symlink_exposes_its_resolving_child_as_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    git_repo.git("branch", "group/child", git_repo.base)
+    alias = coordinator.repo.git_dir / "refs" / "heads" / "alias"
+    alias.symlink_to("group")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/alias/child": git_repo.base,
+        "refs/heads/group/child": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_corrupt_child_below_a_filesystem_namespace_symlink_refuses_the_audit(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    external = tmp_path / "external-refs"
+    external.mkdir()
+    child = external / "child"
+    child.write_text(git_repo.base + "\n", encoding="ascii")
+    alias = coordinator.repo.git_dir / "refs" / "heads" / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+
+    assert coordinator.repo.audit_heads()["refs/heads/alias/child"] == git_repo.base
+
+    child.write_text("not-an-object-id\n", encoding="ascii")
+    listing = git_repo.git("for-each-ref", "refs/heads", check=False)
+    assert listing.returncode == 0
+    assert "warning: ignoring broken ref refs/heads/alias/child" in listing.stderr
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.repo.audit_heads()
+
+
+def test_a_filesystem_ref_namespace_symlink_cycle_refuses_the_audit(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    external = tmp_path / "cyclic-refs"
+    external.mkdir()
+    (external / "loop").symlink_to(external, target_is_directory=True)
+    alias = coordinator.repo.git_dir / "refs" / "heads" / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(GitError, match="namespace symlink cycle"):
+        coordinator.repo.audit_heads()
+
+
+def test_a_symbolic_branch_targeting_a_corrupt_exact_ref_refuses_the_audit(
     git_repo: GitFixture,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     broken = coordinator.repo.git_dir / "refs" / "heads" / "broken"
-    broken.write_text("ref: refs/heads/missing\n", encoding="ascii")
+    broken.write_text("not-an-object-id\n", encoding="ascii")
+    git_repo.git("symbolic-ref", "refs/heads/current", "refs/heads/broken")
 
     with pytest.raises(GitError, match="cannot list audit refs"):
-        coordinator.inspect_wal()
+        coordinator.repo.audit_heads()
+
+
+def test_a_dangling_filesystem_symlink_is_not_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    ghost = coordinator.repo.git_dir / "refs" / "heads" / "ghost"
+    ghost.symlink_to("nowhere")
+    assert git_repo.git("fsck", "--no-dangling", check=False).returncode == 0
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+    assert coordinator.register_session("after-symlink", pid=os.getpid(), ttl=300).actor == (
+        "after-symlink"
+    )
+
+
+def test_a_resolving_filesystem_symlink_remains_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    alias = coordinator.repo.git_dir / "refs" / "heads" / "alias"
+    alias.symlink_to("main")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/alias": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_resolving_symbolic_branch_remains_an_audit_head(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    git_repo.git("symbolic-ref", "refs/heads/alias", "refs/heads/main")
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/alias": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_a_dangling_loose_alias_cannot_hide_a_same_name_packed_branch(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    git_repo.git("branch", "alias", git_repo.base)
+    git_repo.git("pack-refs", "--all")
+    git_repo.git("symbolic-ref", "refs/heads/alias", "refs/heads/missing")
+
+    with pytest.raises(GitError, match="cannot list audit refs"):
+        coordinator.repo.audit_heads()
+
+
+def test_unrelated_rc_zero_git_stderr_does_not_reframe_the_ref_listing(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = Coordinator(git_repo.root)
+    original = coordinator.repo.git
+
+    def add_unrelated_diagnostic(*arguments: str, **kwargs: Any) -> git_module.GitResult:
+        result = original(*arguments, **kwargs)
+        if arguments[0] == "for-each-ref":
+            assert result.returncode == 0
+            return git_module.GitResult(
+                result.returncode,
+                result.stdout,
+                b"trace: built-in: git for-each-ref\n",
+            )
+        return result
+
+    monkeypatch.setattr(coordinator.repo, "git", add_unrelated_diagnostic)
+
+    assert coordinator.repo.audit_heads() == {
+        "HEAD": git_repo.base,
+        "refs/heads/main": git_repo.base,
+    }
+    assert coordinator.inspect_wal().consistent
+
+
+def test_reftable_broken_branch_diagnostic_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_repo = _repository_with_ref_backend(tmp_path, "reftable")
+    coordinator = Coordinator(git_repo.root)
+    original = coordinator.repo.git
+
+    def add_broken_branch_diagnostic(*arguments: str, **kwargs: Any) -> git_module.GitResult:
+        result = original(*arguments, **kwargs)
+        if arguments[0] == "for-each-ref":
+            assert result.returncode == 0
+            return git_module.GitResult(
+                result.returncode,
+                result.stdout,
+                b"warning: ignoring broken ref refs/heads/broken\n",
+            )
+        return result
+
+    monkeypatch.setattr(coordinator.repo, "git", add_broken_branch_diagnostic)
+
+    with pytest.raises(GitError, match="Git ignored a broken branch"):
+        coordinator.repo.audit_heads()
 
 
 def test_a_malformed_symbolic_head_cannot_disappear_from_the_audit(
