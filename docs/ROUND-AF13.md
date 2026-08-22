@@ -75,9 +75,10 @@ parent configuration, lists every `onetree` source below this checkout.
 The external conformance instrument passes all 84 self-checks. Its SHA-256 is
 `edb2fa3ab3393671a357910637329420acb73ff629c4637e852a17e31707ede9`,
 unchanged from the bound AF11 base and result receipts. The task-60 focused
-complexity test passes. Ruff, strict mypy, and `git diff --check` pass. The
-configured local suite passed 355 tests in 178.56 seconds with 90.81% total
-coverage on Python 3.14.4.
+complexity test body passes with `-o addopts=''` and in the configured full
+suite. Ruff `check`, strict mypy, and `git diff --check` pass. The configured
+local suite passed 355 tests in 178.56 seconds with 90.81% total coverage on
+Python 3.14.4.
 
 ## Exact-SHA release receipt
 
