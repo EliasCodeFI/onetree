@@ -1,8 +1,10 @@
 # Gate 1 Round AF13: CI and verification truth
 
 AF13 was developed from `e660215d39ae6c4b1db92ffa0827485dc295f415` in a
-standalone clone while AF12 owned the main checkout. Integration onto AF12 is
-recorded only after that round lands and releases its path claims.
+standalone clone while the main checkout contained unrelated uncommitted work.
+It was subsequently fast-forwarded directly to remote `af5` as
+`0c1965423440a656a3fdddeec01041c1e110c3a4`; no shared-worktree file was
+staged or changed by AF13.
 
 ## Red-first observations
 
@@ -77,11 +79,16 @@ complexity test passes. Ruff, strict mypy, and `git diff --check` pass. The
 configured local suite passed 355 tests in 178.56 seconds with 90.81% total
 coverage on Python 3.14.4.
 
-## Release receipt still required
+## Exact-SHA release receipt
 
-The local Python version does not stand in for the supported matrix. Release
-requires the combined post-AF12 commit to be the exact local, remote, pull-
-request, and workflow SHA; Python 3.11, 3.12, and 3.13 must all pass at that SHA;
-the run must contain no Node 20 deprecation annotation; and the staged manifest
-must contain only the named AF12 and AF13 paths. Those facts are appended here
-only after they are observed.
+`0c1965423440a656a3fdddeec01041c1e110c3a4` is a single-parent direct child
+of the AF13 base and remote `refs/heads/af5` resolved to that exact SHA after
+the fast-forward. GitHub Actions pull-request run
+[`32585113197`](https://github.com/konsta95/onetree/actions/runs/32585113197)
+also reported that SHA and concluded success: its Python 3.11, 3.12, and 3.13
+`gates` jobs each passed checkout, setup-python, install, lint, strict types,
+and tests plus coverage. An exact log scan found no Node 20 deprecation or
+forced-Node-24 annotation.
+
+That commit contains the four AF13 paths only. It deliberately does not adopt
+the separate uncommitted main-checkout diff.
