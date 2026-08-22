@@ -1619,7 +1619,7 @@ class Coordinator:
             head,
             excludes,
             recorded=recorded,
-            pending=pending,
+            pending=pending.keys(),
         )
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
