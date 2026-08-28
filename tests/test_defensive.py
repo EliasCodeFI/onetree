@@ -244,6 +244,31 @@ def test_recovery_resolves_an_exposed_intent(
         coordinator.release("alpha", [str(git_repo.root / "a.txt")])
 
 
+def test_wal_document_version_tracks_the_event_kind() -> None:
+    """`v` names the lowest reader a kind needs, and a document may not understate it."""
+
+    adopted = Wal.document("adopted", "operator", {"operation": "a" * 32})
+    collected = Wal.document(
+        "gc",
+        "alpha",
+        {"claim_generations": [], "session_generations": []},
+    )
+
+    assert adopted["v"] == 2
+    assert collected["v"] == 1
+    assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
+
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**adopted, "v": 1}, oid="fixture")
+    with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
+        Wal._validate_document({**collected, "v": 3}, oid="fixture")
+    # ``True`` is the one that matters: it compares equal to 1, so a bool would
+    # otherwise pass the per-kind check for every version-1 kind.
+    for understated in (0, -1, True, "1", 1.0):
+        with pytest.raises(WalCorruptError, match="WAL schema version is invalid"):
+            Wal._validate_document({**collected, "v": understated}, oid="fixture")
+
+
 def test_wal_document_validator_and_empty_wal_paths(git_repo: GitFixture) -> None:
     coordinator = Coordinator(git_repo.root)
     wal = coordinator.wal

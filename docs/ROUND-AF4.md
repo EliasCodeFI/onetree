@@ -30,10 +30,12 @@ reporting.
 `show-ref --exists` returning 2 means "no table names this ref," which is an
 answer *about the tables* and is therefore worth exactly what they are worth.
 That arm now consults `_reftable_storage_state`, which gained a never-healthy
-check: `git init --ref-format=reftable` writes a non-empty `tables.list` before
-it returns and every later write replaces it by rename, so an empty table list
-is not a state Git ever leaves behind -- not even transiently. Zero bytes is
-decidable, and the decision is refusal.
+check: on Git 2.53.0 `git init --ref-format=reftable` writes a non-empty
+`tables.list` before it returns and every later write replaces it by rename, so
+an empty table list is not a state Git leaves behind -- not even transiently.
+That is an implementation observation, not a Git guarantee: a ref backend that
+did publish an empty list, even transiently, would turn this refusal into a
+false positive. Zero bytes is decidable, and the decision is refusal.
 
 **The scan floor is empty.** `_scan_floor` returns `()`. The reasoning and its
 accepted cost are in their own section below, because this is the one item

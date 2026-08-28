@@ -653,6 +653,13 @@ def _oracle_configs(cases: tuple[PredicateCase, ...]) -> tuple[OracleConfig, ...
         configurations.append(
             (("trailer.separators", ":%= \ts"), ("core.commentString", prefix))
         )
+    # The oracle is a union over this matrix, so a matrix that quietly shrank
+    # would weaken `git_values <= parsed` without failing it -- fewer configs
+    # means fewer values Git ever emits, and a subset assertion only gets
+    # easier. The count is pinned here rather than at the call site because it
+    # is a property of this derivation alone: nothing below reads Git or the
+    # repository, so the value moves only when the corpus or this function does.
+    assert len(configurations) == 303
     return tuple(configurations)
 
 
@@ -700,9 +707,20 @@ def test_landing_ids_are_a_declared_superset_of_config_pinned_git(
     repository = Repository(git_repo.root)
     tree = repository.git_text("show", "-s", "--format=%T", git_repo.base)
     cases = _all_cases()
-    for index, case in enumerate(cases):
-        commit = repository.git_text("commit-tree", tree, input_bytes=case.message)
-        assert repository.update_ref(f"refs/predicate/{index:04d}", commit, None)
+    # Each commit-tree needs its own message on stdin, so those stay one apiece.
+    # The ref creations do not: one `update-ref --stdin -z` transaction replaces
+    # 1,502 processes, and it is the stricter setup as well -- the batch either
+    # creates every ref or none, where a per-ref loop can leave a partial corpus
+    # behind. `update_ref` is the production CAS path, with lock probing and a
+    # retry window; none of that is under test here.
+    commits = [
+        repository.git_text("commit-tree", tree, input_bytes=case.message) for case in cases
+    ]
+    records = "".join(
+        f"create refs/predicate/{index:04d}\0{commit}\0"
+        for index, commit in enumerate(commits)
+    )
+    repository.git("update-ref", "--stdin", "-z", input_bytes=records.encode("ascii"))
 
     git_repo.git("config", "trailer.separators", "=")
     unpinned = _git_oracle(git_repo.root, config=None)
@@ -716,29 +734,20 @@ def test_landing_ids_are_a_declared_superset_of_config_pinned_git(
     union: dict[str, set[str]] = {
         f"refs/predicate/{index:04d}": set() for index in range(len(cases))
     }
-    configurations = _oracle_configs(cases)
-    assert len(configurations) == 303
-    for config in configurations:
+    for config in _oracle_configs(cases):
         observed = _git_oracle(git_repo.root, config=config)
         assert len(observed) == len(cases)
         for reference, values in observed.items():
             union[reference].update(values)
-    over_cases = 0
-    over_values = 0
     for index, case in enumerate(cases):
         parsed = landing_ids(case.message)
         git_values = frozenset(union[f"refs/predicate/{index:04d}"])
         assert parsed == case.expected, case.name
         assert git_values <= parsed, case.name
-        over_cases += bool(parsed - git_values)
-        over_values += len(parsed - git_values)
-        if case.generated:
-            # The independent model is the exact declaration for generated
-            # shapes: subset-only would let a parser broaden unnoticed.
-            assert parsed - git_values == case.expected - git_values, case.name
-        else:
+        if not case.generated:
+            # Generated shapes declare no allow-list; their exactness is the
+            # equality against the independent model above.
             assert parsed - git_values == case.allowed_extra, case.name
-    assert (over_cases, over_values) == (595, 1063)
 
 
 @pytest.mark.parametrize(

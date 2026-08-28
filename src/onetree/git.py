@@ -355,7 +355,8 @@ class Repository:
             raise GitError("unsupported Git ref format", ref_format=ref_format)
         self.ref_format = ref_format
         self._git_paths: dict[str, Path] = {}
-        self._valid_branch_refs: set[str] = set()
+        self._ref_name_status: dict[str, int] = {}
+        self._object_types: dict[str, str] = {}
 
     @staticmethod
     def _environment(index: Path | None = None) -> dict[str, str]:
@@ -463,10 +464,24 @@ class Repository:
         )
 
     def object_type(self, oid: str) -> str | None:
+        """The object's type, or None when this repository does not have it.
+
+        A resolved type is cached for the life of the Repository: an object's
+        type is fixed when it is written. Absence is deliberately not cached --
+        a concurrent process can create the object between two calls, and a
+        remembered miss would make the audit blind to it.
+        """
+
+        cached = self._object_types.get(oid)
+        if cached is not None:
+            return cached
         result = self.git("cat-file", "-t", "--end-of-options", oid, check=False)
         if result.returncode != 0:
             return None
-        return result.stdout.decode("ascii", errors="replace").strip() or None
+        kind = result.stdout.decode("ascii", errors="replace").strip() or None
+        if kind is not None:
+            self._object_types[oid] = kind
+        return kind
 
     def git_path(self, name: str) -> Path:
         """Absolute on-disk path Git would use for ``name`` inside this repository."""
@@ -654,18 +669,27 @@ class Repository:
         self.validate_branch_ref(reference)
         return reference
 
+    def _check_ref_format(self, reference: str) -> int:
+        """Git's exit status for one ref name, asked at most once per name.
+
+        Validity is a property of the name alone: ``check-ref-format`` reads no
+        repository state, so both answers are stable for the life of this
+        Repository. Caching only the accepted names left the rejected ones
+        respawning a process apiece on every storage reconciliation, and a
+        repository-wide audit reconciles storage twice per call.
+        """
+
+        cached = self._ref_name_status.get(reference)
+        if cached is None:
+            cached = self.git("check-ref-format", reference, check=False).returncode
+            self._ref_name_status[reference] = cached
+        return cached
+
     def validate_branch_ref(self, reference: str) -> str:
-        if reference in self._valid_branch_refs:
-            return reference
         if not reference.startswith("refs/heads/"):
             raise GitError("landing target must be a refs/heads ref", reference=reference)
-        result = self.git("check-ref-format", reference, check=False)
-        if result.returncode != 0:
+        if self._check_ref_format(reference) != 0:
             raise GitError("invalid landing target ref", reference=reference)
-        # Validity is a property of the name alone, and replay validates the
-        # same handful of names once per event; the answer is cached so folding
-        # a long WAL does not spawn one subprocess per landing record.
-        self._valid_branch_refs.add(reference)
         return reference
 
     def _loose_ref_path_is_exact_storage(self, path: Path, reference: str) -> bool:
@@ -848,8 +872,8 @@ class Repository:
 
         valid: set[str] = set()
         for reference in set(loose_candidates).union(packed_candidates):
-            check_name = self.git("check-ref-format", reference, check=False)
-            if check_name.returncode == 0:
+            status = self._check_ref_format(reference)
+            if status == 0:
                 loose = loose_candidates.get(reference)
                 if (
                     loose is not None
@@ -859,11 +883,11 @@ class Repository:
                 ):
                     continue
                 valid.add(reference)
-            elif check_name.returncode != 1:
+            elif status != 1:
                 raise GitError(
                     "cannot validate a stored branch name",
                     operation="check-ref-format",
-                    returncode=check_name.returncode,
+                    returncode=status,
                 )
         return frozenset(valid)
 

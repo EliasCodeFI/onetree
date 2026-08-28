@@ -965,6 +965,51 @@ def test_targeted_adoption_attributes_a_shared_commit_to_the_named_branch(
     assert adoption.report.consistent
 
 
+def test_adoption_is_safe_to_run_twice(git_repo: GitFixture) -> None:
+    """A second `wal --adopt` adopts nothing and exits 0; it is not an error."""
+
+    coordinator = Coordinator(git_repo.root)
+    candidate = _marked_commit(
+        coordinator,
+        "refs/heads/main",
+        "4" * 32,
+        (git_repo.base,),
+    )
+
+    first_code, first_out, _ = _cli("wal", "--repo", str(git_repo.root), "--adopt", "--json")
+    second_code, second_out, _ = _cli("wal", "--repo", str(git_repo.root), "--adopt", "--json")
+
+    assert first_code == 0
+    assert json.loads(first_out)["adoption"]["commits"] == [candidate]
+    assert second_code == 0
+    second = json.loads(second_out)["adoption"]
+    assert second["commits"] == []
+    assert second["consistent"] is True
+    assert second["divergences"] == []
+
+
+def test_adoption_of_a_clean_branch_still_reports_the_other_branch(
+    git_repo: GitFixture,
+) -> None:
+    """Nothing to adopt here is not nothing to adopt anywhere; the report is repo-wide."""
+
+    coordinator = Coordinator(git_repo.root)
+    elsewhere = _marked_commit(
+        coordinator,
+        "refs/heads/topic",
+        "5" * 32,
+        (git_repo.base,),
+    )
+
+    adoption = coordinator.adopt_landings("refs/heads/main")
+
+    assert adoption.adopted == ()
+    assert not adoption.report.consistent
+    assert [(item.target, item.commit) for item in adoption.report.divergences] == [
+        ("refs/heads/topic", elsewhere)
+    ]
+
+
 def test_land_refuses_detached_head_without_an_explicit_target(
     git_repo: GitFixture,
 ) -> None:
@@ -3613,22 +3658,26 @@ def test_reftable_table_open_race_cannot_turn_an_absent_ref_into_corruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A listed table can disappear during compaction after its list was read."""
+    """Ref resolution never opens a listed table, so compaction cannot corrupt it."""
 
     git_repo = _repository_with_ref_backend(tmp_path, "reftable")
     repository = Repository(git_repo.root)
     table_list = repository.git_dir / "reftable" / "tables.list"
     table = table_list.parent / table_list.read_text(encoding="utf-8").splitlines()[0]
     original_open = Path.open
+    opened_table = 0
 
     def vanishing_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal opened_table
         if path == table:
+            opened_table += 1
             raise FileNotFoundError("compaction removed the old table")
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", vanishing_open)
 
     assert repository.resolve_ref("refs/onetree/absent", missing_ok=True) is None
+    assert opened_table == 0
 
 
 @pytest.mark.parametrize("ref_format", ["files", "reftable"])

@@ -46,6 +46,7 @@ if [ "$matched_operation" = 1 ] && [ "$matched_reference" = 1 ]; then
     if [ "$ONETREE_TEST_KILL_MODE" = self_after ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"
       kill -KILL "$$"
+      exit 98
     fi
     if [ "$ONETREE_TEST_KILL_MODE" = self_after_hand_commits ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"
@@ -64,6 +65,7 @@ if [ "$matched_operation" = 1 ] && [ "$matched_reference" = 1 ]; then
         count=$((count + 1))
       done
       kill -KILL "$$"
+      exit 98
     fi
     if [ "$ONETREE_TEST_KILL_MODE" = after ]; then
       "$ONETREE_TEST_REAL_GIT" "$@"

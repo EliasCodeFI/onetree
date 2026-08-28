@@ -84,7 +84,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wal.add_argument(
         "--target",
-        help="With --adopt, limit records to one refs/heads branch; audit stays repository-wide.",
+        help=(
+            "One refs/heads branch. Only --adopt narrows anything: it limits which "
+            "landings are recorded. In every mode the audit and the report stay "
+            "repository-wide, and naming a branch only adds it to that audit."
+        ),
     )
     _add_output(wal)
 

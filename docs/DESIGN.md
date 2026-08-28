@@ -37,8 +37,21 @@ implemented as a commit chain on a dedicated ref, pure git plumbing. Each
 event is a commit whose tree carries one JSON document; the parent is the
 previous WAL head; CAS on the WAL ref serializes appends. Event kinds:
 `session_register`, `claim`, `release`, `land_intent` (fence), `landed`,
-`refused`, `gc`. The working tree stays pristine — no state files in the tree,
-ever. History cannot be edited without showing in the ref.
+`adopted`, `refused`, `gc`. `adopted` records the operator's explicit
+acceptance of a broker landing the WAL did not record; every other kind is
+written by the broker itself. The working tree stays pristine — no state files
+in the tree, ever. History cannot be edited without showing in the ref.
+
+Each document carries `v`, the lowest reader version that understands its
+event kind — not a version of the document shape, which has not changed. A
+reader accepts any version it knows and refuses a higher one by version, so a
+binary that predates a kind refuses it as an unsupported version rather than
+as an unknown kind, and only once that kind is actually used. Both refusals
+are `wal_corrupt` — an old reader cannot be taught a new type — so the change
+is in what the operator is told, not in what a machine can dispatch on. A
+document whose `v` disagrees with its kind is refused: understating the
+version is how a newer kind would otherwise reach a reader that refuses the
+version but not the kind. `adopted` is the first kind above version 1.
 
 Actor identity is a stable session id recorded on every event. Event signing
 (Ed25519) is a design hook behind an optional extra — the core stays

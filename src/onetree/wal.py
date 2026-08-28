@@ -14,18 +14,27 @@ from onetree.errors import GitError, RefCorruptError, WalCorruptError
 from onetree.git import Repository
 
 WAL_REF = "refs/onetree/wal"
-EVENT_KINDS = frozenset(
-    {
-        "session_register",
-        "claim",
-        "release",
-        "land_intent",
-        "landed",
-        "adopted",
-        "refused",
-        "gc",
-    }
-)
+
+# ``v`` is the lowest reader version that understands the document's event
+# kind. It is not a version of the document shape: the six keys below have
+# never changed, and a reader that does not know a kind cannot act on the log
+# whatever the shape says. Versioning per kind rather than per log keeps an
+# older binary working against a WAL that has not used a newer kind yet, and
+# makes its refusal accurate when one appears -- an unsupported version, not a
+# corrupt log. A kind's version is frozen once released; adding a kind adds a
+# row here and, if the kind is new, raises WAL_READER_VERSION.
+_KIND_VERSIONS = {
+    "session_register": 1,
+    "claim": 1,
+    "release": 1,
+    "land_intent": 1,
+    "landed": 1,
+    "adopted": 2,
+    "refused": 1,
+    "gc": 1,
+}
+WAL_READER_VERSION = max(_KIND_VERSIONS.values())
+EVENT_KINDS = frozenset(_KIND_VERSIONS)
 _DOCUMENT_KEYS = frozenset({"v", "event", "event_id", "actor", "time", "data"})
 
 
@@ -91,7 +100,7 @@ class Wal:
         if not actor:
             raise WalCorruptError("WAL actor is empty", event=kind)
         return {
-            "v": 1,
+            "v": _KIND_VERSIONS[kind],
             "event": kind,
             "event_id": event_id or uuid.uuid4().hex,
             "actor": actor,
@@ -105,11 +114,19 @@ class Wal:
             raise WalCorruptError("WAL event document is not an object", oid=oid)
         if frozenset(value) != _DOCUMENT_KEYS:
             raise WalCorruptError("WAL event document has unexpected fields", oid=oid)
-        if value.get("v") != 1:
-            raise WalCorruptError("unsupported WAL schema version", oid=oid)
+        version = value.get("v")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise WalCorruptError("WAL schema version is invalid", oid=oid)
+        if version > WAL_READER_VERSION:
+            raise WalCorruptError("unsupported WAL schema version", oid=oid, version=version)
         kind = value.get("event")
         if not isinstance(kind, str) or kind not in EVENT_KINDS:
             raise WalCorruptError("unknown WAL event kind", oid=oid)
+        # A document may not understate the reader its kind needs: accepting a
+        # downgraded ``v`` would let a writer smuggle a newer kind past a reader
+        # that refuses the version but not the kind.
+        if version != _KIND_VERSIONS[kind]:
+            raise WalCorruptError("WAL event version does not match its kind", oid=oid, event=kind)
         actor = value.get("actor")
         if not isinstance(actor, str) or not actor:
             raise WalCorruptError("WAL event actor is invalid", oid=oid)

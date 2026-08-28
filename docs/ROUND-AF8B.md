@@ -113,8 +113,13 @@ an optional accelerator before deciding whether mutation is safe.
 AF8B did not change AF8's alternating `OID NUL trailer NUL` parser.
 `test_git_log_z_terminates_every_audit_record` observes Git 2.53.0 emit two
 NUL bytes per record for `git log -z --format=%H%x00`: the explicit format
-NUL plus `-z`'s record terminator. Commit objects cannot contain a NUL in
-their message, so no message route can manufacture an extra field boundary.
+NUL plus `-z`'s record terminator. This round claimed commit objects cannot
+contain a NUL in their message, and Round AF8D disproved it: `git hash-object
+--literally` built a hash-consistent commit carrying a NUL before its final
+trailer block, which `git show --format=%B` silently truncated at. What keeps
+the framing unambiguous is the record shape rather than the message alphabet --
+the walk emits only `OID NUL empty NUL` records and reads raw objects through a
+second size-framed `cat-file`. See `docs/ROUND-AF8D.md`.
 
 ## Gates
 

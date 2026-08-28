@@ -37,7 +37,15 @@ missed. The repository's seeded corpus independently scores 1,502 shapes,
 including CRLF crossed with continuation runs (a combination the supplied
 corpus did not cross), under 303 literal-marker configurations. It measured
 zero missed shapes and values; 595 shapes carried 1,063 extra values versus
-the Git union. The test pins every parsing setting through `GIT_CONFIG_COUNT`
+the Git union -- the union of what Git detects across all 303 literal-marker
+configurations, which is the strictest baseline available and not the same as
+default Git. The default-Git comparison is a different, larger number; see
+"False-refusal cost and escape" below. Those two totals are this round's
+measurement on the pinned external surface, not an asserted invariant: they
+count the gap to Git, so Git's own trailer behaviour moves them, and a total
+that has to be re-pinned on every Git upgrade reads as a regression when it is
+not one. The configuration count is pinned, because nothing about it depends on
+Git. The test pins every parsing setting through `GIT_CONFIG_COUNT`
 variables, proves those pins override a blinding local
 `trailer.separators` configuration, and asserts the one-directional relation
 `git <= onetree`, an exact independent predicate model, and readable
@@ -50,7 +58,10 @@ missed one real folded-squash landing. It was rejected. Deleting only the
 ## False-refusal cost and escape
 
 The line union deliberately detects more than default Git: 869 of the 1,502
-synthetic shapes, and one of 18 porcelain messages. The porcelain false
+synthetic shapes, and one of 18 porcelain messages. This 869 is measured
+against default Git, so it is necessarily larger than the 595 reported above,
+which is measured against the Git union across all 303 configurations. The two
+numbers use different baselines and do not contradict each other. The porcelain false
 refusal is `prose-mentions-token`. The extra categories asserted in this tree
 are a marker used as the title or prose, a marker before a later paragraph, a
 non-default separator, a marker followed by divider/reviewer text, and the

@@ -1708,7 +1708,11 @@ class Coordinator:
         raise GitError("audit snapshot retry limit exceeded", retries=MAX_CAS_RETRIES)
 
     def adopt_landings(self, target: str | None = None) -> AdoptionResult:
-        """Explicitly record every unrecorded landing found by the local audit."""
+        """Explicitly record every unrecorded landing found by the local audit.
+
+        Adoption is idempotent: an audit that finds nothing to adopt is the
+        ordinary second-run outcome, not a failure.
+        """
 
         target_ref = None if target is None else self.repo.validate_branch_ref(target)
         for _ in range(MAX_CAS_RETRIES):
@@ -1730,12 +1734,7 @@ class Coordinator:
             )
             unrecorded = self._unrecorded_landings(state, adoption_heads)
             if not unrecorded:
-                raise UnrecordedLandingError(
-                    "the audit found no unrecorded broker landings to adopt",
-                    targets=list(targets),
-                    divergences=[],
-                    repair="onetree wal --adopt",
-                )
+                return AdoptionResult((), self.inspect_wal(target_ref))
             documents: list[dict[str, Any]] = []
             for item in unrecorded:
                 if item.commit is None or item.operation is None:
