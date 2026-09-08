@@ -25,6 +25,12 @@ class GitError(OnetreeError):
     kind = "git_error"
 
 
+class PayloadGateError(OnetreeError):
+    """The configured commit-payload gate could not produce a trusted verdict."""
+
+    kind = "payload_gate_error"
+
+
 class UnsupportedWorktreeError(OnetreeError):
     """Gate 1 coordination was invoked from a linked Git worktree."""
 

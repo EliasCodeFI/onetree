@@ -2,15 +2,110 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import shutil
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+from onetree import git as git_module
+
 _GIT_EXECUTABLE = shutil.which("git") or "git"
+
+_GATE_CHILD_SEARCH_PATH = os.pathsep.join(entry for entry in os.defpath.split(os.pathsep) if entry)
+"""The `PATH` a payload-gate child is given: the platform default, empty components dropped.
+
+This mirrors `Repository._payload_gate_environment` rather than reading `os.defpath`
+directly. An empty component would make `shutil.which` search the working directory and
+hand back a bare relative name, which means something different in the child, whose
+working directory is the repository under audit.
+"""
+
+GATE_GIT_LITERAL = repr(shutil.which("git", path=_GATE_CHILD_SEARCH_PATH) or _GIT_EXECUTABLE)
+"""The Git executable as a Python literal, for embedding in a payload-gate stub's source.
+
+A gate child's PATH is chosen rather than inherited -- the platform default with its empty
+components dropped, and in one test a default that test supplies itself -- so a stub that
+names `git` bare resolves it there, not through the PATH these tests run under, and not
+necessarily to the same Git the fixtures themselves invoke. Stubs embed this literal instead.
+
+It is resolved through the child's own search path first, so on any host carrying a Git in
+the platform default the stub names one the child can actually execute. That is what makes a
+Git installed elsewhere fail the audit it is meant to fail rather than every landing test at
+once -- a promise the ambient resolution alone did not keep, because a PATH-dependent shim
+resolves in the parent and then cannot find its own target in the child. The fallback to
+ambient resolution is reached only where the platform default carries no Git at all, and
+there the shipped gate could not run Git either.
+"""
+
+_CLEAN_PAYLOAD_GATE_SOURCE = """\
+import json
+import subprocess
+import sys
+
+candidate = sys.argv[2]
+repository = sys.argv[4]
+completed = subprocess.run(
+    [_GIT_, "-C", repository, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", candidate],
+    check=True,
+    capture_output=True,
+)
+paths = sorted(
+    path.decode("utf-8", errors="strict")
+    for path in completed.stdout.split(b"\\0")
+    if path
+)
+print(
+    json.dumps(
+        {
+            "candidate": candidate,
+            "repository": repository,
+            "staged_files": paths,
+            "findings": [],
+            "degraded": [],
+            "verdict": "CLEAN",
+        }
+    )
+)
+""".replace("_GIT_", GATE_GIT_LITERAL)
+
+
+SHIPPED_PAYLOAD_GATE_SOURCE_SHA256 = git_module.PAYLOAD_GATE_SOURCE_SHA256
+"""The digest the package ships, captured before any fixture can rebind it.
+
+`clean_commit_payload_gate` is autouse, so inside a test body the module global always
+names that test's throwaway gate. Every assertion about the SHIPPED pin has to read this
+snapshot instead, or it asserts the fixture's own value and passes for any pin at all.
+"""
+
+
+@pytest.fixture(autouse=True)
+def clean_commit_payload_gate(tmp_path: Path) -> Iterator[None]:
+    """Give every landing test an exact-output gate unless it overrides one.
+
+    The patcher is this fixture's own, not the `monkeypatch` fixture. That fixture is one
+    instance per test, shared with the test body, and `undo()` on it reverts everything the
+    instance has recorded -- including a setup this fixture performed before the body ran.
+    Two tests call `monkeypatch.undo()` mid-body, and sharing the instance silently starves
+    them of a gate from that line on.
+    """
+
+    gate = tmp_path / "clean_commit_payload.py"
+    gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            git_module,
+            "PAYLOAD_GATE_SOURCE_SHA256",
+            hashlib.sha256(gate.read_bytes()).hexdigest(),
+        )
+        patcher.setenv("ONETREE_COMMIT_PAYLOAD", str(gate))
+        yield
+
 
 # A PATH-shim git that SIGKILLs the broker, or itself, from inside a matched
 # invocation.
@@ -29,6 +124,10 @@ _GIT_EXECUTABLE = shutil.which("git") or "git"
 # mid-rename death; the broker cannot distinguish the two observations.
 _KILL_GIT_SOURCE = """#!/bin/bash
 set -u
+if [ -z "${ONETREE_TEST_KILL_REF+x}${ONETREE_TEST_KILL_STATE+x}" ] &&
+   [ -z "${ONETREE_TEST_KILL_NTH+x}${ONETREE_TEST_KILL_MODE+x}" ]; then
+  exec __CAPTURED_REAL_GIT__ "$@"
+fi
 matched_operation=0
 matched_reference=0
 for argument in "$@"; do
@@ -121,7 +220,8 @@ def kill_git(tmp_path: Path) -> KillGit:
     directory = tmp_path / "killgit"
     directory.mkdir()
     executable = directory / "git"
-    executable.write_text(_KILL_GIT_SOURCE, encoding="utf-8")
+    source = _KILL_GIT_SOURCE.replace("__CAPTURED_REAL_GIT__", shlex.quote(_GIT_EXECUTABLE))
+    executable.write_text(source, encoding="utf-8")
     executable.chmod(0o755)
     return KillGit(executable=executable, state=tmp_path / "killgit.count")
 

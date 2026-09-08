@@ -70,6 +70,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--target",
         help="Full refs/heads target (required while HEAD is detached).",
     )
+    land.add_argument(
+        "--commit-payload",
+        help=(
+            "Path to commit_payload.py (default: ONETREE_COMMIT_PAYLOAD; "
+            "landing refuses when neither is set)."
+        ),
+    )
     land.add_argument("-m", "--message", help="Commit message.")
     _add_output(land)
 
@@ -143,7 +150,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     try:
-        coordinator = Coordinator(args.repo)
+        coordinator = Coordinator(
+            args.repo,
+            commit_payload=getattr(args, "commit_payload", None),
+        )
         if args.command == "session":
             session = coordinator.register_session(
                 _actor(args.actor),

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from conftest import GitFixture
 
+from onetree import git as git_module
 from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import (
@@ -596,6 +597,36 @@ def test_git_wrapper_refusals_and_index_type(git_repo: GitFixture, tmp_path: Pat
     git_repo.git("checkout", "--quiet", "--detach")
     with pytest.raises(GitError, match="detached"):
         repository.head_ref()
+
+
+def test_git_invocation_relabels_only_operating_system_errors(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_invoke` may relabel an OSError as a git-exec failure, and nothing else.
+
+    Every typed onetree error subclasses RuntimeError, so a handler widened to catch
+    RuntimeError would rewrite any precise refusal raised under the subprocess call into
+    "could not execute git" -- and the caller would then act on an inability to start git
+    rather than on the refusal that actually happened. The two arms below differ only in
+    the class of the injected exception, so what they pin is the width of that handler.
+    """
+
+    repository = Repository(git_repo.root)
+    sentinel = WalCorruptError("a typed refusal raised under the subprocess call")
+
+    def raise_sentinel(*_arguments: object, **_keywords: object) -> None:
+        raise sentinel
+
+    monkeypatch.setattr(git_module.subprocess, "run", raise_sentinel)
+    with pytest.raises(WalCorruptError) as crossed:
+        repository.head_ref()
+    assert crossed.value is sentinel
+
+    # Reached before the patched call above, so the two arms do not interact.
+    monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", None)
+    with pytest.raises(GitError, match="could not execute git") as relabelled:
+        repository.head_ref()
+    assert relabelled.value.details["operation"] == "symbolic-ref"
 
 
 def test_cli_human_errors_and_environment_identity(

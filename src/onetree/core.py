@@ -378,9 +378,19 @@ def _overlaps(first: str, second: str) -> bool:
 class Coordinator:
     """The daemon-free broker; every mutation is serialized by a Git ref CAS."""
 
-    def __init__(self, repository: Path | str) -> None:
+    def __init__(
+        self,
+        repository: Path | str,
+        *,
+        commit_payload: Path | str | None = None,
+    ) -> None:
         self.repo = Repository(repository)
         self.wal = Wal(self.repo)
+        self.commit_payload = (
+            commit_payload
+            if commit_payload is not None
+            else os.environ.get("ONETREE_COMMIT_PAYLOAD")
+        )
 
     def _audit_heads(
         self,
@@ -1286,6 +1296,22 @@ class Coordinator:
             )
             context["candidate"] = commit
             payload_paths = [change.path for change in changes]
+            try:
+                self.repo.audit_commit_payload(commit, payload_paths, self.commit_payload)
+            except LandingRefusedError as refusal:
+                # A gate verdict against the candidate is a landing refusal like the
+                # eight above, and every one of those is recorded before it is raised.
+                # Left unrecorded, the one refusal that inspects the payload itself is
+                # the one no peer and no later audit can see happened.
+                #
+                # PayloadGateError is deliberately not caught here. It says the broker
+                # could not obtain a trusted verdict at all, which is an operational
+                # failure of this process and not a statement about this candidate.
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, str(refusal.details["reason"]), payload_paths
+                ):
+                    continue
+                raise
             lander_start = _pid_start(os.getpid())
             lander_warnings = _liveness_warnings(lander_start)
             intent = self.wal.document(
