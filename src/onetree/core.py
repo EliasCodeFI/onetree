@@ -511,7 +511,27 @@ class Coordinator:
             repair="git replace --convert-graft-file, then review the replacement refs",
         )
 
-    def _canonical_path(self, raw_path: str) -> str:
+    @staticmethod
+    def _resolve_release_path(candidate: Path) -> Path:
+        """A vanished suffix may still name a recorded claim; unresolved aliases may not."""
+
+        suffix: list[str] = []
+        prefix = candidate
+        while True:
+            try:
+                resolved = prefix.resolve(strict=True)
+            except RuntimeError as error:
+                # Older supported Python versions use RuntimeError for a symlink loop.
+                raise OSError(str(error)) from error
+            except FileNotFoundError:
+                if prefix.is_symlink() or prefix.name in {"", ".."}:
+                    raise
+                suffix.append(prefix.name)
+                prefix = prefix.parent
+            else:
+                return resolved.joinpath(*reversed(suffix))
+
+    def _canonical_path(self, raw_path: str, *, for_release: bool = False) -> str:
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             raise InvalidPathError(
@@ -520,7 +540,11 @@ class Coordinator:
                 reason="relative",
             )
         try:
-            resolved = candidate.resolve(strict=True)
+            resolved = (
+                self._resolve_release_path(candidate)
+                if for_release
+                else candidate.resolve(strict=True)
+            )
         except FileNotFoundError as error:
             raise InvalidPathError(
                 "claim path does not exist",
@@ -1021,7 +1045,7 @@ class Coordinator:
 
     def release(self, actor: str, paths: Sequence[str] = ()) -> ReleaseResult:
         actor = _validate_actor(actor)
-        canonical = tuple(sorted({self._canonical_path(path) for path in paths}))
+        canonical = tuple(sorted({self._canonical_path(path, for_release=True) for path in paths}))
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
             snapshot = self._read_wal()
