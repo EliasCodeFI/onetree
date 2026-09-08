@@ -51,6 +51,13 @@ def _build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--ttl", type=float, default=86400.0, help="Claim lease seconds.")
     _add_output(claim)
 
+    narrow = subparsers.add_parser("narrow", help="Atomically retain descendants of a held path.")
+    narrow.add_argument("parent", help="Absolute path of the exact claim to surrender.")
+    narrow.add_argument("paths", nargs="+", help="Absolute existing descendants to retain.")
+    _add_repo(narrow)
+    _add_actor(narrow)
+    _add_output(narrow)
+
     release = subparsers.add_parser("release", help="Release selected paths or all held paths.")
     release.add_argument("paths", nargs="*")
     _add_repo(release)
@@ -172,6 +179,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "claim": {"claims": [claim.payload() for claim in claim_result.claims]},
             }
             human = f"claimed {len(claim_result.claims)} path(s)"
+        elif args.command == "narrow":
+            narrow_result = coordinator.narrow(_actor(args.actor), args.parent, args.paths)
+            payload = {
+                "ok": True,
+                "narrow": {
+                    "released": list(narrow_result.released),
+                    "claims": [claim.payload() for claim in narrow_result.claims],
+                },
+            }
+            human = f"narrowed {args.parent}; retained {len(narrow_result.claims)} claim(s)"
         elif args.command == "release":
             release_result = coordinator.release(_actor(args.actor), args.paths)
             payload = {

@@ -20,6 +20,7 @@ from onetree.errors import (
     InvalidPathError,
     LandingRefusedError,
     LegacyGraftError,
+    NarrowRefusedError,
     OnetreeError,
     RefCorruptError,
     RefLockedError,
@@ -100,6 +101,12 @@ class ClaimInfo:
 
 @dataclass(frozen=True)
 class ClaimResult:
+    claims: tuple[ClaimInfo, ...]
+
+
+@dataclass(frozen=True)
+class NarrowResult:
+    released: tuple[str, ...]
     claims: tuple[ClaimInfo, ...]
 
 
@@ -1029,6 +1036,128 @@ class Coordinator:
             if self._try_append(state, snapshot, documents) is not None:
                 return ClaimResult(claims)
         raise GitError("claim CAS retry limit exceeded")
+
+    def narrow(self, actor: str, parent: str, paths: Sequence[str]) -> NarrowResult:
+        """Retain existing descendants without surrendering their coverage between writes.
+
+        Only the named parent generation is surrendered. Other claims survive,
+        and newly issued children inherit its remaining lease without renewal.
+        """
+
+        actor = _validate_actor(actor)
+        canonical_parent = self._canonical_path(parent)
+        canonical = tuple(sorted({self._canonical_path(path) for path in paths}))
+        if not canonical:
+            raise InvalidPathError("at least one retained path is required", reason="empty")
+        invalid = [
+            path
+            for path in canonical
+            if path == canonical_parent or not _covers(canonical_parent, path)
+        ]
+        if invalid:
+            raise InvalidPathError(
+                "retained paths must be proper descendants of the parent",
+                reason="not_descendant",
+                parent=canonical_parent,
+                paths=invalid,
+            )
+        children = tuple(
+            path
+            for path in canonical
+            if not any(other != path and _covers(other, path) for other in canonical)
+        )
+        selected_generation: str | None = None
+        for _ in range(MAX_CAS_RETRIES):
+            now = time.time()
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            session = self._active_session(state, actor, now)
+            if session is None:
+                raise IdentityError("session is not active", session=actor)
+            active = state.active_claims(now)
+            owned = tuple(claim for claim in active if claim.actor == actor)
+            parents = tuple(claim for claim in owned if claim.path == canonical_parent)
+            selected = parents[0] if len(parents) == 1 else None
+            reason: str | None = None
+            if selected is None:
+                reason = "not_held"
+            elif selected_generation is not None and selected.generation != selected_generation:
+                reason = "claim_changed"
+            else:
+                selected_generation = selected.generation
+                fenced = {
+                    str(fence.get("claim_generation"))
+                    for intent in state.pending.values()
+                    for fence in intent.data.get("fences", [])
+                    if isinstance(fence, dict)
+                }
+                if selected.generation in fenced:
+                    reason = "pending_land"
+            if reason is not None:
+                refusal = self.wal.document(
+                    "refused",
+                    actor,
+                    {
+                        "action": "narrow",
+                        "reason": reason,
+                        "parent": canonical_parent,
+                        "paths": list(children),
+                    },
+                )
+                if self._try_append(state, snapshot, (refusal,)) is None:
+                    continue
+                raise NarrowRefusedError(
+                    "narrow refused",
+                    reason=reason,
+                    parent=canonical_parent,
+                    paths=list(children),
+                )
+            assert selected is not None
+            remaining = tuple(claim for claim in owned if claim.generation != selected.generation)
+            needed = tuple(
+                path
+                for path in children
+                if not any(_covers(claim.path, path) for claim in remaining)
+            )
+            claims = tuple(
+                ClaimInfo(
+                    actor,
+                    path,
+                    uuid.uuid4().hex,
+                    session.generation,
+                    min(selected.expires_at, session.expires_at),
+                )
+                for path in needed
+            )
+            documents = tuple(
+                self.wal.document(
+                    "claim",
+                    actor,
+                    {
+                        "path": claim.path,
+                        "generation": claim.generation,
+                        "session_generation": claim.session_generation,
+                        "expires_at": claim.expires_at,
+                    },
+                )
+                for claim in claims
+            ) + (
+                self.wal.document(
+                    "release",
+                    actor,
+                    {"generations": [selected.generation], "paths": [canonical_parent]},
+                ),
+            )
+            if self._try_append(state, snapshot, documents) is not None:
+                retained = tuple(
+                    claim
+                    for claim in (*remaining, *claims)
+                    if any(_covers(claim.path, path) for path in children)
+                )
+                return NarrowResult(
+                    (canonical_parent,), tuple(sorted(retained, key=lambda claim: claim.path))
+                )
+        raise GitError("narrow CAS retry limit exceeded")
 
     def check(self, actor: str, path: str) -> CheckResult:
         actor = _validate_actor(actor)

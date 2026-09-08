@@ -121,3 +121,10 @@ class ReleaseRefusedError(OnetreeError):
 
     kind = "release_refused"
     exit_code = 1
+
+
+class NarrowRefusedError(OnetreeError):
+    """Narrowing requires an unchanged owned parent without pending landings."""
+
+    kind = "narrow_refused"
+    exit_code = 1
