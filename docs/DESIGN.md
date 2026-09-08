@@ -147,6 +147,12 @@ never failed is not evidence.
   that is change detection for the next landing and for an operator, not a
   control over the verdict just produced: the child executed a snapshot, so what
   the configured path holds afterwards cannot bear on what already ran.
+  The gate's complete report and admitted source digest are retained in the
+  intent, or in a classified gate-refusal event. Landed and recovered records
+  refer to that immutable carrier. Hook suite evidence, advisories and allowed
+  NO_COMPANION outcomes remain visible; historical records without evidence
+  are explicitly unrecorded. The receipt and replay contract is recorded in
+  `docs/ROUND-GATE-EVIDENCE.md`.
 
 ## Non-goals for Round A
 

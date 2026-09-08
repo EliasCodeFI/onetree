@@ -231,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "operation": land_result.operation,
                     "intent": land_result.intent,
                     "warnings": list(land_result.warnings),
+                    "gate_receipt": land_result.gate_receipt,
                 },
             }
             human = f"landed {land_result.commit} on {land_result.target}"
@@ -302,6 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "ref_locks": list(wal_result.ref_locks),
                     "temp_indexes": [residue.payload() for residue in wal_result.temp_indexes],
                     "events": [_event_payload(event) for event in wal_result.events],
+                    "gate_evidence": wal_result.gate_evidence(),
                 },
             }
             # The verdict leads. A human line that reads identically for a healthy

@@ -31,7 +31,13 @@ from onetree.errors import (
     WalCorruptError,
     WalDivergedError,
 )
-from onetree.git import MarkedCommit, Repository, TempIndex, TreeEntry
+from onetree.git import (
+    MarkedCommit,
+    Repository,
+    TempIndex,
+    TreeEntry,
+    validate_payload_gate_receipt,
+)
 from onetree.proc import process_alive as _pid_alive
 from onetree.proc import process_start as _pid_start
 from onetree.wal import WAL_REF, EventRecord, Wal, WalSnapshot
@@ -133,6 +139,7 @@ class LandResult:
     operation: str
     intent: str
     warnings: tuple[str, ...] = ()
+    gate_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,43 @@ class WalReport:
     divergences: tuple[Divergence, ...] = ()
     ref_locks: tuple[str, ...] = ()
     temp_indexes: tuple[TempIndex, ...] = ()
+
+    def gate_evidence(self) -> list[dict[str, Any]]:
+        carriers = {
+            event.event_id: event
+            for event in self.events
+            if event.kind in {"land_intent", "refused"} and "gate_receipt" in event.data
+        }
+        evidence: list[dict[str, Any]] = []
+        for event in self.events:
+            if event.kind not in {"land_intent", "landed", "adopted", "refused"}:
+                continue
+            if event.kind == "refused" and event.data.get("action") != "land":
+                continue
+            reference = (
+                event.event_id
+                if event.event_id in carriers
+                else event.data.get("intent")
+                if event.kind in {"landed", "refused"}
+                else None
+            )
+            carrier = carriers.get(reference) if isinstance(reference, str) else None
+            recorded = carrier is not None and (
+                carrier.event_id == event.event_id
+                or (
+                    carrier.kind == "land_intent"
+                    and carrier.actor == event.actor
+                    and carrier.data.get("operation") == event.data.get("operation")
+                )
+            )
+            evidence.append(
+                {
+                    "event": event.event_id,
+                    "state": "recorded" if recorded else "unrecorded",
+                    "receipt_event": reference if recorded else None,
+                }
+            )
+        return evidence
 
 
 @dataclass(frozen=True)
@@ -640,6 +684,8 @@ class Coordinator:
         """
 
         data = event.data
+        if "gate_receipt" in data and event.kind not in {"land_intent", "refused"}:
+            raise WalCorruptError("gate receipt is on the wrong event kind", oid=event.oid)
         if event.event_id in state.event_ids:
             raise WalCorruptError("duplicate WAL event id", oid=event.oid)
         state.event_ids.add(event.event_id)
@@ -789,6 +835,7 @@ class Coordinator:
                 raise WalCorruptError(
                     "land_intent fences do not match its payload", oid=event.oid
                 )
+            self._validate_gate_receipt(event, "CLEAN", intent_payload_paths, data["candidate"])
             state.pending[operation] = event
         elif event.kind == "adopted":
             if frozenset(data) != {"operation", "target", "expected_head", "commit", "tree"}:
@@ -874,10 +921,37 @@ class Coordinator:
                 state.refused_operations.add(refused_operation)
             action = _string(data, "action", event)
             reason = _string(data, "reason", event)
+            if "gate_receipt" in data:
+                verdict = {
+                    "payload_gate_refused": "REFUSE", "payload_gate_degraded": "DEGRADED"
+                }.get(reason)
+                if action != "land" or verdict is None:
+                    raise WalCorruptError("gate receipt has no matching refusal", oid=event.oid)
+                self._validate_gate_receipt(event, verdict, _string_list(data, "paths", event))
             if action == "recover" and reason == "branch_diverged":
                 state.diverged_refusals.add(_divergence_key(data.get("divergences"), event))
         else:  # all event kinds are covered above
             raise AssertionError(f"unhandled WAL event: {event.kind}")
+
+    @staticmethod
+    def _validate_gate_receipt(
+        event: EventRecord, verdict: str, paths: Sequence[str], candidate: str | None = None
+    ) -> None:
+        if "gate_receipt" not in event.data:
+            return
+        receipt = event.data["gate_receipt"]
+        try:
+            validate_payload_gate_receipt(receipt)
+        except (ValueError, TypeError) as error:
+            raise WalCorruptError(
+                "invalid retained gate evidence", oid=event.oid, detail=str(error)
+            ) from error
+        if (
+            receipt["report"]["verdict"] != verdict
+            or set(receipt["expected_paths"]) != set(paths)
+            or (candidate is not None and receipt["report"]["candidate"] != candidate)
+        ):
+            raise WalCorruptError("gate receipt differs from its WAL event", oid=event.oid)
 
     def _active_session(
         self,
@@ -1249,6 +1323,8 @@ class Coordinator:
         operation: str,
         reason: str,
         paths: Sequence[str] = (),
+        *,
+        gate_receipt: Mapping[str, Any] | None = None,
     ) -> bool:
         document = self.wal.document(
             "refused",
@@ -1258,6 +1334,7 @@ class Coordinator:
                 "reason": reason,
                 "operation": operation,
                 "paths": list(paths),
+                **({"gate_receipt": dict(gate_receipt)} if gate_receipt is not None else {}),
             },
         )
         return self._try_append(state, snapshot, (document,)) is not None
@@ -1450,7 +1527,9 @@ class Coordinator:
             context["candidate"] = commit
             payload_paths = [change.path for change in changes]
             try:
-                self.repo.audit_commit_payload(commit, payload_paths, self.commit_payload)
+                gate_receipt = self.repo.audit_commit_payload(
+                    commit, payload_paths, self.commit_payload
+                )
             except LandingRefusedError as refusal:
                 # A gate verdict against the candidate is a landing refusal like the
                 # eight above, and every one of those is recorded before it is raised.
@@ -1461,7 +1540,9 @@ class Coordinator:
                 # could not obtain a trusted verdict at all, which is an operational
                 # failure of this process and not a statement about this candidate.
                 if not self._record_land_refusal(
-                    state, snapshot, actor, operation, str(refusal.details["reason"]), payload_paths
+                    state, snapshot, actor, operation, str(refusal.details["reason"]),
+                    payload_paths,
+                    gate_receipt=refusal.details.get("gate_receipt"),
                 ):
                     continue
                 raise
@@ -1489,6 +1570,7 @@ class Coordinator:
                     },
                     "fences": list(fences),
                     "payload": [change.event_payload() for change in changes],
+                    "gate_receipt": gate_receipt,
                 },
                 event_id=intent_id,
             )
@@ -1581,6 +1663,7 @@ class Coordinator:
                 operation,
                 intent_id,
                 lander_warnings,
+                gate_receipt,
             )
         raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
 

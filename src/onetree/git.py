@@ -15,6 +15,7 @@ import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from onetree.errors import (
     GitError,
@@ -91,6 +92,100 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
             raise ValueError(f"duplicate key in payload gate JSON: {name!r}")
         seen[name] = value
     return seen
+
+
+def validate_payload_gate_receipt(value: Any) -> None:
+    """Historical evidence binds its original gate and candidate, independent of today's clone."""
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "gate_source_sha256", "expected_paths", "report"}
+        or type(value.get("version")) is not int
+        or value["version"] != 1
+    ):
+        raise ValueError("invalid gate receipt envelope")
+    digest = value["gate_source_sha256"]
+    expected = value["expected_paths"]
+    report = value["report"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("invalid gate receipt source digest")
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(path, str) or not path for path in expected)
+        or len(set(expected)) != len(expected)
+    ):
+        raise ValueError("invalid gate receipt expected paths")
+    if not isinstance(report, dict):
+        raise ValueError("invalid gate receipt report")
+    candidate = report.get("candidate")
+    if (
+        not isinstance(candidate, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", candidate) is None
+        or not isinstance(report.get("repository"), str)
+        or not report["repository"]
+        or not isinstance(report.get("staged_files"), list)
+        or any(not isinstance(path, str) for path in report["staged_files"])
+        or not isinstance(report.get("findings"), list)
+        or not isinstance(report.get("degraded"), list)
+        or report.get("verdict") not in ("CLEAN", "REFUSE", "DEGRADED")
+    ):
+        raise ValueError("invalid gate receipt report fields")
+    if report["verdict"] != "DEGRADED" and (
+        len(set(report["staged_files"])) != len(report["staged_files"])
+        or set(report["staged_files"]) != set(expected)
+    ):
+        raise ValueError("gate receipt payload differs from expected paths")
+    if report["verdict"] == "CLEAN" and (report["findings"] or report["degraded"]):
+        raise ValueError("gate receipt calls a non-empty report CLEAN")
+    evidence_fields = {"advisories", "hook_suites", "hook_suite_state"}
+    present = evidence_fields.intersection(report)
+    if present:
+        if (
+            present != evidence_fields
+            or not isinstance(report["advisories"], list)
+            or any(not isinstance(item, str) for item in report["advisories"])
+            or not isinstance(report["hook_suite_state"], str)
+            or not isinstance(report["hook_suites"], list)
+        ):
+            raise ValueError("invalid gate receipt hook evidence")
+        for suite in report["hook_suites"]:
+            if not isinstance(suite, dict) or any(
+                not isinstance(suite.get(name), str)
+                for name in (
+                    "hook_path",
+                    "suite_path",
+                    "status",
+                    "detail",
+                    "evidence",
+                    "weakening",
+                    "runtime",
+                )
+            ):
+                raise ValueError("invalid gate receipt hook suite")
+            checks = suite.get("checks")
+            if "checks" not in suite or (
+                checks is not None and (type(checks) is not int or checks < 0)
+            ):
+                raise ValueError("invalid gate receipt hook check count")
+    # A retained report must remain valid JSON, including extension fields.
+    json.dumps(value, allow_nan=False)
+
+
+def _payload_gate_receipt(
+    source_sha256: str, expected_paths: Sequence[str], report: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = {
+        "version": 1,
+        "gate_source_sha256": source_sha256,
+        "expected_paths": list(expected_paths),
+        "report": report,
+    }
+    try:
+        validate_payload_gate_receipt(receipt)
+    except (ValueError, TypeError) as error:
+        raise PayloadGateError("malformed retained gate evidence", detail=str(error)) from error
+    return receipt
 
 
 def _landing_marker_positions(line: bytes) -> tuple[int, ...]:
@@ -1303,7 +1398,7 @@ class Repository:
         commit: str,
         expected_paths: Sequence[str],
         gate_source: Path | str | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Require an exact CLEAN verdict over one immutable candidate commit."""
 
         commit = self.validate_oid(commit, label="candidate commit")
@@ -1477,6 +1572,7 @@ class Repository:
                 reason="payload_gate_degraded",
                 paths=expected,
                 degraded=degraded,
+                gate_receipt=_payload_gate_receipt(gate_source_sha256, expected, payload),
             )
         observed_set = set(paths)
         if len(observed_set) != len(paths) or observed_set != set(expected):
@@ -1496,14 +1592,14 @@ class Repository:
                     findings=findings,
                     degraded=degraded,
                 )
-            return
-        if verdict == "REFUSE":
-            raise LandingRefusedError(
-                "commit payload gate refused the candidate",
-                reason="payload_gate_refused",
-                paths=expected,
-                findings=findings,
-            )
+            return _payload_gate_receipt(gate_source_sha256, expected, payload)
+        raise LandingRefusedError(
+            "commit payload gate refused the candidate",
+            reason="payload_gate_refused",
+            paths=expected,
+            gate_receipt=_payload_gate_receipt(gate_source_sha256, expected, payload),
+            findings=findings,
+        )
 
     def commit_parents(self, commit: str) -> tuple[str, ...]:
         content = self.git("cat-file", "commit", commit).stdout
