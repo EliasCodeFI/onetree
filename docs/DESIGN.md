@@ -33,8 +33,12 @@ this document is the implementation contract for the first two rounds.
      head, re-parent the built tree and retry; exactly one racer wins per
      attempt, losers retry cleanly.
 4. **Test referee** (Round B). Before the ref moves, the candidate is tested
-   atop everything queued ahead of it (the exact train). A red train bisects
-   to name the conflicting pair. Plus: branch-operation refusal (`switch`/
+   atop everything queued ahead of it (the exact train). A red train names
+   a conflicting pair only when that pair was demonstrated to fail;
+   otherwise it reports the demonstrated failing combination or explicitly
+   unresolved localization. Red and timed-out candidates remain refused.
+   Minimality and localization-cost claims require supporting evidence
+   (see `docs/ROUND-B-AMENDMENT.md`). Plus: branch-operation refusal (`switch`/
    `checkout`/destructive `reset` in a shared clone), and a typed rejection
    contract that names exactly the invalidated paths so a session repairs
    minimally.
