@@ -16,7 +16,13 @@ from test_referee import inherited_config_values, operator_config, referee_comma
 from onetree import referee, workspace
 from onetree.cli import main
 from onetree.core import Coordinator
-from onetree.errors import GitError, LandingRefusedError, WalCorruptError, WalDivergedError
+from onetree.errors import (
+    GitError,
+    LandingRefusedError,
+    PayloadGateError,
+    WalCorruptError,
+    WalDivergedError,
+)
 from onetree.wal import EventRecord
 
 
@@ -425,25 +431,125 @@ def test_invalid_referee_setting_under_protection_is_not_a_quarantine(
     assert coordinator.inspect_wal().consistent
 
 
+def break_referee_setting(git_repo: GitFixture, shape: str) -> tuple[str, str]:
+    """Make the referee setting unreadable in one of the shapes `referee.configuration`
+    refuses; returns the refusal text expected and the key to unset afterwards."""
+    if shape == "timeout":
+        git_repo.git("config", "onetree.refereeTimeout", "3O0")
+        return "invalid referee timeout", "onetree.refereeTimeout"
+    if shape == "duplicate":
+        git_repo.git("config", "onetree.referee", "/bin/true")
+        git_repo.git("config", "--add", "onetree.referee", "/bin/true")
+        return "one nonempty value", "onetree.referee"
+    if shape == "empty":
+        git_repo.git("config", "onetree.referee", "")
+        return "one nonempty value", "onetree.referee"
+    git_repo.git("config", "onetree.referee", os.fsdecode(b"/bin/\xff"))
+    return "not UTF-8", "onetree.referee"
+
+
+@pytest.mark.parametrize("shape", ["timeout", "duplicate", "empty", "not_utf8"])
 def test_recover_keeps_a_real_divergence_beside_an_unreadable_setting(
-    git_repo: GitFixture,
+    git_repo: GitFixture, shape: str,
 ) -> None:
     coordinator = protected(git_repo)
     landed = coordinator.land("alpha")
     git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
-    git_repo.git("config", "onetree.refereeTimeout", "3O0")
+    detail, key = break_referee_setting(git_repo, shape)
+    events_before = len(coordinator.wal.read().events)
     # Control: the setting alone is the typed refusal (the test above); here the
     # branch has also moved away from what the broker landed.
     with pytest.raises(WalDivergedError) as caught:
         coordinator.recover()
-    kinds = {item["kind"] for item in caught.value.details["divergences"]}
-    assert {"landed_not_on_target", "referee_config"} <= kinds
-    assert "workspace_changed" not in kinds
-    # Correcting the setting does not make the divergence go away.
-    git_repo.git("config", "--unset", "onetree.refereeTimeout")
+    reported = {item["kind"]: item["detail"] for item in caught.value.details["divergences"]}
+    assert set(reported) == {"landed_not_on_target", "referee_config"}
+    assert detail in reported["referee_config"]
+    # The row recovery records carries the same two items, the setting's detail included
+    # (Round BF3 DUO: the error was asserted, the row was not).
+    events = coordinator.wal.read().events
+    assert len(events) == events_before + 1
+    row = events[-1]
+    assert (row.kind, row.data["action"], row.data["reason"]) == (
+        "refused", "recover", "branch_diverged",
+    )
+    assert {item["kind"]: item["detail"] for item in row.data["divergences"]} == reported
+    # Correcting the setting does not make the divergence go away: the audit now reads
+    # the workspace and finds the same external move, a new divergence set recorded once.
+    git_repo.git("config", "--unset-all", key)
     with pytest.raises(WalDivergedError) as still:
         coordinator.recover()
-    assert "landed_not_on_target" in {item["kind"] for item in still.value.details["divergences"]}
+    kinds = {item["kind"] for item in still.value.details["divergences"]}
+    assert kinds == {"landed_not_on_target", "workspace_changed"}
+    events = coordinator.wal.read().events
+    assert len(events) == events_before + 2
+    assert {item["kind"] for item in events[-1].data["divergences"]} == kinds
+    with pytest.raises(WalDivergedError):
+        coordinator.recover()
+    assert len(coordinator.wal.read().events) == events_before + 2
+
+
+def test_recover_cli_human_mode_names_every_divergence(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The JSON payload carried both items; the human register said only that the branch
+    and the WAL disagree (Round BF3 DUO)."""
+    coordinator = protected(git_repo)
+    landed = coordinator.land("alpha")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    break_referee_setting(git_repo, "timeout")
+    assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    summary, *items = captured.err.splitlines()
+    assert summary.startswith("onetree: the branch and the WAL disagree")
+    assert any(line.startswith("  landed_not_on_target at refs/heads/main: ") for line in items)
+    assert any(
+        line.startswith("  referee_config at HEAD: ") and "invalid referee timeout" in line
+        for line in items
+    )
+
+
+def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`.git/config` may include a path git expands per operator (`~`): the setting is the
+    repository's, its content is whatever each peer's HOME holds. Measured 2026-09-10
+    (Round BF3 DUO, task #164): a peer whose HOME reads another referee is refused by the
+    epoch comparison, and the peer whose HOME matches is refused by the payload gate,
+    whose child has no HOME by design, so its git cannot expand the include (git's
+    diagnostic reaches the refusal only as far as the gate forwards its stderr). Nobody
+    lands while the include is per-operator, and nothing is silent. This fixture asserts
+    that shape; a mechanism that admits HOME for path expansion, or refuses such
+    includes by name, flips it."""
+    homes: dict[str, Path] = {}
+    for peer, command in (("alpha", "/bin/true"), ("beta", "/bin/false")):
+        homes[peer] = tmp_path / peer
+        homes[peer].mkdir()
+        git_repo.git("config", "--file", str(homes[peer] / "referee.gitconfig"),
+                     "onetree.referee", command)
+    git_repo.git("config", "include.path", "~/referee.gitconfig")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(homes["alpha"]))
+    coordinator = protected(git_repo)
+    # RED control: one repository, one `local`-scope setting, two contents.
+    assert referee.configuration(coordinator.repo) == ("/bin/true", referee.DEFAULT_TIMEOUT)
+    monkeypatch.setenv("HOME", str(homes["beta"]))
+    assert referee.configuration(coordinator.repo) == ("/bin/false", referee.DEFAULT_TIMEOUT)
+    with pytest.raises(LandingRefusedError) as other_home:
+        coordinator.land("alpha")
+    assert other_home.value.details["reason"] == "workspace_changed"
+    assert "referee configuration changed" in str(other_home.value)
+    monkeypatch.setenv("HOME", str(homes["alpha"]))
+    with pytest.raises(PayloadGateError) as same_home:
+        coordinator.land("alpha")
+    assert "wrote to stderr" in str(same_home.value)
+    assert same_home.value.details["stderr"]
+    assert git_repo.oid() == git_repo.base
+    # Control: a path git expands nowhere reads the same for every peer and lands.
+    git_repo.git("config", "include.path", str(homes["alpha"] / "referee.gitconfig"))
+    landed = coordinator.land("alpha")
+    assert landed.referee_receipt["command"] == "/bin/true"
+    assert git_repo.oid() == landed.commit
 
 
 def test_recover_cli_names_the_setting_not_a_divergence(
@@ -559,7 +665,8 @@ def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture, sh
     """The two shapes task #151 records, each asserting the branch of the guard it reaches.
 
     `routine`: an entry older than `gc.reflogExpire` (90 days) sits inside the recorded
-    prefix and default expiry removes it, so the prefix digest no longer matches.
+    prefix and default expiry removes it, so the log is shorter than the recorded prefix
+    (the guard's length clause; the digest clause is the equal-length rewrite test's).
     `emptied`: `--expire=now` leaves no entries at all. A #151 reconciliation flips the
     shape it addresses; neither is the desired outcome for an unmoved workspace.
     """

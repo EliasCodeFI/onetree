@@ -10,11 +10,19 @@ CI, Gate 2 battery and live parent fleet receipts.
 `onetree.referee` is an owner-configured command, parsed as quoted arguments
 without a shell. It is read from the repository's own configuration: the
 `local` and `worktree` scopes as git reports them (`.git/config` with its
-includes followed, and `.git/config.worktree`), which every peer of the one
-tree shares. The operator's global and system files, the command-line scope
+includes followed, and `.git/config.worktree`), both reached through the
+`.git/config` every peer of the one tree shares. An include whose path git
+expands per operator (`~`) is the repository's setting with each peer's
+content: a peer whose HOME reads another referee is refused by the epoch
+comparison, and under the payload gate — whose child has no HOME — nobody
+lands until the include names one path for everyone (measured 2026-09-10,
+task #164). The operator's global and system files, the command-line scope
 and the `GIT_CONFIG*` environment do not decide which referee runs or with
-what timeout, so every peer observes the pair the protected epoch records. A
-value in both repository scopes is a duplicate and refuses. A shell pipeline requires an explicitly named shell in that
+what timeout, so every peer observes the pair the protected epoch records;
+the environment names are dropped before git runs, and the scope filter is
+what drops a system file, which no environment can remove. A value in both
+repository scopes is a duplicate and refuses; a value git cannot hand over as
+UTF-8 text refuses as `referee_config`. A shell pipeline requires an explicitly named shell in that
 command. Its executable and external dependencies are trusted operator inputs;
 this is a test runner, not a sandbox for hostile commands. A missing setting
 is explicitly reported as `not_configured`, meaning structural checks only.
@@ -85,8 +93,13 @@ the fence window), `wal --json` reports a `referee_config` divergence,
 `wal --recover` refuses as `referee_config` without recording a
 `branch_diverged` row, and correcting the setting is the whole remedy. When the
 branch has also diverged from the WAL, recovery reports both (`wal_diverged`
-with a `referee_config` item beside the branch divergence) and correcting the
-setting leaves the divergence to reconcile. Do not remove the WAL or disable
+with a `referee_config` item beside the branch divergence, in the JSON payload
+and as one stderr line per item in the human register) and records that set
+as one `branch_diverged` row; correcting the setting leaves the divergence to
+reconcile, and the audit that can now read the workspace reports the external
+move as `workspace_changed` beside it — a new divergence set, recorded once.
+One row per distinct set for the life of the WAL: an identical set recurring
+later is not recorded again. Do not remove the WAL or disable
 the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
@@ -288,3 +301,39 @@ behaviour reds against `08d0216`, the BF2 CI step mismatching on the newline
 value, twelve guard-neutralised runs failing, the `/proc/self/cwd/bin` boundary
 listed as accepted). Gates at the BF3 commit: ruff clean, strict mypy clean,
 575 passed / 30 skipped, coverage 91.53%.
+
+### Round BF4 (fix round after the Round BF3 DUO, 2026-09-10)
+
+The Round BF3 DUO read `08d0216..8aec20f`: the adversarial review returned
+clean and the silent-failure hunt returned new-debt. Its major finding is a
+guard with no fixture that could fail: the scope filter's exclusion of the
+`system` and `command` scopes was measured for `global` alone, because the
+broker drops every environment name that would inject or redirect those scopes
+before git runs, so no test could hand the filter a `system` or `command` pair
+— and a system file is the one input no environment can remove. Round BF4
+changes one behaviour, the human register of `wal --recover`, and closes the
+unmeasured guards with fixtures:
+
+| Unmeasured guard or gap | Fixture | Observed red |
+| --- | --- | --- |
+| scope filter admitting `system` / `command` | `test_system_and_command_scopes_are_not_the_repositorys[system, command]` — the redirecting names are admitted into the broker's environment on purpose, so the pair reaches the filter | filter widened to `!= "global"`: the red referee ran |
+| referee stream refusals: non-UTF-8 value (real input), exit other than 0/1, unterminated stream, odd field count | `test_unreadable_referee_configuration_is_a_typed_refusal[not_utf8, exit_128, unterminated, odd_fields]` | each arm neutralised in turn: no refusal |
+| recovery's `branch_diverged` row asserted only through the raised error; one refusal shape sampled | `test_recover_keeps_a_real_divergence_beside_an_unreadable_setting[timeout, duplicate, empty, not_utf8]` reads the row, its `referee_config` detail, and the second set after correction | row recorded without the item: passed at `8aec20f` |
+| human-mode `wal --recover` named neither item | `test_recover_cli_human_mode_names_every_divergence` | summary line only at `8aec20f` |
+| per-operator include (`~`) in `.git/config`: the doc said both scopes are shared | `test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate` | epoch comparison neutralised: the other HOME's referee ran silently |
+| `head_ref` / `symbolic_head` non-1 exit proven against a fake only | the head_ref test writes `ref: refs/heads/a..b` into `.git/HEAD` and reads both | exit 128 mapped to `detached`: passed |
+
+The reflog-expiry fixture's docstring now names the clause the routine shape
+reaches (the log is shorter than the recorded prefix; the digest clause is the
+equal-length rewrite test's). The referee docstring and this document say
+"reached through `.git/config`" rather than "live under `.git/`", and record
+what a `~` include does under the gate (task #164 carries the allowlist
+decision that would change it).
+
+Receipt: `round-bf4-red-first.txt` in the local evidence directory (one
+behaviour red against `8aec20f`, four fixtures green there as expected, eleven
+guard-neutralised runs failing, the three touched files green as the control;
+a first run's control failed once on a stale `__pycache__` entry compiled from
+a same-length mutant, and the harness now runs without bytecode). Gates at the
+BF4 commit: ruff clean, strict mypy clean, 586 passed / 30 skipped, coverage
+91.78%.

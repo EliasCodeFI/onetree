@@ -36,13 +36,19 @@ def configuration(repo: Repository) -> tuple[str | None, float]:
 
     The protected epoch records this pair and every peer must observe the same one, so
     only the repository's own scopes count: what git reports as `local` (`.git/config`
-    with its includes followed) and `worktree` (`.git/config.worktree`), both of which
-    live under `.git/` and are shared by every peer of the one tree. The operator's
-    global and system files and the command-line scope are not the repository's.
+    with its includes followed) and `worktree` (`.git/config.worktree`), both reached
+    through `.git/config`, which every peer of the one tree shares. An include whose path
+    git expands per operator (`~`) is still the repository's setting, but its content is
+    each peer's; the epoch comparison makes that difference a refusal, not a silent choice
+    of referee. The operator's global and system files and the command-line scope are not
+    the repository's: the broker's environment already drops the names that would inject
+    the command scope or redirect the read (`Repository._environment`), and this filter is
+    the only thing that drops a system file, which no environment can remove.
     Measured 2026-09-10: an effective-scope read ran a global red referee the repository
     never configured and put a global timeout into the epoch (Round BF DUO); a `--local`
     read skipped `[include]` and `config.worktree` and demoted a repository-configured
-    red referee to `not_configured` (Round BF2 DUO).
+    red referee to `not_configured` (Round BF2 DUO); the `system` exclusion had no fixture
+    that could fail, because no test could hand this filter a `system` pair (Round BF3 DUO).
     """
     values: list[str | None] = []
     for key in ("onetree.referee", "onetree.refereeTimeout"):

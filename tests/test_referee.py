@@ -18,6 +18,7 @@ from test_cli import _json_call
 from onetree import referee
 from onetree.core import Coordinator
 from onetree.errors import LandingRefusedError, WalCorruptError
+from onetree.git import Repository
 from onetree.wal import EventRecord
 
 
@@ -203,6 +204,84 @@ def test_repository_includes_and_worktree_config_are_the_repositorys(
     assert caught.value.details["reason"] == "referee_red"
     assert caught.value.details["referee_receipt"]["command"] == red
     assert git_repo.oid() == git_repo.base
+
+
+@pytest.mark.parametrize("scope", ["system", "command"])
+def test_system_and_command_scopes_are_not_the_repositorys(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
+) -> None:
+    """The broker drops the environment that would redirect its own `git config`, so no
+    test can hand the scope filter a `system` or `command` pair through the front door
+    and the filter's exclusion of both had no fixture that could fail (Round BF3 DUO).
+    Here the redirecting names are admitted into the broker's environment on purpose:
+    the pair reaches the filter, and the filter alone must drop it -- a system file is
+    exactly the input no environment pop can remove."""
+    red = "/bin/false"
+    if scope == "system":
+        system_file = tmp_path / "system.gitconfig"
+        git_repo.git("config", "--file", str(system_file), "onetree.referee", red)
+        admitted = {"GIT_CONFIG_SYSTEM": str(system_file)}
+        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    else:
+        admitted = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "onetree.referee",
+                    "GIT_CONFIG_VALUE_0": red}
+    for name, value in admitted.items():
+        monkeypatch.setenv(name, value)
+    original = Repository._environment
+
+    def admitting(index: Path | None = None) -> dict[str, str]:
+        environment = original(index)
+        environment.update(admitted)
+        return environment
+
+    monkeypatch.setattr(Repository, "_environment", staticmethod(admitting))
+    coordinator = staged(git_repo)
+    # RED control: the pair now reaches the read, labelled with its scope; a filter
+    # admitting that scope would run the red command.
+    reported = coordinator.repo.git(
+        "config", "--null", "--show-scope", "--get-all", "onetree.referee",
+    ).stdout
+    assert reported == f"{scope}\0{red}\0".encode()
+    assert referee.configuration(coordinator.repo) == (None, referee.DEFAULT_TIMEOUT)
+    landed = coordinator.land("alpha")
+    assert landed.referee_receipt["result"] == "not_configured"
+    assert git_repo.changed_paths(landed.commit) == {"a.txt"}
+
+
+@pytest.mark.parametrize("shape", ["not_utf8", "exit_128", "unterminated", "odd_fields"])
+def test_unreadable_referee_configuration_is_a_typed_refusal(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch, shape: str,
+) -> None:
+    """A value git cannot hand over as UTF-8 text is a real repository input; the other
+    three are streams `git config --null --show-scope` does not produce, and the parser
+    refuses them rather than guessing at pairs (uncovered arms, Round BF3 DUO)."""
+    coordinator = staged(git_repo)
+    if shape == "not_utf8":
+        git_repo.git("config", "onetree.referee", os.fsdecode(b"/bin/\xff"))
+        # RED control: git reports one local pair whose value is not UTF-8.
+        raw = coordinator.repo.git(
+            "config", "--null", "--show-scope", "--get-all", "onetree.referee",
+        ).stdout
+        assert raw == b"local\0/bin/\xff\0"
+        expected = "not UTF-8"
+    else:
+        returncode, stdout = {
+            "exit_128": (128, b"local\0/bin/true\0"),
+            "unterminated": (0, b"local\0/bin/true"),
+            "odd_fields": (0, b"local\0"),
+        }[shape]
+        fake = subprocess.CompletedProcess(["git", "config"], returncode, stdout=stdout,
+                                           stderr=b"")
+        monkeypatch.setattr(coordinator.repo, "git", lambda *arguments, **options: fake)
+        expected = "cannot read referee configuration"
+    with pytest.raises(LandingRefusedError, match=expected) as caught:
+        referee.configuration(coordinator.repo)
+    assert caught.value.details["reason"] == "referee_config"
+    if shape == "not_utf8":
+        with pytest.raises(LandingRefusedError) as refused:
+            coordinator.land("alpha")
+        assert refused.value.details["reason"] == "referee_config"
+        assert git_repo.oid() == git_repo.base
 
 
 def test_referee_in_both_local_and_worktree_scope_is_a_duplicate(git_repo: GitFixture) -> None:

@@ -617,10 +617,21 @@ def test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached(
     git_repo.git("checkout", "--quiet", "--detach")
     with pytest.raises(GitError, match="detached"):
         repository.head_ref()
+    assert repository.symbolic_head() is None
+    # A real input reaches the arm (Round BF3 DUO: it was proven against a fake only):
+    # HEAD naming a ref git refuses to resolve. The repository still opens.
+    (git_repo.root / ".git" / "HEAD").write_text("ref: refs/heads/a..b\n", encoding="utf-8")
+    reopened = Repository(git_repo.root)
+    for read in (reopened.head_ref, reopened.symbolic_head):
+        with pytest.raises(GitError, match="cannot read HEAD: fatal: No such ref: HEAD") as real:
+            read()
+        assert "detached" not in str(real.value)
     monkeypatch.setattr(repository, "git", lambda *arguments, **options: failed)
     with pytest.raises(GitError, match="unable to parse command-line config") as caught:
         repository.head_ref()
     assert "detached" not in str(caught.value)
+    with pytest.raises(GitError, match="unable to parse command-line config"):
+        repository.symbolic_head()
 
 
 def test_git_invocation_relabels_only_operating_system_errors(

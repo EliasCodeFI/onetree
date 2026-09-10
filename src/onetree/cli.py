@@ -357,15 +357,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OnetreeError as error:
         payload = {"ok": False, "error": error.payload()}
         pending_divergence = 0
+        divergences: list[dict[str, Any]] = []
         if args.command == "wal" and args.recover and isinstance(error, WalDivergedError):
             pending_divergence = int(error.details.get("pending", 0))
+            divergences = list(error.details.get("divergences", []))
             payload["recovery"] = {
                 "consistent": False,
                 "pending": pending_divergence,
                 "repaired": error.details.get("repaired", 0),
                 "refused": error.details.get("refused", 0),
                 "locks": error.details.get("locks", []),
-                "divergences": error.details.get("divergences", []),
+                "divergences": divergences,
             }
         if json_output:
             _emit(payload, True, "")
@@ -376,6 +378,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else ""
             )
             sys.stderr.write(f"onetree: {error}{suffix}\n")
+            # Each divergence names what the operator must reconcile; a second item
+            # beside the branch divergence (an unreadable referee setting) was reported
+            # in the JSON payload only (Round BF3 DUO).
+            for item in divergences:
+                sys.stderr.write(f"  {item['kind']} at {item['target']}: {item['detail']}\n")
         return error.exit_code
 
     _emit(payload, json_output, human)
