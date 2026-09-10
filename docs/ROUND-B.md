@@ -62,12 +62,21 @@ prevent unrestricted same-user Git commands from running or restore unstaged
 work already erased. Sampling leaves a window between a check and a later
 external write. Suppressing and restoring every distinguishing observation
 can escape detection; reflog suppression/rewriting is refused when observable.
+The evidence is the reflog, so only operations that move a ref are visible:
+`checkout -- <path>`, `restore`, `read-tree -u` and `checkout-index` erase
+unstaged peer work without a reflog transition and are not detected (measured
+2026-09-10; the same damage from `reset --hard` is). Routine reflog expiry by
+`git gc` rewrites the recorded prefix and quarantines an unmoved workspace;
+the reconciliation that lifts it is task #151, not this round.
 This boundary is the explicit compensating guard for the measured bare-Git
 bypass. Harness-only hooks are not the protection mechanism.
 
 A quarantined baseline is not silently refreshed by `protect`, registration,
 or ordinary recovery. Reconciliation requires a separate explicit operator
-disposition. Do not remove the WAL or disable the guard to restore a green
+disposition. An unreadable referee setting under protection is not a
+quarantine: it refuses as `referee_config` (or `referee_config_changed` inside
+the fence window), `wal --json` reports a `referee_config` divergence, and
+correcting the setting is the whole remedy. Do not remove the WAL or disable the guard to restore a green
 status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
@@ -132,7 +141,9 @@ session death at the final fence, and claim expiry under a directory claim.
 The corrected focused run passed 55 checks. Both independent review lenses
 accepted the runtime and final exact-path changes and released their freezes.
 The final full run passed 559 tests in 206.07 seconds with 90.79% coverage,
-including the real estate payload-gate cases. Ruff and strict mypy passed.
+including the real estate payload-gate cases; that count needs
+`ONETREE_TEST_ESTATE_GATE` set. CI sets nothing and runs 529 passed with 30
+skipped per matrix leg (run 34425990890). Ruff and strict mypy passed.
 The bounded detection decision is `3a9692e15528`; it does not authorize a
 workspace reconciliation or replace the remaining cutover gates.
 
@@ -156,3 +167,27 @@ Local evidence is retained in
 `round-b-full-v4.txt` / `round-b-full-v4.xml`.
 The disposable reset used the admitted fixture operation under the owner's
 previously approved scope. No production repository was reset.
+
+### Round BF (fix round after the Round B DUO, 2026-09-10)
+
+Two DUO seats read the Round B diff at `15842ba`: the adversarial review
+returned new-debt and the silent-failure hunt returned execution-miss, because
+guards this document states as delivered (the at-fence re-check, reflog prefix
+rewrite detection) had no fixture that fails without them. Round BF fixes
+three behaviours and adds the missing fixtures:
+
+| Defect or unmeasured guard | Fixture | Observed red |
+| --- | --- | --- |
+| `GIT_CONFIG` in the lander's environment demoted a configured red referee to `not_configured` and the candidate landed | `test_inherited_git_config_environment_cannot_demote_a_red_referee` | `DID NOT RAISE` at `15842ba` |
+| An unreadable referee setting under protection refused as `workspace_changed` | `test_invalid_referee_setting_under_protection_is_not_a_quarantine`, `test_setting_broken_inside_the_fence_window_is_a_configuration_change` | reason `workspace_changed` at `15842ba` |
+| A `land_intent` without referee evidence, or naming another referee, replayed under a protected epoch | `test_forged_intent_evidence_is_refused_on_replay` | `DID NOT RAISE WalCorruptError` at `15842ba` |
+| Reflog prefix rewrite, malformed transition, dead-lander intent skip, unlogged external move, at-fence re-check, silent baseline replacement, landing outside the protected branch, intent referee checks, duplicate or empty setting, verdict/exit agreement, narrow child environment, process-group kill, referee stdout capture | the correspondingly named tests in `test_workspace_guard.py` and `test_referee.py` | each fails with its guard neutralised in a scratch clone |
+
+Receipts: `round-bf-prefix-red.txt` (the three defects against pre-fix source)
+and `round-bf-red-first.txt` (fifteen guard-neutralised runs, all failing) in
+the local evidence directory named above. The shared-index preservation claim
+in `DESIGN.md` gained its direct byte-level measurement
+(`test_build_leaves_shared_index_and_worktree_untouched`), and the INV6
+control now executes the fail-open reference evaluator instead of asserting a
+tautology. CI additionally refuses a runner environment without `HOME` or with
+a relative `PATH` entry (measured on run 34425990890).

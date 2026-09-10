@@ -3,29 +3,38 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
 from conftest import GitFixture
 
-from onetree.core import Coordinator
+from onetree.core import ClaimInfo, Coordinator
 from onetree.errors import ClaimConflictError, InvalidPathError
 
 
+def _unsafe_holders(store: Iterable[ClaimInfo], raw: str) -> list[str]:
+    """The fail-open evaluator INV6 forbids, kept as a test fixture.
+
+    It manufactures an absolute key by resolving the raw input against the process
+    cwd and matches stored claims by that key. It never validates the input, so a
+    relative path yields a key no repo-relative stored claim can match, and the
+    answer for a path someone holds is "no holders".
+    """
+    key = str(Path(raw).resolve())
+    return [
+        claim.actor
+        for claim in store
+        if claim.path == key or key.startswith(f"{claim.path}/")
+    ]
+
+
 def test_inv6_invalid_paths_refuse_and_conflicts_name_holder(
-    git_repo: GitFixture, tmp_path: Path
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     alpha = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     coordinator.register_session("beta", pid=os.getpid(), ttl=300)
-
-    # RED control: resolving a relative/nonexistent path alone manufactures an
-    # absolute-looking key and would report no holders. This is the measured
-    # fail-open shape from the reference implementation that INV6 forbids.
-    unsafe_key = str(Path("does-not-exist").resolve())
-    assert Path(unsafe_key).is_absolute()
-    assert not Path(unsafe_key).exists()
-    assert [] == []  # the unsafe evaluator's empty warnings/holders outcome
 
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
@@ -45,6 +54,17 @@ def test_inv6_invalid_paths_refuse_and_conflicts_name_holder(
     verdict = coordinator.check("beta", str(git_repo.root / "a.txt"))
     assert verdict.blocked is True
     assert [holder.actor for holder in verdict.holders] == ["alpha"]
+
+    # RED control, executed: from the repository root the unsafe evaluator resolves
+    # "a.txt" to an absolute key, matches no stored claim, and reports that nobody
+    # holds a path alpha holds. A safe evaluator would name alpha here, and the
+    # shipped one refuses the same input with a typed error instead of answering.
+    monkeypatch.chdir(git_repo.root)
+    assert _unsafe_holders(verdict.holders, "a.txt") == []
+    with pytest.raises(InvalidPathError) as relative:
+        coordinator.check("beta", "a.txt")
+    assert relative.value.details["reason"] == "relative"
+
     with pytest.raises(ClaimConflictError) as conflict:
         coordinator.claim("beta", [str(git_repo.root / "a.txt")])
     assert conflict.value.details["holders"] == ["alpha"]

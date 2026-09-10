@@ -850,6 +850,21 @@ class Coordinator:
                     raise WalCorruptError("intent has a failed referee", oid=event.oid)
                 if data["referee_receipt"]["baseline"] != intent_head:
                     raise WalCorruptError("referee baseline differs from intent", oid=event.oid)
+            if (state.workspace_epoch is not None
+                    and intent_target == state.workspace_epoch["target"]):
+                # The epoch records which referee guards the shared branch. The broker
+                # that honours it never writes an intent without that referee's
+                # evidence, so an intent lacking it, or carrying another referee's,
+                # did not come from the broker.
+                if "referee_receipt" not in data:
+                    raise WalCorruptError("protected intent has no referee evidence",
+                                          oid=event.oid)
+                receipt = data["referee_receipt"]
+                if [receipt["command"], receipt["timeout_seconds"]] != list(
+                    state.workspace_epoch["referee"]
+                ):
+                    raise WalCorruptError("protected intent evidence names another referee",
+                                          oid=event.oid)
             state.pending[operation] = event
             if (state.workspace_epoch is not None
                     and intent_target == state.workspace_epoch["target"]):
@@ -1515,11 +1530,19 @@ class Coordinator:
                     reason="nothing_staged",
                     paths=[],
                 )
-            violation = self._workspace_violation(state)
+            invalidated = [change.path for change in changes]
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config", invalidated
+                ):
+                    continue
+                raise LandingRefusedError("invalid referee configuration",
+                                          reason="referee_config", paths=invalidated) from None
             if state.workspace_epoch is not None and target_ref != state.workspace_epoch["target"]:
                 violation = "landing target is outside the protected shared branch"
             if violation is not None:
-                invalidated = [change.path for change in changes]
                 if not self._record_land_refusal(
                     state, snapshot, actor, operation, "workspace_changed", invalidated
                 ):
@@ -1704,7 +1727,19 @@ class Coordinator:
             )
             if checkpoint is not None:
                 checkpoint("before_intent", context)
-            violation = self._workspace_violation(state)
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError:
+                # The configuration was readable when the candidate was audited, so an
+                # unreadable one here is a change, the same refusal the unprotected
+                # path records below.
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed before admission",
+                                          reason="referee_config_changed",
+                                          paths=payload_paths) from None
             if violation is not None:
                 if not self._record_land_refusal(
                     state, snapshot, actor, operation, "workspace_changed", payload_paths
@@ -2092,9 +2127,15 @@ class Coordinator:
                     for audit_target in targets
                 )
             divergences = (*boundaries, *self._divergences(state, heads))
-            violation = self._workspace_violation(state)
-            if violation is not None:
-                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError as refusal:
+                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
+            else:
+                if violation is not None:
+                    divergences = (
+                        *divergences, Divergence("workspace_changed", "HEAD", violation)
+                    )
             now = time.time()
             sessions = tuple(
                 sorted(actor for actor in state.sessions if state.session_active(actor, now))
@@ -2301,9 +2342,15 @@ class Coordinator:
             self._verify_landed(state)
             heads = self._audit_heads(state, target)
             divergences = self._divergences(state, heads)
-            violation = self._workspace_violation(state)
-            if violation is not None:
-                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError as refusal:
+                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
+            else:
+                if violation is not None:
+                    divergences = (
+                        *divergences, Divergence("workspace_changed", "HEAD", violation)
+                    )
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if not divergences:

@@ -24,8 +24,13 @@ def test_tests_import_onetree_from_the_checkout_under_test() -> None:
     )
 
 
-def test_ci_covers_every_supported_python_minor_and_uses_node24_actions() -> None:
-    """The workflow must exercise 3.11-3.13 without deprecated Node 20 actions."""
+def test_ci_covers_every_supported_python_minor_and_pins_the_admitted_action_revisions() -> None:
+    """The workflow must exercise 3.11-3.13 and run only the admitted action revisions.
+
+    Whether a revision runs on Node 24 is measured when it is admitted, not here: this
+    test cannot see an action's `action.yml`, so a sha bump to a Node 20 revision passes
+    it. The setup-uv sha below was measured `using: "node24"` on 2026-09-10.
+    """
 
     workflow_lines = {
         line.strip()

@@ -3,13 +3,16 @@ from __future__ import annotations
 import copy
 import os
 import shlex
+import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture
+from conftest import _GIT_EXECUTABLE, GitFixture
+from test_cli import _json_call
 
 from onetree import referee
 from onetree.core import Coordinator
@@ -17,9 +20,21 @@ from onetree.errors import LandingRefusedError, WalCorruptError
 from onetree.wal import EventRecord
 
 
+def referee_command(code: str) -> str:
+    return shlex.join([sys.executable, "-I", "-S", "-c", code])
+
+
 def configure(git_repo: GitFixture, code: str) -> None:
-    command = shlex.join([sys.executable, "-I", "-S", "-c", code])
-    git_repo.git("config", "onetree.referee", command)
+    git_repo.git("config", "onetree.referee", referee_command(code))
+
+
+def inherited_config_values(git_repo: GitFixture, key: str) -> list[str]:
+    """What `git config` answers for `key` under the test process's own environment."""
+    completed = subprocess.run(
+        [_GIT_EXECUTABLE, "-C", str(git_repo.root), "config", "--null", "--get-all", key],
+        check=False, capture_output=True, env=os.environ.copy(),
+    )
+    return [item.decode() for item in completed.stdout.split(b"\0") if item]
 
 
 def staged(git_repo: GitFixture, actor: str = "alpha", path: str = "a.txt") -> Coordinator:
@@ -68,11 +83,93 @@ def test_referee_timeout_never_moves_target(git_repo: GitFixture) -> None:
     configure(git_repo, "import time; time.sleep(10)")
     git_repo.git("config", "onetree.refereeTimeout", "0.05")
     coordinator = staged(git_repo)
+    started = time.monotonic()
     with pytest.raises(LandingRefusedError) as caught:
         coordinator.land("alpha")
+    elapsed = time.monotonic() - started
     assert caught.value.details["reason"] == "referee_timeout"
     assert git_repo.oid() == git_repo.base
-    assert coordinator.inspect_wal().events[-1].data["referee_receipt"]["result"] == "timeout"
+    receipt = coordinator.inspect_wal().events[-1].data["referee_receipt"]
+    assert receipt["result"] == "timeout"
+    # The referee slept for 10 s. A landing that returns well inside that window
+    # killed the process group; one that waited for the sleeper did not.
+    assert elapsed < 5
+    assert receipt["duration_seconds"] < 5
+
+
+@pytest.mark.parametrize("channel", ["GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                                     "GIT_CONFIG_GLOBAL"])
+def test_inherited_git_config_environment_cannot_demote_a_red_referee(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
+) -> None:
+    configure(git_repo, "raise SystemExit(3)")
+    red = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
+    coordinator = staged(git_repo)
+    if channel == "GIT_CONFIG":
+        # The deprecated redirect: `git config` reads this file instead of the repository.
+        empty = tmp_path / "empty-config"
+        empty.write_text("", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG", str(empty))
+    elif channel == "GIT_CONFIG_PARAMETERS":
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'onetree.referee=/bin/true'")
+    elif channel == "GIT_CONFIG_COUNT":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "onetree.referee")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/bin/true")
+    else:
+        alternate = tmp_path / "global-config"
+        alternate.write_text("[onetree]\n\treferee = /bin/true\n", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(alternate))
+
+    # RED control: under the environment the lander inherits, git itself no longer
+    # answers with the one red command, so an evaluator reading through that
+    # environment would run no referee or a different one.
+    assert inherited_config_values(git_repo, "onetree.referee") != [red]
+
+    with pytest.raises(LandingRefusedError) as caught:
+        coordinator.land("alpha")
+    assert caught.value.details["reason"] == "referee_red"
+    assert caught.value.details["referee_receipt"]["command"] == red
+    assert git_repo.oid() == git_repo.base
+
+
+def test_duplicate_or_empty_referee_setting_is_a_typed_refusal(git_repo: GitFixture) -> None:
+    git_repo.git("config", "onetree.referee", referee_command("raise SystemExit(9)"))
+    git_repo.git("config", "--add", "onetree.referee", referee_command("pass"))
+    coordinator = staged(git_repo)
+    # RED control: an evaluator that took the first value would run the red
+    # referee and refuse for its verdict; one that took the last would land.
+    assert len(inherited_config_values(git_repo, "onetree.referee")) == 2
+    with pytest.raises(LandingRefusedError) as duplicate:
+        coordinator.land("alpha")
+    assert duplicate.value.details["reason"] == "referee_config"
+    assert git_repo.oid() == git_repo.base
+
+    git_repo.git("config", "--unset-all", "onetree.referee")
+    git_repo.git("config", "onetree.referee", "")
+    with pytest.raises(LandingRefusedError) as empty:
+        coordinator.land("alpha")
+    assert empty.value.details["reason"] == "referee_config"
+    assert git_repo.oid() == git_repo.base
+
+    git_repo.git("config", "--unset-all", "onetree.referee")
+    configure(git_repo, "pass")
+    assert coordinator.land("alpha").referee_receipt["result"] == "pass"
+
+
+def test_referee_child_sees_only_the_admitted_environment(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure(git_repo, "import os; raise SystemExit(3 if 'ONETREE_TEST_CANARY' in os.environ "
+              "else 0)")
+    monkeypatch.setenv("ONETREE_TEST_CANARY", "leaked")
+    command = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
+    # RED control: the same command run with the inherited environment sees the
+    # canary and exits red, so a referee child that inherited would refuse below.
+    inherited = subprocess.run(shlex.split(command), check=False, env=os.environ.copy())
+    assert inherited.returncode == 3
+    landed = staged(git_repo).land("alpha")
+    assert landed.referee_receipt["result"] == "pass"
 
 
 def test_referee_retests_candidate_after_wal_and_target_race(git_repo: GitFixture) -> None:
@@ -167,7 +264,9 @@ def test_missing_program_is_an_unexecuted_error(git_repo: GitFixture) -> None:
     assert caught.value.details["reason"] == "referee_error"
 
 
-def test_referee_output_is_bounded_and_kept_out_of_cli_stdout(git_repo: GitFixture) -> None:
+def test_referee_output_is_bounded_and_kept_out_of_cli_stdout(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
     configure(git_repo, "import sys; print('x' * 5000); print('bad', file=sys.stderr); "
               "raise SystemExit(8)")
     with pytest.raises(LandingRefusedError) as caught:
@@ -176,6 +275,15 @@ def test_referee_output_is_bounded_and_kept_out_of_cli_stdout(git_repo: GitFixtu
     assert receipt["output_truncated"] is True
     assert len(receipt["stdout_tail"]) == 4096
     assert receipt["stderr_tail"] == "bad\n"
+
+    # The CLI's JSON stdout is exactly one object; the referee's own printing
+    # reaches it only inside the recorded receipt tail.
+    configure(git_repo, "print('JUNK-NOT-JSON'); raise SystemExit(5)")
+    code, payload = _json_call(capsys, ["land", "--repo", str(git_repo.root), "--session", "alpha"])
+    assert code != 0
+    assert payload["ok"] is False
+    assert payload["error"]["reason"] == "referee_red"
+    assert payload["error"]["referee_receipt"]["stdout_tail"] == "JUNK-NOT-JSON\n"
 
 
 def test_referee_configuration_change_at_fence_refuses(git_repo: GitFixture) -> None:
@@ -246,6 +354,29 @@ def test_referee_receipt_semantics_reject_inconsistent_evidence(
     receipt[field] = value
     with pytest.raises(ValueError, match="referee|localization"):
         referee.validate_receipt(receipt)
+
+
+@pytest.mark.parametrize(("patch", "message"), [
+    ({"result": "red", "returncode": 0}, "red referee has no failed exit"),
+    ({"result": "red", "returncode": None}, "red referee has no failed exit"),
+    ({"result": "timeout", "returncode": 1}, "unobserved exit"),
+    ({"result": "not_configured", "returncode": 0, "command": None, "tested": []},
+     "unobserved exit"),
+])
+def test_receipt_verdict_and_exit_must_agree(
+    git_repo: GitFixture, patch: dict[str, Any], message: str,
+) -> None:
+    configure(git_repo, "pass")
+    receipt = copy.deepcopy(dict(staged(git_repo).land("alpha").referee_receipt))
+    receipt.update(patch)
+    with pytest.raises(ValueError, match=message):
+        referee.validate_receipt(receipt)
+    # Control: the same verdict with the exit it implies is accepted.
+    if patch["result"] == "red":
+        receipt["returncode"] = 1
+    else:
+        receipt["returncode"] = None
+    referee.validate_receipt(receipt)
 
 
 def test_red_verdict_is_not_retried_to_green_after_wal_race(

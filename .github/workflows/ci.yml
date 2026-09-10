@@ -27,6 +27,23 @@ jobs:
         with:
           version: "0.12.3"
           enable-cache: false
+      - name: Require HOME and an absolute PATH on the runner
+        # Measured 2026-09-10 (run 34425990890): with HOME unset, setup-uv prepends
+        # "undefined/.local/bin" to PATH, a cwd-relative entry a checked-out file
+        # could satisfy before /usr/bin/git. Refuse that environment instead of
+        # running the gates inside it.
+        run: |
+          if [ -z "${HOME:-}" ]; then
+            echo '::error::HOME is unset on this runner.'
+            exit 1
+          fi
+          IFS=: read -r -a entries <<< "$PATH"
+          for entry in "${entries[@]}"; do
+            case "$entry" in
+              /*) ;;
+              *) echo "::error::PATH carries a relative entry '$entry'."; exit 1 ;;
+            esac
+          done
       - name: Prepare standalone Python
         env:
           UV_PYTHON_INSTALL_DIR: ${{ runner.tool_cache }}/uv-python

@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from onetree import referee
-from onetree.errors import GitError, LandingRefusedError
+from onetree.errors import GitError
 from onetree.git import Repository
 
 
@@ -72,11 +72,20 @@ def validate(value: Any, repo: Repository) -> None:
 def violation(
     repo: Repository, epoch: Mapping[str, Any], transitions: Sequence[tuple[str, str]],
 ) -> str | None:
+    """Name what changed in the protected workspace, or None when nothing did.
+
+    An unreadable referee configuration is not a workspace change: it propagates as
+    the referee's own typed refusal (`referee_config`) so the operator fixes the
+    setting instead of being sent to baseline reconciliation.
+    """
     try:
         if not _enabled(repo):
             return "workspace reflog evidence is unavailable or disabled"
-        if list(referee.configuration(repo)) != epoch["referee"]:
-            return "protected referee configuration changed"
+    except GitError as error:
+        return "workspace observation failed: " + str(error)
+    if list(referee.configuration(repo)) != epoch["referee"]:
+        return "protected referee configuration changed"
+    try:
         if repo.symbolic_head() != epoch["target"]:
             return "shared HEAD changed branch or became detached"
         observed = repo.require_commit(str(epoch["target"]))
@@ -104,6 +113,6 @@ def violation(
                 tip = new
             if tip != observed:
                 return "workspace target moved without continuous reflog evidence"
-    except (OSError, UnicodeError, ValueError, GitError, LandingRefusedError) as error:
+    except (OSError, UnicodeError, ValueError, GitError) as error:
         return "workspace observation failed: " + str(error)
     return None

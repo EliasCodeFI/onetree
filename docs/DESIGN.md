@@ -39,10 +39,14 @@ this document is the implementation contract for the first two rounds.
    unresolved localization. Red and timed-out candidates remain refused.
    Minimality and localization-cost claims require supporting evidence
    (see `docs/ROUND-B-AMENDMENT.md`). Plus: Git-layer detection of unexplained
-   branch operations (`switch`/`checkout`/destructive `reset`) in a protected
-   shared clone, with persistent refusal of subsequent landings. This does not
-   prevent the external operation or recover erased unstaged work; the measured
-   boundary and evidence-loss residuals are explicit in `docs/ROUND-B.md`.
+   ref transitions recorded in the reflog of a protected shared clone (`switch`,
+   `checkout <branch>`, destructive `reset`, `stash`, a bare commit), with
+   persistent refusal of subsequent landings. Working-tree operations that move
+   no ref leave no reflog transition and are NOT detected: `checkout -- <path>`,
+   `restore`, `read-tree -u`, `checkout-index` erase unstaged peer work
+   unobserved (measured 2026-09-10). This does not prevent the external
+   operation or recover erased unstaged work; the measured boundary and
+   evidence-loss residuals are explicit in `docs/ROUND-B.md`.
    A typed rejection
    contract that names exactly the invalidated paths so a session repairs
    minimally.

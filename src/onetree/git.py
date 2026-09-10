@@ -518,7 +518,24 @@ class Repository:
             "GIT_SHALLOW_FILE",
             "GIT_TEST_COMMIT_GRAPH",
             "GIT_TEST_MULTI_PACK_INDEX",
+            # The referee command and the workspace guard's reflog switch are read
+            # through `git config`. Each of these names redirects or extends what
+            # that read returns from outside the repository, so an inherited value
+            # decides which referee runs, or whether one runs at all. GIT_CONFIG
+            # alone was measured demoting a configured red referee to
+            # `not_configured` and landing the candidate (Round B DUO, 2026-09-10).
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
         ):
+            environment.pop(name, None)
+        for name in [
+            key for key in environment
+            if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        ]:
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
         environment.setdefault("GIT_AUTHOR_EMAIL", "onetree@localhost")
