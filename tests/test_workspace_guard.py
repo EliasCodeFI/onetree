@@ -558,78 +558,129 @@ def test_recover_row_identity_excludes_the_detail(git_repo: GitFixture) -> None:
 
 def test_recover_row_identity_includes_the_commit(git_repo: GitFixture) -> None:
     """The other half of the identity: two divergences of one kind on one target that
-    name different commits are two sets, each recorded (Round BF5 DUO: a key of kind and
-    target alone left the suite green while the second divergence went unrecorded)."""
+    differ in the commit alone are two sets, each recorded (Round BF5 DUO: a key of kind
+    and target alone left the suite green while the second divergence went unrecorded).
+    The input that separates two sets by the commit alone is adoption. A broker
+    candidate's operation is a function of its commit (the trailer is in the message),
+    but `wal --adopt` records one witness operation per commit and admits the same
+    operation across commits, so two adopted siblings share an operation and differ in
+    the commit. Round BF6's shape differed in both halves and could not tell either half
+    from the other; no shipped input separates two sets by the operation alone (Round BF6
+    DUO)."""
     coordinator = Coordinator(git_repo.root)
-    session = coordinator.register_session("alpha", pid=os.getpid())
-    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
-    git_repo.write("a.txt", "first\n")
-    git_repo.stage(session.index_path, "a.txt")
-    first = coordinator.land("alpha")
-    # Hand-move the branch back, so the next landing builds on the baseline and the first
-    # landing is no longer on the target.
-    git_repo.git("update-ref", "refs/heads/main", git_repo.base, first.commit)
+    operation = "0123456789abcdef" * 2
+    tree = coordinator.repo.git_text("show", "-s", "--format=%T", git_repo.base)
+    first, second = (
+        coordinator.repo.git_text(
+            "commit-tree", tree, "-p", git_repo.base,
+            input_bytes=f"{name} hand landing\n\nOnetree-Operation: {operation}\n".encode(),
+        )
+        for name in ("first", "second")
+    )
+    assert first != second
+    # Each sibling heads the branch while it is adopted; the second adoption records the
+    # operation the first already carries, under another commit.
+    assert coordinator.repo.update_ref("refs/heads/main", first, git_repo.base)
+    adopted = coordinator.adopt_landings()
+    assert [(e.data["commit"], e.data["operation"]) for e in adopted.adopted] == [
+        (first, operation),
+    ]
+    assert coordinator.repo.update_ref("refs/heads/main", second, first)
+    adopted = coordinator.adopt_landings()
+    assert [(e.data["commit"], e.data["operation"]) for e in adopted.adopted] == [
+        (second, operation),
+    ]
+    # The branch heads the second sibling: the first is off the target.
     with pytest.raises(WalDivergedError) as diverged:
         coordinator.recover()
-    assert [(item["kind"], item["commit"]) for item in diverged.value.details["divergences"]] == [
-        ("landed_not_on_target", first.commit),
-    ]
+    assert [
+        (item["kind"], item["commit"], item["operation"])
+        for item in diverged.value.details["divergences"]
+    ] == [("landed_not_on_target", first, operation)]
     rows = [
         event for event in coordinator.wal.read().events
         if event.kind == "refused" and event.data.get("action") == "recover"
     ]
     assert len(rows) == 1
-    # A second landing on the moved branch, then the branch moved to the first commit:
-    # the same kind on the same target now names the second commit -- a different set.
-    git_repo.write("a.txt", "second\n")
-    git_repo.stage(session.index_path, "a.txt")
-    second = coordinator.land("alpha")
-    assert second.commit != first.commit
-    git_repo.git("update-ref", "refs/heads/main", first.commit, second.commit)
+    # The branch moved to the first sibling: the same kind, target and operation now name
+    # the second commit -- a different set.
+    git_repo.git("update-ref", "refs/heads/main", first, second)
     with pytest.raises(WalDivergedError) as again:
         coordinator.recover()
-    assert [(item["kind"], item["commit"]) for item in again.value.details["divergences"]] == [
-        ("landed_not_on_target", second.commit),
-    ]
+    assert [
+        (item["kind"], item["commit"], item["operation"])
+        for item in again.value.details["divergences"]
+    ] == [("landed_not_on_target", second, operation)]
     rows = [
         event for event in coordinator.wal.read().events
         if event.kind == "refused" and event.data.get("action") == "recover"
     ]
     assert len(rows) == 2
-    assert [row.data["divergences"][0]["commit"] for row in rows] == [first.commit, second.commit]
-    assert [row.data["divergences"][0]["operation"] for row in rows] == [
-        first.operation, second.operation,
-    ]
+    assert [row.data["divergences"][0]["commit"] for row in rows] == [first, second]
+    assert {row.data["divergences"][0]["operation"] for row in rows} == {operation}
 
 
 def test_recover_cli_human_mode_keeps_each_item_on_one_line(
     git_repo: GitFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A detail that carries newlines (a `workspace_changed` detail embeds git's stderr,
+    """A detail that carries line breaks (a `workspace_changed` detail embeds git's stderr,
     which can be several lines) is still one stderr line per item; the fragment would
     otherwise start a line of its own at column 0. No shipped producer of such a detail
     was demonstrated (Round BF5 DUO), so the input is synthetic: the reflog-switch read
-    raising a two-line git failure."""
+    raising a git failure whose message carries every break a line reader honours --
+    LF, CR, NEL and LINE SEPARATOR -- so a collapse of the newline alone fails it (Round
+    BF6 DUO)."""
     coordinator = protected(git_repo)
     coordinator.land("alpha")
+    breaks = "fatal: bad config line 3 in file .git/config\nhint: fix\rthe\x85file\u2028now"
 
     def failing(repo: Any) -> bool:
-        raise GitError("fatal: bad config line 3 in file .git/config\nhint: fix the file")
+        raise GitError(breaks)
 
     monkeypatch.setattr(workspace, "_enabled", failing)
     assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
+    assert len(breaks.splitlines()) == 5
     summary, *items = captured.err.splitlines()
     assert summary.startswith("onetree: the branch and the WAL disagree")
     assert len(items) == 1
     assert items[0].startswith("  workspace_changed at HEAD: workspace observation failed: ")
-    assert "bad config line 3 in file .git/config hint: fix the file" in items[0]
+    assert "bad config line 3 in file .git/config hint: fix the file now" in items[0]
     # Control: the JSON payload keeps the detail's newline.
     code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
     assert code == 2
     assert [item["kind"] for item in payload["recovery"]["divergences"]] == ["workspace_changed"]
     assert "\n" in payload["recovery"]["divergences"][0]["detail"]
+
+
+def test_cli_human_mode_keeps_the_summary_on_one_line(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The summary line `onetree: ...` is one line as well. The input is shipped, not
+    synthetic: `.git/config` includes a path git expands per operator while the broker's
+    environment has no HOME, so the broker's own git dies before any command runs and the
+    GitError carries git's two-line diagnostic; without the collapse the `fatal:` line
+    started at column 0 as if it were a second message (Round BF6 DUO). JSON carries the
+    message as git wrote it."""
+    git_repo.git("config", "include.path", "~/referee.gitconfig")
+    monkeypatch.delenv("HOME")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("\n") == 1
+    assert captured.err.startswith("onetree: git ")
+    assert (
+        "could not expand include path '~/referee.gitconfig' fatal: bad config line"
+        in captured.err
+    )
+    code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
+    assert code == 2
+    assert payload["error"]["type"] == "git_error"
+    assert "could not expand include path '~/referee.gitconfig'\nfatal: bad config line" in (
+        payload["error"]["message"]
+    )
 
 
 def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate(

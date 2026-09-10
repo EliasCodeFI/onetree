@@ -15,11 +15,13 @@ includes followed, and `.git/config.worktree`), both reached through the
 expands per operator (`~`) is the repository's setting with each peer's
 content: under protection a peer whose HOME reads another referee is refused
 by the epoch comparison, and the payload gate — whose audit children run
-without HOME whatever the caller holds — refuses every peer until the include
-names one path for everyone (the shipped gate as `payload_gate_degraded` with
-a WAL row naming the include; past the gate, the referee's own clone runs
-without HOME as well and refuses `referee_error`; measured 2026-09-10, task
-#164). The operator's global and system files, the command-line scope
+without HOME whatever the caller holds, on the `commit` path the broker
+invokes — refuses every peer until the include names one path for everyone
+(the shipped gate as `payload_gate_degraded` with a WAL row naming the
+include; past the gate, the referee's own clone runs without HOME as well and
+refuses `referee_error`; measured 2026-09-10, task #164; the gate's
+index-check path is another matter — its safe.directory probe forwards HOME,
+and without HOME the probe's own failure is the DEGRADED there). The operator's global and system files, the command-line scope
 and the `GIT_CONFIG*` environment do not decide which referee runs or with
 what timeout, so every peer observes the pair the protected epoch records;
 the environment names that inject or redirect are dropped before git runs,
@@ -413,7 +415,7 @@ behaviour:
 
 | Claim without its measurement | Fixture | Observed red (first failure line, `round-bf6-red-first.txt`) |
 | --- | --- | --- |
-| identity includes commit and operation | `test_recover_row_identity_includes_the_commit`: two landings, the branch hand-moved twice, two `landed_not_on_target` sets naming different commits, two rows | key reduced to kind and target: `assert 1 == 2` on the row count — the second set is not recorded |
+| identity includes the commit (as first written: "commit and operation", a conjunction this fixture could not distinguish — its two sets differed in both halves, so either half alone kept it green; Round BF7 reshaped it) | `test_recover_row_identity_includes_the_commit` at `4320afd`: two landings, the branch hand-moved twice, two `landed_not_on_target` sets naming different commits, two rows | key reduced to kind and target: `assert 1 == 2` on the row count — the second set is not recorded |
 | one stderr line per item whatever the detail carries | `test_recover_cli_human_mode_keeps_each_item_on_one_line`: the reflog-switch read raising a two-line git failure (synthetic; no shipped producer demonstrated) | collapse removed: `assert 2 == 1` on the item-line count — the fragment starts its own line |
 
 Prose: the BF4 cell reads `assert False` as the run showed; the contract
@@ -425,5 +427,51 @@ control set precisely.
 
 Receipt: `round-bf6-red-first.txt` (two fixtures green at `7a46fb7` as
 expected, two guard-neutralised runs failing with their first failure line,
-the touched test files green as the control). Gates at the BF6 commit are in
-the commit message.
+the touched test files green as the control). Gates at the BF6 commit: ruff
+clean, strict mypy clean, 589 passed / 31 skipped, coverage 91.78%; CI run
+34509398536 three legs success (91.81/91.81/91.78%).
+
+### Round BF7 (fix round after the Round BF6 DUO, 2026-09-10)
+
+The Round BF6 DUO read `7a46fb7..4320afd`; both seats returned new-debt, no
+execution-miss. The identity claim above stated a conjunction its fixture
+could not distinguish: the two sets differed in commit and operation both, so
+a key without the operation (620 passed with the estate gate) and a key
+without the commit (both identity fixtures green) kept the suite green, and
+only dropping both gave the receipted red. The shipped input that separates
+two sets by the commit alone is adoption — a broker candidate's operation is a
+function of its commit (the trailer is in the message), but `wal --adopt`
+records one witness operation per commit and admits the same operation across
+commits — and no shipped input separates two sets by the operation alone
+(`state.landed` is append-only; a second pair for one commit adds an item
+inside a set, never a set). The item-line fixture sampled the newline only, so
+a collapse of `\n` alone passed it although its own line reader honours CR,
+NEL and LINE SEPARATOR as well. On an adjacent surface the round had not
+claimed, the summary line `onetree: {error}` printed a `GitError` as carried:
+git's diagnostic for an include it cannot expand is two lines, and the
+`fatal:` fragment started a line of its own at column 0. And "the audit
+children run without HOME" was over-general: on the gate's index-check path a
+safe.directory probe that forwards HOME runs first, and without HOME its own
+failure is the DEGRADED there; the broker invokes `commit` mode only, where
+that probe never runs. Round BF7 changes one behaviour — the summary line is
+one line, as the item lines are — and reshapes two fixtures:
+
+| Claim without its measurement | Fixture | Observed red (first failure line, `round-bf7-red-first.txt`) |
+| --- | --- | --- |
+| identity includes the commit | `test_recover_row_identity_includes_the_commit`: two sibling hand commits carrying one `Onetree-Operation` trailer, each adopted while it heads the branch, then each seen off the target in turn — two sets of one kind, target and operation naming different commits, two rows | key without the commit (kind, target, operation): `assert 1 == 2` on the row count; key reduced to kind and target: `assert 1 == 2`. Key without the operation (kind, target, commit): the fixture passes — the documented gap, observed: no shipped input separates two sets by the operation alone |
+| one stderr line per item whatever break the detail carries | `test_recover_cli_human_mode_keeps_each_item_on_one_line`: the synthetic detail carries LF, CR, NEL and LINE SEPARATOR (`splitlines()` reads five pieces) | collapse of `\n` alone: `assert 4 == 1`; collapse removed: `assert 5 == 1` |
+| the summary line is one line | `test_cli_human_mode_keeps_the_summary_on_one_line`: `.git/config` includes `~/referee.gitconfig` and the broker runs without HOME, so its own git dies with git's two-line diagnostic (shipped input); JSON keeps the newline | at `4320afd`: `assert 2 == 1` on the stderr line count; collapse removed: `assert 2 == 1` |
+
+Prose: the estate-gate docstring and the contract paragraph name the gate's
+`commit` mode as the path whose audit children run without HOME and the
+index-check probe as the exception; the BF6 table's first claim reads as
+measured. The BF6 commit message's sentence "the gate's safe.directory probe
+child forwards HOME and does not decide the verdict" stands as written and is
+true of the broker's path only.
+
+Receipt: `round-bf7-red-first.txt` (one behaviour red against `4320afd`, two
+fixtures green there as expected, five guard-neutralised runs failing with
+their first failure line, one documented gap observed green, four test files
+green as the control — the two the commit touches, `test_cli.py` for the
+summary line's other callers and `test_referee.py`, the estate-gate file under
+the shipped gate). Gates at the BF7 commit are in the commit message.

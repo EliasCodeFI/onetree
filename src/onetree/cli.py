@@ -377,7 +377,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pending_divergence
                 else ""
             )
-            sys.stderr.write(f"onetree: {error}{suffix}\n")
+            # The summary is one line whatever the message carries: a GitError carries
+            # git's stderr, two lines for an include git cannot expand (Round BF6 DUO).
+            message = " ".join(str(error).split())
+            sys.stderr.write(f"onetree: {message}{suffix}\n")
             # Each divergence names what the operator must reconcile; a second item
             # beside the branch divergence (an unreadable referee setting) was reported
             # in the JSON payload only (Round BF3 DUO). The detail says "this commit";

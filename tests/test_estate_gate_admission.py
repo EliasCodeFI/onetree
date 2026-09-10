@@ -234,10 +234,12 @@ def test_real_gate_refuses_a_per_operator_include_as_degraded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shipped gate's audit children -- the git processes whose reads decide its verdict
-    -- run without HOME whatever the caller holds, so a `~` include in `.git/config` fails
-    their config read; the gate reports DEGRADED naming the include and the broker refuses
-    `payload_gate_degraded` with a WAL row. The stub
+    """On the path the broker invokes -- the gate's `commit` mode -- the audit children
+    whose reads decide the verdict run without HOME whatever the caller holds, so a `~`
+    include in `.git/config` fails their config read; the gate reports DEGRADED naming the
+    include and the broker refuses `payload_gate_degraded` with a WAL row. The gate's
+    index-check mode is not this path: there a safe.directory probe that forwards HOME
+    runs first, and without HOME its own failure is the DEGRADED (Round BF6 DUO). The stub
     gate of the ordinary suite dies on the same input (`PayloadGateError`, no row); the
     workspace-guard fixture asserts that shape, this one the shipped gate's (Round BF4
     DUO, task #164)."""
