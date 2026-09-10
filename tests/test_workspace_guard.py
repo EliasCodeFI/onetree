@@ -556,6 +556,82 @@ def test_recover_row_identity_excludes_the_detail(git_repo: GitFixture) -> None:
     assert {item["kind"]: item["detail"] for item in events[-1].data["divergences"]} == first_row
 
 
+def test_recover_row_identity_includes_the_commit(git_repo: GitFixture) -> None:
+    """The other half of the identity: two divergences of one kind on one target that
+    name different commits are two sets, each recorded (Round BF5 DUO: a key of kind and
+    target alone left the suite green while the second divergence went unrecorded)."""
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("alpha", pid=os.getpid())
+    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
+    git_repo.write("a.txt", "first\n")
+    git_repo.stage(session.index_path, "a.txt")
+    first = coordinator.land("alpha")
+    # Hand-move the branch back, so the next landing builds on the baseline and the first
+    # landing is no longer on the target.
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, first.commit)
+    with pytest.raises(WalDivergedError) as diverged:
+        coordinator.recover()
+    assert [(item["kind"], item["commit"]) for item in diverged.value.details["divergences"]] == [
+        ("landed_not_on_target", first.commit),
+    ]
+    rows = [
+        event for event in coordinator.wal.read().events
+        if event.kind == "refused" and event.data.get("action") == "recover"
+    ]
+    assert len(rows) == 1
+    # A second landing on the moved branch, then the branch moved to the first commit:
+    # the same kind on the same target now names the second commit -- a different set.
+    git_repo.write("a.txt", "second\n")
+    git_repo.stage(session.index_path, "a.txt")
+    second = coordinator.land("alpha")
+    assert second.commit != first.commit
+    git_repo.git("update-ref", "refs/heads/main", first.commit, second.commit)
+    with pytest.raises(WalDivergedError) as again:
+        coordinator.recover()
+    assert [(item["kind"], item["commit"]) for item in again.value.details["divergences"]] == [
+        ("landed_not_on_target", second.commit),
+    ]
+    rows = [
+        event for event in coordinator.wal.read().events
+        if event.kind == "refused" and event.data.get("action") == "recover"
+    ]
+    assert len(rows) == 2
+    assert [row.data["divergences"][0]["commit"] for row in rows] == [first.commit, second.commit]
+    assert [row.data["divergences"][0]["operation"] for row in rows] == [
+        first.operation, second.operation,
+    ]
+
+
+def test_recover_cli_human_mode_keeps_each_item_on_one_line(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detail that carries newlines (a `workspace_changed` detail embeds git's stderr,
+    which can be several lines) is still one stderr line per item; the fragment would
+    otherwise start a line of its own at column 0. No shipped producer of such a detail
+    was demonstrated (Round BF5 DUO), so the input is synthetic: the reflog-switch read
+    raising a two-line git failure."""
+    coordinator = protected(git_repo)
+    coordinator.land("alpha")
+
+    def failing(repo: Any) -> bool:
+        raise GitError("fatal: bad config line 3 in file .git/config\nhint: fix the file")
+
+    monkeypatch.setattr(workspace, "_enabled", failing)
+    assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    summary, *items = captured.err.splitlines()
+    assert summary.startswith("onetree: the branch and the WAL disagree")
+    assert len(items) == 1
+    assert items[0].startswith("  workspace_changed at HEAD: workspace observation failed: ")
+    assert "bad config line 3 in file .git/config hint: fix the file" in items[0]
+    # Control: the JSON payload keeps the detail's newline.
+    code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
+    assert code == 2
+    assert [item["kind"] for item in payload["recovery"]["divergences"]] == ["workspace_changed"]
+    assert "\n" in payload["recovery"]["divergences"][0]["detail"]
+
+
 def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate(
     git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,8 +646,12 @@ def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_
     traceback retained, no WAL row); the shipped gate returns DEGRADED naming the include
     and the broker refuses `payload_gate_degraded` with a WAL row -- the estate-gate
     variant in test_estate_gate_admission.py asserts that shape. A mechanism that refuses
-    such includes by name flips both; admitting HOME to the broker's environment (#164)
-    flips neither, because the shipped gate strips HOME from its own git children."""
+    such includes by name flips both. HOME already reaches the broker's own git; the
+    environments without it are the gate child's and the referee's clone. Admitting HOME
+    to the gate child's allowlist flips the stub-gate arm only -- the stub then says CLEAN
+    and the referee stage's HOME-less `git clone --shared` refuses `referee_error` on the
+    same include (Round BF5 DUO) -- while the shipped gate strips HOME from its own git
+    children whatever it receives, so its arm stays (task #164)."""
     homes: dict[str, Path] = {}
     for peer, command in (("alpha", "/bin/true"), ("beta", "/bin/false")):
         homes[peer] = tmp_path / peer

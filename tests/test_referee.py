@@ -258,7 +258,9 @@ def test_unreadable_referee_configuration_is_a_typed_refusal(
     serves the malformed stream for `onetree.referee` only and "unset" for the timeout,
     so an arm that stops refusing hands the value through instead of tripping the timeout
     parse (Round BF4 DUO: one shared stream made every arm's red an "invalid referee
-    timeout" refusal, and the fixture red only on the message)."""
+    timeout" refusal, and the fixture red only on the message). The odd-field arm is the
+    exception: without it the strict `zip` raises an untyped `ValueError`, so that arm
+    turns a crash into the typed refusal rather than an acceptance."""
     coordinator = staged(git_repo)
     if shape == "not_utf8":
         git_repo.git("config", "onetree.referee", os.fsdecode(b"/bin/\xff"))

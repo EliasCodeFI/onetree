@@ -14,10 +14,12 @@ includes followed, and `.git/config.worktree`), both reached through the
 `.git/config` every peer of the one tree shares. An include whose path git
 expands per operator (`~`) is the repository's setting with each peer's
 content: under protection a peer whose HOME reads another referee is refused
-by the epoch comparison, and the payload gate — whose git children run
+by the epoch comparison, and the payload gate — whose audit children run
 without HOME whatever the caller holds — refuses every peer until the include
 names one path for everyone (the shipped gate as `payload_gate_degraded` with
-a WAL row naming the include; measured 2026-09-10, task #164). The operator's global and system files, the command-line scope
+a WAL row naming the include; past the gate, the referee's own clone runs
+without HOME as well and refuses `referee_error`; measured 2026-09-10, task
+#164). The operator's global and system files, the command-line scope
 and the `GIT_CONFIG*` environment do not decide which referee runs or with
 what timeout, so every peer observes the pair the protected epoch records;
 the environment names that inject or redirect are dropped before git runs,
@@ -323,7 +325,7 @@ unmeasured guards with fixtures:
 | scope filter admitting `system` / `command` | `test_system_and_command_scopes_are_not_the_repositorys[system, command]` — the redirecting names are admitted into the broker's environment on purpose, so the pair reaches the filter | filter widened to `!= "global"`: `assert ('/bin/false', 300.0) == (None, 300.0)` at the configuration read, before any landing |
 | referee stream refusals: non-UTF-8 value (real input), exit other than 0/1, unterminated stream, odd field count | `test_unreadable_referee_configuration_is_a_typed_refusal[not_utf8, exit_128, unterminated, odd_fields]` | at `abe35ec` (one fake stream served for both keys): `not_utf8` DID NOT RAISE; `exit_128` and `unterminated` still refused as `invalid referee timeout` and the fixture failed on the message only; `odd_fields` an untyped `ValueError` from `zip(strict=True)`. Round BF5 corrected the fake; see its table |
 | recovery's `branch_diverged` row asserted only through the raised error; one refusal shape sampled | `test_recover_keeps_a_real_divergence_beside_an_unreadable_setting[timeout, duplicate, empty, not_utf8]` reads the row, its `referee_config` detail, and the second set after correction | row recorded without the item: the row/error equality assert fails; an unchanged set re-recorded: the event-count assert fails |
-| human-mode `wal --recover` named neither item | `test_recover_cli_human_mode_names_every_divergence` | at `8aec20f`: no item line under the summary (the fixture's line count assert) |
+| human-mode `wal --recover` named neither item | `test_recover_cli_human_mode_names_every_divergence` | at `8aec20f`: `assert False` on the fixture's `any(...)` over item lines — no `landed_not_on_target` line under the summary (the BF4 fixture had no line count; that assert and its `assert 0 == 2` are Round BF5's) |
 | per-operator include (`~`) in `.git/config`: the doc said both scopes are shared | `test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate` | epoch comparison neutralised: `PayloadGateError: commit payload gate wrote to stderr` inside `pytest.raises(LandingRefusedError)` — the gate's git died on the include before any referee ran |
 | `head_ref` / `symbolic_head` non-1 exit proven against a fake only | the head_ref test writes `ref: refs/heads/a..b` into `.git/HEAD` and reads both | `head_ref` mapping exit 128 to `detached` was already failed by the fake at `8aec20f` (regex mismatch); the `symbolic_head` mapping passed there and the new fixture is what fails it (`DID NOT RAISE GitError`) |
 
@@ -386,6 +388,42 @@ observed green against `/home/anvil/.claude/tools/commit_payload.py` here.
 
 Receipt: `round-bf5-red-first.txt` (one behaviour red against `abe35ec`, four
 fixtures green there as expected, thirteen guard-neutralised runs failing with
-their first failure line recorded, the four touched test files green as the
-control, the estate-gate file included with the shipped gate). Gates at the
-BF5 commit are recorded in the commit message.
+their first failure line recorded, four test files green as the control — the
+three the commit touches and `test_defensive.py`, whose head_ref case the
+neutralisations exercise — the estate-gate file under the shipped gate). Gates
+at the BF5 commit: ruff clean, strict mypy clean, 587 passed / 31 skipped,
+coverage 91.78%; CI run 34503908926 three legs success (91.81/91.81/91.78%).
+
+### Round BF6 (fix round after the Round BF5 DUO, 2026-09-10)
+
+The Round BF5 DUO read `abe35ec..7a46fb7`: the adversarial review returned
+execution-miss on one cell — the rewritten BF4 human-mode cell named Round
+BF5's line-count assert where the BF4 fixture had failed on its `any(...)`
+(`assert False`) — and the silent-failure hunt returned new-debt: the
+divergence-set identity was fixtured for the excluded detail only (a key of
+kind and target alone left the suite green while a second divergence naming
+another commit went unrecorded); the single-line collapse of a human-mode
+detail had no input with a newline, so its line-count assert could not fail;
+the include fixture's "flips neither" was false for HOME admitted to the gate
+child's allowlist (the stub then says CLEAN and the referee's own HOME-less
+clone refuses `referee_error` — a third layer the account had not named); and
+the stream fixture's docstring generalised "hands the value through" over the
+odd-field arm, whose removal is an untyped `ValueError`. Round BF6 changes no
+behaviour:
+
+| Claim without its measurement | Fixture | Observed red (first failure line, `round-bf6-red-first.txt`) |
+| --- | --- | --- |
+| identity includes commit and operation | `test_recover_row_identity_includes_the_commit`: two landings, the branch hand-moved twice, two `landed_not_on_target` sets naming different commits, two rows | key reduced to kind and target: `assert 1 == 2` on the row count — the second set is not recorded |
+| one stderr line per item whatever the detail carries | `test_recover_cli_human_mode_keeps_each_item_on_one_line`: the reflog-switch read raising a two-line git failure (synthetic; no shipped producer demonstrated) | collapse removed: `assert 2 == 1` on the item-line count — the fragment starts its own line |
+
+Prose: the BF4 cell reads `assert False` as the run showed; the contract
+paragraph names the referee's clone as the third HOME-less layer; the include
+fixture docstring says which arm HOME in the gate child's allowlist flips and
+why; the estate-gate docstring says "audit children"; the stream fixture
+docstring carves out the odd-field arm; the BF5 receipt line names the
+control set precisely.
+
+Receipt: `round-bf6-red-first.txt` (two fixtures green at `7a46fb7` as
+expected, two guard-neutralised runs failing with their first failure line,
+the touched test files green as the control). Gates at the BF6 commit are in
+the commit message.
