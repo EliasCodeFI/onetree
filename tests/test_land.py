@@ -129,6 +129,35 @@ def test_inv1_unclaimed_payload_refuses_whole_land_then_claimed_payload_lands(
     assert git_repo.changed_paths(landed.commit) == {"a.txt", "b.txt"}
 
 
+def test_build_leaves_shared_index_and_worktree_untouched(git_repo: GitFixture) -> None:
+    coordinator = Coordinator(git_repo.root)
+    session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
+    git_repo.write("a.txt", "a1\n")
+    git_repo.stage(session.index_path, "a.txt")
+
+    shared_index = git_repo.root / ".git" / "index"
+    tracked = ("a.txt", "b.txt", "nested/c.txt")
+    index_before = shared_index.read_bytes()
+    index_mtime_before = shared_index.stat().st_mtime_ns
+    worktree_before = {path: (git_repo.root / path).read_bytes() for path in tracked}
+
+    landed = coordinator.land("alpha", message="shared index stays put")
+
+    assert git_repo.oid() == landed.commit
+    assert git_repo.changed_paths(landed.commit) == {"a.txt"}
+    assert shared_index.read_bytes() == index_before
+    assert shared_index.stat().st_mtime_ns == index_mtime_before
+    assert {path: (git_repo.root / path).read_bytes() for path in tracked} == worktree_before
+
+    # RED control: a plain `git add` against the shared index moves the same bytes
+    # this test reads, so the equalities above can fail for a landing that writes
+    # through the shared index.
+    git_repo.write("b.txt", "b1\n")
+    git_repo.git("add", "--", "b.txt")
+    assert shared_index.read_bytes() != index_before
+
+
 def test_inv2_release_between_audit_and_cas_breaks_fence_then_reclaim_allows(
     git_repo: GitFixture,
 ) -> None:

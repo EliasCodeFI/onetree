@@ -77,10 +77,16 @@ Round AF added the last of those, since `check .git/config` had answered
 repository-relative POSIX paths. Directory claims cover descendants, and a
 batch claim is all-or-nothing. A conflict reports the current actor id in both
 the typed exception and JSON output. A deleted claimed path remains releasable
-through `release` with no path arguments.
+through `release` with no path arguments; the estate claim-lifecycle addition
+also supports naming the deleted path explicitly.
 
 This deliberately follows INV6 even though it means a new file is claimed via
-an existing parent directory before creation.
+an existing parent directory before creation. After creation, `narrow PARENT
+CHILD...` retains existing descendants and surrenders the exact parent claim in
+one WAL ref update. New children inherit the parent deadline; other claims and
+their generations survive. Pending landings that fence the parent refuse the
+operation. See `ROUND-ATOMIC-NARROW.md` for the contract and measured gap in the
+former release-then-claim procedure.
 
 ### WAL representation and recovery
 

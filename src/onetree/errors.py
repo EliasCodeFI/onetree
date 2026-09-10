@@ -25,6 +25,12 @@ class GitError(OnetreeError):
     kind = "git_error"
 
 
+class PayloadGateError(OnetreeError):
+    """The configured commit-payload gate could not produce a trusted verdict."""
+
+    kind = "payload_gate_error"
+
+
 class UnsupportedWorktreeError(OnetreeError):
     """Gate 1 coordination was invoked from a linked Git worktree."""
 
@@ -114,4 +120,11 @@ class ReleaseRefusedError(OnetreeError):
     """A release requested claims that the actor does not hold."""
 
     kind = "release_refused"
+    exit_code = 1
+
+
+class NarrowRefusedError(OnetreeError):
+    """Narrowing requires an unchanged owned parent without pending landings."""
+
+    kind = "narrow_refused"
     exit_code = 1

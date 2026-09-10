@@ -1,4 +1,4 @@
-"""Command-line adapter for the Round A broker."""
+"""Command-line interface for shared-tree coordination."""
 
 from __future__ import annotations
 
@@ -33,6 +33,11 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Report version and build phase.")
     _add_output(status)
 
+    protect = subparsers.add_parser("protect", help="Protect the current shared branch baseline.")
+    _add_repo(protect)
+    _add_actor(protect)
+    _add_output(protect)
+
     session = subparsers.add_parser("session", help="Register or inspect a session index.")
     _add_repo(session)
     _add_actor(session)
@@ -50,6 +55,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(claim)
     claim.add_argument("--ttl", type=float, default=86400.0, help="Claim lease seconds.")
     _add_output(claim)
+
+    narrow = subparsers.add_parser("narrow", help="Atomically retain descendants of a held path.")
+    narrow.add_argument("parent", help="Absolute path of the exact claim to surrender.")
+    narrow.add_argument("paths", nargs="+", help="Absolute existing descendants to retain.")
+    _add_repo(narrow)
+    _add_actor(narrow)
+    _add_output(narrow)
 
     release = subparsers.add_parser("release", help="Release selected paths or all held paths.")
     release.add_argument("paths", nargs="*")
@@ -69,6 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
     land.add_argument(
         "--target",
         help="Full refs/heads target (required while HEAD is detached).",
+    )
+    land.add_argument(
+        "--commit-payload",
+        help=(
+            "Path to commit_payload.py (default: ONETREE_COMMIT_PAYLOAD; "
+            "landing refuses when neither is set)."
+        ),
     )
     land.add_argument("-m", "--message", help="Commit message.")
     _add_output(land)
@@ -116,6 +135,13 @@ def _actor(explicit: str | None) -> str:
     return candidates.pop()
 
 
+def _one_line(text: str) -> str:
+    """One stderr line per message: every boundary a line reader honours becomes a
+    space, and the message's own spacing stays (a path with two spaces is that path).
+    JSON carries the message as written."""
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
 def _emit(payload: Mapping[str, Any], json_output: bool, human: str) -> None:
     if json_output:
         sys.stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
@@ -137,13 +163,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": True,
             "name": "onetree",
             "version": __version__,
-            "phase": "gate-1-round-a",
+            "phase": "gate-1-round-b",
         }
-        _emit(payload, json_output, f"onetree {__version__} (phase: gate-1-round-a)")
+        _emit(payload, json_output, f"onetree {__version__} (phase: gate-1-round-b)")
         return 0
 
     try:
-        coordinator = Coordinator(args.repo)
+        coordinator = Coordinator(
+            args.repo,
+            commit_payload=getattr(args, "commit_payload", None),
+        )
         if args.command == "session":
             session = coordinator.register_session(
                 _actor(args.actor),
@@ -162,6 +191,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "claim": {"claims": [claim.payload() for claim in claim_result.claims]},
             }
             human = f"claimed {len(claim_result.claims)} path(s)"
+        elif args.command == "narrow":
+            narrow_result = coordinator.narrow(_actor(args.actor), args.parent, args.paths)
+            payload = {
+                "ok": True,
+                "narrow": {
+                    "released": list(narrow_result.released),
+                    "claims": [claim.payload() for claim in narrow_result.claims],
+                },
+            }
+            human = f"narrowed {args.parent}; retained {len(narrow_result.claims)} claim(s)"
         elif args.command == "release":
             release_result = coordinator.release(_actor(args.actor), args.paths)
             payload = {
@@ -187,6 +226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if check_result.blocked
                 else f"CLEAR {check_result.path}"
             )
+        elif args.command == "protect":
+            epoch = coordinator.protect_workspace(_actor(args.actor))
+            payload = {"ok": True, "workspace": dict(epoch)}
+            human = f"protected {epoch['target']} at {epoch['tip']}"
         elif args.command == "land":
             land_result = coordinator.land(
                 _actor(args.actor),
@@ -204,6 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "operation": land_result.operation,
                     "intent": land_result.intent,
                     "warnings": list(land_result.warnings),
+                    "gate_receipt": land_result.gate_receipt,
+                    "referee_receipt": land_result.referee_receipt,
                 },
             }
             human = f"landed {land_result.commit} on {land_result.target}"
@@ -275,6 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "ref_locks": list(wal_result.ref_locks),
                     "temp_indexes": [residue.payload() for residue in wal_result.temp_indexes],
                     "events": [_event_payload(event) for event in wal_result.events],
+                    "gate_evidence": wal_result.gate_evidence(),
                 },
             }
             # The verdict leads. A human line that reads identically for a healthy
@@ -318,15 +364,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OnetreeError as error:
         payload = {"ok": False, "error": error.payload()}
         pending_divergence = 0
+        divergences: list[dict[str, Any]] = []
         if args.command == "wal" and args.recover and isinstance(error, WalDivergedError):
             pending_divergence = int(error.details.get("pending", 0))
+            divergences = list(error.details.get("divergences", []))
             payload["recovery"] = {
                 "consistent": False,
                 "pending": pending_divergence,
                 "repaired": error.details.get("repaired", 0),
                 "refused": error.details.get("refused", 0),
                 "locks": error.details.get("locks", []),
-                "divergences": error.details.get("divergences", []),
+                "divergences": divergences,
             }
         if json_output:
             _emit(payload, True, "")
@@ -336,7 +384,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pending_divergence
                 else ""
             )
-            sys.stderr.write(f"onetree: {error}{suffix}\n")
+            # The summary is one line whatever break the message carries: a GitError
+            # carries git's stderr, two lines for an include git cannot expand (Round
+            # BF6 DUO), and git passes non-ASCII breaks through (Round BF7 DUO).
+            sys.stderr.write(f"onetree: {_one_line(str(error))}{suffix}\n")
+            # Each divergence names what the operator must reconcile; a second item
+            # beside the branch divergence (an unreadable referee setting) was reported
+            # in the JSON payload only (Round BF3 DUO). The detail says "this commit";
+            # the commit and operation it means are printed with it, one line per item
+            # whatever the detail carries (Round BF4 DUO).
+            for item in divergences:
+                where = [
+                    f"{name} {item[name]}" for name in ("commit", "operation")
+                    if item.get(name) is not None
+                ]
+                suffix_text = f" ({', '.join(where)})" if where else ""
+                sys.stderr.write(
+                    f"  {item['kind']} at {item['target']}: "
+                    f"{_one_line(str(item['detail']))}{suffix_text}\n"
+                )
+            # A degraded gate names what it could not audit; the rows were in the WAL
+            # row and the JSON payload only (Round BF7 DUO).
+            for row in error.details.get("degraded") or []:
+                sys.stderr.write(f"  degraded: {_one_line(str(row))}\n")
         return error.exit_code
 
     _emit(payload, json_output, human)

@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from onetree.errors import GitError, RefCorruptError, RefLockedError, UnsupportedWorktreeError
+from onetree.errors import (
+    GitError,
+    LandingRefusedError,
+    PayloadGateError,
+    RefCorruptError,
+    RefLockedError,
+    UnsupportedWorktreeError,
+)
 from onetree.proc import process_tag
 
 _GIT_EXECUTABLE = shutil.which("git")
@@ -39,6 +50,142 @@ _TEMP_INDEX_PREFIX = "index-"
 _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z")
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
+PAYLOAD_GATE_TIMEOUT_SECONDS = 300.0
+PAYLOAD_GATE_SOURCE_SHA256 = (
+    "e20c259cfee795f064eb18fa4208c3d9ef6ea962ecd96cf8efbfe351cce4f669"
+)
+PAYLOAD_GATE_ENVIRONMENT_NAMES = (
+    "PATH",
+    "LC_ALL",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_OPTIONAL_LOCKS",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_GRAFT_FILE",
+)
+"""Required execution controls admitted for the commit-payload gate child."""
+
+PAYLOAD_GATE_IDENTITY_ENVIRONMENT_NAMES = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CODEX_THREAD_ID",
+)
+"""Optional caller identity for attribution comparison, never candidate-derived."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object, refusing any name that appears more than once.
+
+    `json.loads` resolves a repeated name last-wins and reports nothing. A verdict document
+    is trusted, so last-wins lets a forged trailing name silently override an honest earlier
+    one while the parse still succeeds. Refusing the document is the only outcome that keeps
+    "the gate said CLEAN" and "the gate said this" the same statement.
+
+    Raises `ValueError`, which the caller already treats as an unusable document.
+    """
+
+    seen: dict[str, object] = {}
+    for name, value in pairs:
+        if name in seen:
+            raise ValueError(f"duplicate key in payload gate JSON: {name!r}")
+        seen[name] = value
+    return seen
+
+
+def validate_payload_gate_receipt(value: Any) -> None:
+    """Historical evidence binds its original gate and candidate, independent of today's clone."""
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "gate_source_sha256", "expected_paths", "report"}
+        or type(value.get("version")) is not int
+        or value["version"] != 1
+    ):
+        raise ValueError("invalid gate receipt envelope")
+    digest = value["gate_source_sha256"]
+    expected = value["expected_paths"]
+    report = value["report"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("invalid gate receipt source digest")
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(path, str) or not path for path in expected)
+        or len(set(expected)) != len(expected)
+    ):
+        raise ValueError("invalid gate receipt expected paths")
+    if not isinstance(report, dict):
+        raise ValueError("invalid gate receipt report")
+    candidate = report.get("candidate")
+    if (
+        not isinstance(candidate, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", candidate) is None
+        or not isinstance(report.get("repository"), str)
+        or not report["repository"]
+        or not isinstance(report.get("staged_files"), list)
+        or any(not isinstance(path, str) for path in report["staged_files"])
+        or not isinstance(report.get("findings"), list)
+        or not isinstance(report.get("degraded"), list)
+        or report.get("verdict") not in ("CLEAN", "REFUSE", "DEGRADED")
+    ):
+        raise ValueError("invalid gate receipt report fields")
+    if report["verdict"] != "DEGRADED" and (
+        len(set(report["staged_files"])) != len(report["staged_files"])
+        or set(report["staged_files"]) != set(expected)
+    ):
+        raise ValueError("gate receipt payload differs from expected paths")
+    if report["verdict"] == "CLEAN" and (report["findings"] or report["degraded"]):
+        raise ValueError("gate receipt calls a non-empty report CLEAN")
+    evidence_fields = {"advisories", "hook_suites", "hook_suite_state"}
+    present = evidence_fields.intersection(report)
+    if present:
+        if (
+            present != evidence_fields
+            or not isinstance(report["advisories"], list)
+            or any(not isinstance(item, str) for item in report["advisories"])
+            or not isinstance(report["hook_suite_state"], str)
+            or not isinstance(report["hook_suites"], list)
+        ):
+            raise ValueError("invalid gate receipt hook evidence")
+        for suite in report["hook_suites"]:
+            if not isinstance(suite, dict) or any(
+                not isinstance(suite.get(name), str)
+                for name in (
+                    "hook_path",
+                    "suite_path",
+                    "status",
+                    "detail",
+                    "evidence",
+                    "weakening",
+                    "runtime",
+                )
+            ):
+                raise ValueError("invalid gate receipt hook suite")
+            checks = suite.get("checks")
+            if "checks" not in suite or (
+                checks is not None and (type(checks) is not int or checks < 0)
+            ):
+                raise ValueError("invalid gate receipt hook check count")
+    # A retained report must remain valid JSON, including extension fields.
+    json.dumps(value, allow_nan=False)
+
+
+def _payload_gate_receipt(
+    source_sha256: str, expected_paths: Sequence[str], report: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = {
+        "version": 1,
+        "gate_source_sha256": source_sha256,
+        "expected_paths": list(expected_paths),
+        "report": report,
+    }
+    try:
+        validate_payload_gate_receipt(receipt)
+    except (ValueError, TypeError) as error:
+        raise PayloadGateError("malformed retained gate evidence", detail=str(error)) from error
+    return receipt
 
 
 def _landing_marker_positions(line: bytes) -> tuple[int, ...]:
@@ -371,7 +518,33 @@ class Repository:
             "GIT_SHALLOW_FILE",
             "GIT_TEST_COMMIT_GRAPH",
             "GIT_TEST_MULTI_PACK_INDEX",
+            # Each of these names redirects or extends what `git config` returns,
+            # and what git itself does, from outside the repository. GIT_CONFIG
+            # alone was measured demoting a configured red referee to
+            # `not_configured` and landing the candidate (Round B DUO, 2026-09-10).
+            # The referee read keeps only the `local` and `worktree` scopes, so
+            # the command scope these names add is filtered there too; GIT_CONFIG
+            # is different: it redirects the `git config` command itself, so its
+            # pop is what keeps that read pointed at the repository at all. The
+            # first three pops also keep the guard's effective-scope
+            # `core.logAllRefUpdates` read honest (fixture: the reflog-switch
+            # channel test). The last three cannot override a local setting and
+            # have no fixture that fails without them: hygiene, not a guard.
+            # HOME and XDG_CONFIG_HOME stay: the referee child gets an admitted
+            # environment and the broker's git keeps the operator's global
+            # settings that are not referee scope.
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
         ):
+            environment.pop(name, None)
+        for name in [
+            key for key in environment
+            if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        ]:
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
         environment.setdefault("GIT_AUTHOR_EMAIL", "onetree@localhost")
@@ -388,6 +561,83 @@ class Repository:
         return environment
 
     @classmethod
+    def _payload_gate_environment(cls) -> dict[str, str]:
+        """Environment for the payload gate child, admitted by name and never inherited.
+
+        The gate's verdict is trusted, so anything that can run code inside its interpreter
+        forges that verdict outright. The interpreter flags do not reach far enough to
+        prevent it: `-I` and `-S` are read by CPython, while `ld.so` resolves `LD_PRELOAD`
+        and `LD_AUDIT` before `main()` runs, so a library named there executes ahead of every
+        control this class has. The SHA-256 pin does not help either, because it verifies the
+        bytes on disk and those are exactly the bytes the hijacked interpreter goes on to
+        read.
+
+        Subtracting known-dangerous names cannot establish the property, only narrow it: Git,
+        CPython and the loader each grow new environment controls, and under subtraction every
+        name not yet thought of is admitted by default. Admission by name inverts that. The
+        same argument, and the same shape, is used one call frame away by the gate itself.
+
+        Execution controls are chosen, not inherited. Native session identifiers are
+        separately admitted caller metadata: the gate must compare the candidate with its
+        actual caller, not with an identity derived from the candidate or the OneTree actor.
+        Most of the names are ones `_environment` sets outright. The four Git identity names
+        are not -- there they are applied with `setdefault`, which leaves a parent's own value
+        standing -- so this frame pins them again rather than forwarding what it received; a
+        forwarded value would arrive under a name the allowlist admits, and decide who a
+        commit the gate makes is attributed to. `PATH` is pinned to the platform default for
+        that reason alone: the shipped gate resolves `git` through its own default search
+        path, never through this value (measured 2026-09-02, CLEAN with a fake `git` first on
+        `PATH` and with no `git` on `PATH` at all), so a forwarded `PATH` would be the one
+        execution control that arrived ambient.
+        Empty components are dropped because an empty `PATH` entry means the working
+        directory, and the child's working directory is the repository under audit -- measured
+        on this platform, `os.defpath` carries no empty component but `PATH=":"` does resolve
+        a bare name from the working directory. That argument is POSIX-scoped: `ntpath.defpath`
+        is `'.;C:\\bin'`, whose leading `.` names the working directory outright and passes
+        through this filter untouched, so on Windows the drop would not buy what it buys here.
+        It is scoped in a second way too, and the narrower one: what this frame protects is the
+        gate's own interpreter. The shipped gate builds its git children an environment whose
+        `PATH` is `os.defpath` verbatim, empty components and all -- so on a host whose default
+        carried one, the value dropped here would be restored one frame down. Where that would
+        resolve is not uniform: five of those children per audit run in the repository under
+        audit, and the rest -- twenty of twenty-five for a four-file payload, the total tracking
+        payload size while the five does not -- run in a private temporary directory the gate
+        creates for itself, which nobody else can write. No POSIX default carries an empty
+        component, which is why the divergence is inert rather than a hole; the Windows default
+        needs no empty component to reach the working directory, and is scoped out above.
+
+        Required controls must remain available. Caller identity may be absent; preserving
+        absence lets the admitted gate report its existing comparison limitation honestly.
+        """
+        source = cls._environment()
+        environment: dict[str, str] = {
+            "PATH": os.pathsep.join(
+                entry for entry in os.defpath.split(os.pathsep) if entry
+            ),
+            "GIT_AUTHOR_NAME": "onetree session",
+            "GIT_AUTHOR_EMAIL": "onetree@localhost",
+            "GIT_COMMITTER_NAME": "onetree broker",
+            "GIT_COMMITTER_EMAIL": "onetree@localhost",
+        }
+        missing = [
+            name
+            for name in PAYLOAD_GATE_ENVIRONMENT_NAMES
+            if name not in environment and name not in source
+        ]
+        if missing:
+            raise PayloadGateError(
+                "commit payload gate environment is missing admitted names",
+                missing=",".join(sorted(missing)),
+            )
+        for name in PAYLOAD_GATE_ENVIRONMENT_NAMES:
+            if name not in environment:
+                environment[name] = source[name]
+        for name in PAYLOAD_GATE_IDENTITY_ENVIRONMENT_NAMES:
+            if name in source:
+                environment[name] = source[name]
+        return environment
+
+    @classmethod
     def _invoke(
         cls,
         cwd: Path,
@@ -395,6 +645,7 @@ class Repository:
         *,
         index: Path | None = None,
         input_bytes: bytes | None = None,
+        environment: Mapping[str, str] | None = None,
         check: bool,
     ) -> GitResult:
         try:
@@ -405,7 +656,7 @@ class Repository:
                 check=False,
                 capture_output=True,
                 input=input_bytes,
-                env=cls._environment(index),
+                env=cls._environment(index) if environment is None else environment,
             )
         except OSError as error:
             raise GitError(f"could not execute git: {error}", operation=arguments[0]) from error
@@ -663,8 +914,14 @@ class Repository:
 
     def head_ref(self) -> str:
         result = self.git("symbolic-ref", "--quiet", "HEAD", check=False)
-        if result.returncode != 0:
+        if result.returncode == 1:
             raise GitError("HEAD is detached; pass a branch ref", operation="symbolic-ref")
+        if result.returncode != 0:
+            # Any other exit is git failing to answer, not an answer of "detached"
+            # (Round BF2 DUO: a malformed GIT_CONFIG_COUNT environment was reported as
+            # a detached HEAD).
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
         reference = result.stdout.decode("ascii", errors="strict").strip()
         self.validate_branch_ref(reference)
         return reference
@@ -1029,6 +1286,25 @@ class Repository:
     def temp_index_dir(self) -> Path:
         return self.git_dir / "onetree" / "tmp"
 
+    def payload_gate_dir(self) -> Path:
+        """Where the broker keeps its private copy of the admitted gate bytes.
+
+        A sibling of the temporary-index directory rather than a member of it: the index
+        sweeper decides what to reclaim by name prefix, and a gate copy that outlives a
+        SIGKILL must not be reclaimable by a rule written for a different kind of residue.
+
+        The choice of location is a control, not a convenience. ``tempfile`` resolves its
+        default from ``TMPDIR``, so a broker started with ``TMPDIR`` set writes the copy it
+        is about to execute onto a filesystem the caller named -- and a filesystem the caller
+        controls can serve different bytes to the interpreter's read than the ones the broker
+        wrote and hashed. Anchoring to the git directory removes the variable: the copy lands
+        where the repository already keeps broker-owned state, on the repository's own
+        filesystem, and the document's claim that it sits inside the repository becomes
+        checkable rather than merely stated.
+        """
+
+        return self.git_dir / "onetree" / "gate"
+
     def new_temp_index(self) -> Path:
         """Reserve an owner-tagged temporary index path.
 
@@ -1148,6 +1424,214 @@ class Repository:
             arguments.extend(("-p", parent))
         oid = self.git_text(*arguments, input_bytes=(message.rstrip("\n") + "\n").encode())
         return self.validate_oid(oid, label="commit")
+
+    def audit_commit_payload(
+        self,
+        commit: str,
+        expected_paths: Sequence[str],
+        gate_source: Path | str | None,
+    ) -> dict[str, Any]:
+        """Require an exact CLEAN verdict over one immutable candidate commit."""
+
+        commit = self.validate_oid(commit, label="candidate commit")
+        if gate_source is None or not str(gate_source).strip():
+            raise PayloadGateError(
+                "commit payload gate is not configured",
+                environment="ONETREE_COMMIT_PAYLOAD",
+            )
+        try:
+            gate = Path(gate_source).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise PayloadGateError(
+                f"commit payload gate cannot be resolved: {error}",
+                gate=str(gate_source),
+            ) from error
+        if not gate.is_file():
+            raise PayloadGateError(
+                "commit payload gate is not a regular file",
+                gate=str(gate),
+            )
+        try:
+            gate_bytes = gate.read_bytes()
+            gate_source_sha256 = hashlib.sha256(gate_bytes).hexdigest()
+        except OSError as error:
+            raise PayloadGateError(
+                f"commit payload gate source could not be read: {error}",
+                gate=str(gate),
+            ) from error
+        if gate_source_sha256 != PAYLOAD_GATE_SOURCE_SHA256:
+            raise PayloadGateError(
+                "commit payload gate source does not match admitted SHA-256",
+                gate=str(gate),
+                expected_sha256=PAYLOAD_GATE_SOURCE_SHA256,
+                observed_sha256=gate_source_sha256,
+            )
+
+        gate_directory = self.payload_gate_dir()
+        try:
+            gate_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise PayloadGateError(
+                f"commit payload gate directory could not be created: {error}",
+                directory=str(gate_directory),
+            ) from error
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="onetree-payload-gate-", dir=gate_directory
+            ) as temporary:
+                pinned_gate = Path(temporary) / "commit_payload.py"
+                pinned_gate.write_bytes(gate_bytes)
+                pinned_gate.chmod(stat.S_IRUSR)
+                arguments = (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    str(pinned_gate),
+                    "commit",
+                    commit,
+                    "--repo",
+                    str(self.root),
+                    "--json",
+                )
+                completed = subprocess.run(  # noqa: S603 - exact Python + source argv
+                    arguments,
+                    check=False,
+                    capture_output=True,
+                    cwd=self.root,
+                    env=self._payload_gate_environment(),
+                    timeout=PAYLOAD_GATE_TIMEOUT_SECONDS,
+                )
+        except subprocess.TimeoutExpired as error:
+            raise PayloadGateError(
+                "commit payload gate timed out",
+                gate=str(gate),
+                timeout_seconds=PAYLOAD_GATE_TIMEOUT_SECONDS,
+            ) from error
+        except OSError as error:
+            raise PayloadGateError(
+                f"could not execute commit payload gate: {error}",
+                gate=str(gate),
+            ) from error
+
+        try:
+            source_sha256_after = hashlib.sha256(gate.read_bytes()).hexdigest()
+        except OSError as error:
+            raise PayloadGateError(
+                f"commit payload gate source could not be re-read: {error}",
+                gate=str(gate),
+            ) from error
+        if source_sha256_after != gate_source_sha256:
+            raise PayloadGateError(
+                "commit payload gate source changed while executing",
+                gate=str(gate),
+                before_sha256=gate_source_sha256,
+                after_sha256=source_sha256_after,
+            )
+
+        if completed.stderr:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise PayloadGateError(
+                "commit payload gate wrote to stderr",
+                gate=str(gate),
+                returncode=completed.returncode,
+                stderr=detail,
+            )
+        try:
+            decoded = completed.stdout.decode("utf-8", errors="strict")
+            payload = json.loads(decoded, object_pairs_hook=_reject_duplicate_keys)
+        except ValueError as error:
+            raise PayloadGateError(
+                "commit payload gate did not emit one UTF-8 JSON value",
+                gate=str(gate),
+                returncode=completed.returncode,
+            ) from error
+        if not isinstance(payload, dict):
+            raise PayloadGateError(
+                "commit payload gate JSON is not an object",
+                gate=str(gate),
+            )
+
+        verdict = payload.get("verdict")
+        candidate = payload.get("candidate")
+        repository = payload.get("repository")
+        paths = payload.get("staged_files")
+        findings = payload.get("findings")
+        degraded = payload.get("degraded")
+        if (
+            not isinstance(verdict, str)
+            or not isinstance(candidate, str)
+            or not isinstance(repository, str)
+            or not isinstance(paths, list)
+            or not all(isinstance(path, str) for path in paths)
+            or not isinstance(findings, list)
+            or not isinstance(degraded, list)
+        ):
+            raise PayloadGateError(
+                "commit payload gate JSON has malformed required fields",
+                gate=str(gate),
+            )
+
+        if candidate != commit:
+            raise PayloadGateError(
+                "commit payload gate audited a different candidate",
+                gate=str(gate),
+                expected_candidate=commit,
+                observed_candidate=candidate,
+            )
+
+        expected = list(expected_paths)
+        if repository != str(self.root):
+            raise PayloadGateError(
+                "commit payload gate audited a different payload",
+                gate=str(gate),
+                expected_repository=str(self.root),
+                observed_repository=repository,
+                expected_paths=expected,
+                observed_paths=paths,
+            )
+        expected_returncodes = {"CLEAN": 0, "REFUSE": 1, "DEGRADED": 2}
+        expected_returncode = expected_returncodes.get(verdict)
+        if expected_returncode is None or completed.returncode != expected_returncode:
+            raise PayloadGateError(
+                "commit payload gate verdict and exit status disagree",
+                gate=str(gate),
+                verdict=verdict,
+                returncode=completed.returncode,
+            )
+        if verdict == "DEGRADED":
+            raise LandingRefusedError(
+                "commit payload gate degraded the candidate",
+                reason="payload_gate_degraded",
+                paths=expected,
+                degraded=degraded,
+                gate_receipt=_payload_gate_receipt(gate_source_sha256, expected, payload),
+            )
+        observed_set = set(paths)
+        if len(observed_set) != len(paths) or observed_set != set(expected):
+            raise PayloadGateError(
+                "commit payload gate audited a different payload",
+                gate=str(gate),
+                expected_repository=str(self.root),
+                observed_repository=repository,
+                expected_paths=expected,
+                observed_paths=paths,
+            )
+        if verdict == "CLEAN":
+            if findings or degraded:
+                raise PayloadGateError(
+                    "commit payload gate called a non-empty report CLEAN",
+                    gate=str(gate),
+                    findings=findings,
+                    degraded=degraded,
+                )
+            return _payload_gate_receipt(gate_source_sha256, expected, payload)
+        raise LandingRefusedError(
+            "commit payload gate refused the candidate",
+            reason="payload_gate_refused",
+            paths=expected,
+            gate_receipt=_payload_gate_receipt(gate_source_sha256, expected, payload),
+            findings=findings,
+        )
 
     def commit_parents(self, commit: str) -> tuple[str, ...]:
         content = self.git("cat-file", "commit", commit).stdout
@@ -1343,16 +1827,33 @@ class Repository:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise GitError(f"cannot test ancestry: {detail}", operation="merge-base")
 
-    @staticmethod
-    def landing_message(body: str, operation: str, intent: str, actor: str) -> str:
-        """Append the trailer block that makes a broker landing self-identifying."""
+    def landing_message(self, body: str, operation: str, intent: str, actor: str) -> str:
+        """Keep caller attribution and broker identity in one final trailer block."""
 
-        return (
-            f"{body.rstrip(chr(10))}\n\n"
-            f"{LANDING_TRAILER}: {operation}\n"
-            f"Onetree-Intent: {intent}\n"
-            f"Onetree-Actor: {actor}\n"
-        )
+        # Configured trailer commands must not execute while constructing a candidate.
+        with tempfile.TemporaryDirectory(prefix="onetree-trailers-") as temporary:
+            directory = Path(temporary).resolve()
+            result = self._invoke(
+                directory,
+                (
+                    "-c", "trailer.separators=:", "-c", "core.commentString=#",
+                    "interpret-trailers", "--no-divider", "--where", "end",
+                    "--if-exists", "add", "--if-missing", "add",
+                    "--trailer", f"{LANDING_TRAILER}: {operation}",
+                    "--trailer", f"Onetree-Intent: {intent}",
+                    "--trailer", f"Onetree-Actor: {actor}",
+                ),
+                input_bytes=(body.rstrip("\n") + "\n").encode("utf-8"),
+                environment={
+                    "LC_ALL": "C",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CEILING_DIRECTORIES": str(directory.parent),
+                },
+                check=True,
+            )
+        return result.stdout.decode("utf-8")
 
     def marked_commits(
         self,

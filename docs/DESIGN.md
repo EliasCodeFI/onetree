@@ -18,15 +18,36 @@ this document is the implementation contract for the first two rounds.
      fail-closed, an unclaimed path refuses the whole payload;
    - build: `git write-tree` against the session index, then `commit-tree` —
      the shared index and working tree are never touched;
+   - payload gate: require the configured `commit_payload.py` source to match
+     the independently admitted SHA-256, execute a private snapshot of those
+     bytes, and confirm the configured source remained unchanged; invoke its
+     `commit` mode over that immutable candidate, require one internally
+     consistent JSON verdict for the exact candidate, repository, and payload
+     paths, and proceed only on CLEAN with no findings or degraded rows;
+     operational gate errors leave both the target ref and WAL unchanged;
+     a trusted REFUSE or DEGRADED verdict preserves the target and records a
+     `refused` WAL event, without a `land_intent` or `landed` event;
    - fence: claims must still be held at the landing moment; a reclaimed or
      expired claim aborts the landing;
    - land: compare-and-swap `update-ref` on the target branch; on a moved
      head, re-parent the built tree and retry; exactly one racer wins per
      attempt, losers retry cleanly.
 4. **Test referee** (Round B). Before the ref moves, the candidate is tested
-   atop everything queued ahead of it (the exact train). A red train bisects
-   to name the conflicting pair. Plus: branch-operation refusal (`switch`/
-   `checkout`/destructive `reset` in a shared clone), and a typed rejection
+   atop everything queued ahead of it (the exact train). A red train names
+   a conflicting pair only when that pair was demonstrated to fail;
+   otherwise it reports the demonstrated failing combination or explicitly
+   unresolved localization. Red and timed-out candidates remain refused.
+   Minimality and localization-cost claims require supporting evidence
+   (see `docs/ROUND-B-AMENDMENT.md`). Plus: Git-layer detection of unexplained
+   ref transitions recorded in the reflog of a protected shared clone (`switch`,
+   `checkout <branch>`, destructive `reset`, `stash`, a bare commit), with
+   persistent refusal of subsequent landings. Working-tree operations that move
+   no ref leave no reflog transition and are NOT detected: `checkout -- <path>`,
+   `restore`, `read-tree -u`, `checkout-index` erase unstaged peer work
+   unobserved (measured 2026-09-10). This does not prevent the external
+   operation or recover erased unstaged work; the measured boundary and
+   evidence-loss residuals are explicit in `docs/ROUND-B.md`.
+   A typed rejection
    contract that names exactly the invalidated paths so a session repairs
    minimally.
 
@@ -37,7 +58,10 @@ implemented as a commit chain on a dedicated ref, pure git plumbing. Each
 event is a commit whose tree carries one JSON document; the parent is the
 previous WAL head; CAS on the WAL ref serializes appends. Event kinds:
 `session_register`, `claim`, `release`, `land_intent` (fence), `landed`,
-`adopted`, `refused`, `gc`. `adopted` records the operator's explicit
+`adopted`, `refused`, `gc`, `workspace_protect`. `workspace_protect` records
+the explicitly established shared-branch, reflog and referee baseline; it
+requires reader version 3 and cannot be silently replaced by registration.
+`adopted` records the operator's explicit
 acceptance of a broker landing the WAL did not record; every other kind is
 written by the broker itself. The working tree stays pristine — no state files
 in the tree, ever. History cannot be edited without showing in the ref.
@@ -118,6 +142,32 @@ never failed is not evidence.
   predicate and deliberate exclusion of key-alias configurations that rename
   unrelated markers are recorded in `docs/ROUND-AF10.md`; the bounded large
   folded-input fixture is recorded in `docs/ROUND-AF11.md`.
+- **INV9** No candidate becomes visible on a target branch or in a WAL intent
+  unless the source-admitted commit-payload gate echoed and audited that exact
+  candidate and exact path set CLEAN. The gate runs from a read-only private
+  copy of the admitted bytes, at a broker-chosen path under the repository's own
+  git directory rather than wherever `TMPDIR` points, and in an interpreter
+  whose whole environment is admitted by name. Admission is the load-bearing
+  word: subtracting known-dangerous names narrows the channel without
+  establishing the property, because Git, CPython and the dynamic loader each
+  grow new environment controls and every name not yet thought of is admitted by
+  default under subtraction. The interpreter flags do not reach far enough to
+  substitute for it -- `-I` and `-S` are read by CPython, while `ld.so` resolves
+  `LD_PRELOAD` and `LD_AUDIT` before `main()`, so a library named there runs
+  ahead of every control the broker has, and the source digest does not help
+  because it verifies the bytes on disk that the hijacked interpreter then goes
+  on to read. Source digest, exit status, verdict, candidate, repository, path
+  list, findings, and degraded rows are one coupled contract; no-op or partial
+  substitutes fail closed. The configured source is re-read after the call, but
+  that is change detection for the next landing and for an operator, not a
+  control over the verdict just produced: the child executed a snapshot, so what
+  the configured path holds afterwards cannot bear on what already ran.
+  The gate's complete report and admitted source digest are retained in the
+  intent, or in a classified gate-refusal event. Landed and recovered records
+  refer to that immutable carrier. Hook suite evidence, advisories and allowed
+  NO_COMPANION outcomes remain visible; historical records without evidence
+  are explicitly unrecorded. The receipt and replay contract is recorded in
+  `docs/ROUND-GATE-EVIDENCE.md`.
 
 ## Non-goals for Round A
 

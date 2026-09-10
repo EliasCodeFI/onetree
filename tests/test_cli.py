@@ -38,7 +38,7 @@ def test_status_human_and_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload == {
         "name": "onetree",
         "ok": True,
-        "phase": "gate-1-round-a",
+        "phase": "gate-1-round-b",
         "version": __version__,
     }
 

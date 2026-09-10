@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from onetree import referee, workspace
 from onetree.errors import (
     ClaimConflictError,
     GitError,
@@ -20,6 +21,7 @@ from onetree.errors import (
     InvalidPathError,
     LandingRefusedError,
     LegacyGraftError,
+    NarrowRefusedError,
     OnetreeError,
     RefCorruptError,
     RefLockedError,
@@ -30,7 +32,13 @@ from onetree.errors import (
     WalCorruptError,
     WalDivergedError,
 )
-from onetree.git import MarkedCommit, Repository, TempIndex, TreeEntry
+from onetree.git import (
+    MarkedCommit,
+    Repository,
+    TempIndex,
+    TreeEntry,
+    validate_payload_gate_receipt,
+)
 from onetree.proc import process_alive as _pid_alive
 from onetree.proc import process_start as _pid_start
 from onetree.wal import WAL_REF, EventRecord, Wal, WalSnapshot
@@ -104,6 +112,12 @@ class ClaimResult:
 
 
 @dataclass(frozen=True)
+class NarrowResult:
+    released: tuple[str, ...]
+    claims: tuple[ClaimInfo, ...]
+
+
+@dataclass(frozen=True)
 class CheckResult:
     path: str
     blocked: bool
@@ -126,6 +140,8 @@ class LandResult:
     operation: str
     intent: str
     warnings: tuple[str, ...] = ()
+    gate_receipt: Mapping[str, Any] | None = None
+    referee_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +175,43 @@ class WalReport:
     divergences: tuple[Divergence, ...] = ()
     ref_locks: tuple[str, ...] = ()
     temp_indexes: tuple[TempIndex, ...] = ()
+
+    def gate_evidence(self) -> list[dict[str, Any]]:
+        carriers = {
+            event.event_id: event
+            for event in self.events
+            if event.kind in {"land_intent", "refused"} and "gate_receipt" in event.data
+        }
+        evidence: list[dict[str, Any]] = []
+        for event in self.events:
+            if event.kind not in {"land_intent", "landed", "adopted", "refused"}:
+                continue
+            if event.kind == "refused" and event.data.get("action") != "land":
+                continue
+            reference = (
+                event.event_id
+                if event.event_id in carriers
+                else event.data.get("intent")
+                if event.kind in {"landed", "refused"}
+                else None
+            )
+            carrier = carriers.get(reference) if isinstance(reference, str) else None
+            recorded = carrier is not None and (
+                carrier.event_id == event.event_id
+                or (
+                    carrier.kind == "land_intent"
+                    and carrier.actor == event.actor
+                    and carrier.data.get("operation") == event.data.get("operation")
+                )
+            )
+            evidence.append(
+                {
+                    "event": event.event_id,
+                    "state": "recorded" if recorded else "unrecorded",
+                    "receipt_event": reference if recorded else None,
+                }
+            )
+        return evidence
 
 
 @dataclass(frozen=True)
@@ -229,6 +282,8 @@ class _FoldedState:
     event_ids: set[str] = field(default_factory=set)
     session_generations: set[str] = field(default_factory=set)
     claim_generations: set[str] = field(default_factory=set)
+    workspace_epoch: Mapping[str, Any] | None = None
+    workspace_transitions: list[tuple[str, str]] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> _FoldedState:
@@ -260,6 +315,8 @@ class _FoldedState:
             event_ids=set(self.event_ids),
             session_generations=set(self.session_generations),
             claim_generations=set(self.claim_generations),
+            workspace_epoch=self.workspace_epoch,
+            workspace_transitions=list(self.workspace_transitions),
         )
 
     def observe_position(self, target: str, *positions: str) -> None:
@@ -378,9 +435,19 @@ def _overlaps(first: str, second: str) -> bool:
 class Coordinator:
     """The daemon-free broker; every mutation is serialized by a Git ref CAS."""
 
-    def __init__(self, repository: Path | str) -> None:
+    def __init__(
+        self,
+        repository: Path | str,
+        *,
+        commit_payload: Path | str | None = None,
+    ) -> None:
         self.repo = Repository(repository)
         self.wal = Wal(self.repo)
+        self.commit_payload = (
+            commit_payload
+            if commit_payload is not None
+            else os.environ.get("ONETREE_COMMIT_PAYLOAD")
+        )
 
     def _audit_heads(
         self,
@@ -501,7 +568,27 @@ class Coordinator:
             repair="git replace --convert-graft-file, then review the replacement refs",
         )
 
-    def _canonical_path(self, raw_path: str) -> str:
+    @staticmethod
+    def _resolve_release_path(candidate: Path) -> Path:
+        """A vanished suffix may still name a recorded claim; unresolved aliases may not."""
+
+        suffix: list[str] = []
+        prefix = candidate
+        while True:
+            try:
+                resolved = prefix.resolve(strict=True)
+            except RuntimeError as error:
+                # Older supported Python versions use RuntimeError for a symlink loop.
+                raise OSError(str(error)) from error
+            except FileNotFoundError:
+                if prefix.is_symlink() or prefix.name in {"", ".."}:
+                    raise
+                suffix.append(prefix.name)
+                prefix = prefix.parent
+            else:
+                return resolved.joinpath(*reversed(suffix))
+
+    def _canonical_path(self, raw_path: str, *, for_release: bool = False) -> str:
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             raise InvalidPathError(
@@ -510,7 +597,11 @@ class Coordinator:
                 reason="relative",
             )
         try:
-            resolved = candidate.resolve(strict=True)
+            resolved = (
+                self._resolve_release_path(candidate)
+                if for_release
+                else candidate.resolve(strict=True)
+            )
         except FileNotFoundError as error:
             raise InvalidPathError(
                 "claim path does not exist",
@@ -599,6 +690,10 @@ class Coordinator:
         """
 
         data = event.data
+        if "gate_receipt" in data and event.kind not in {"land_intent", "refused"}:
+            raise WalCorruptError("gate receipt is on the wrong event kind", oid=event.oid)
+        if "referee_receipt" in data and event.kind not in {"land_intent", "refused"}:
+            raise WalCorruptError("referee receipt is on the wrong event kind", oid=event.oid)
         if event.event_id in state.event_ids:
             raise WalCorruptError("duplicate WAL event id", oid=event.oid)
         state.event_ids.add(event.event_id)
@@ -748,7 +843,34 @@ class Coordinator:
                 raise WalCorruptError(
                     "land_intent fences do not match its payload", oid=event.oid
                 )
+            self._validate_gate_receipt(event, "CLEAN", intent_payload_paths, data["candidate"])
+            if "referee_receipt" in data:
+                self._validate_referee_receipt(event, data["candidate"])
+                if data["referee_receipt"]["result"] not in {"pass", "not_configured"}:
+                    raise WalCorruptError("intent has a failed referee", oid=event.oid)
+                if data["referee_receipt"]["baseline"] != intent_head:
+                    raise WalCorruptError("referee baseline differs from intent", oid=event.oid)
+            if state.workspace_epoch is not None:
+                # The epoch records which branch is protected and which referee
+                # guards it. The broker that honours it refuses every landing outside
+                # that branch and never writes an intent without that referee's
+                # evidence, so an intent elsewhere, lacking the evidence, or carrying
+                # another referee's, did not come from the broker.
+                if intent_target != state.workspace_epoch["target"]:
+                    raise WalCorruptError("protected intent targets outside the shared branch",
+                                          oid=event.oid)
+                if "referee_receipt" not in data:
+                    raise WalCorruptError("protected intent has no referee evidence",
+                                          oid=event.oid)
+                receipt = data["referee_receipt"]
+                if [receipt["command"], receipt["timeout_seconds"]] != list(
+                    state.workspace_epoch["referee"]
+                ):
+                    raise WalCorruptError("protected intent evidence names another referee",
+                                          oid=event.oid)
             state.pending[operation] = event
+            if state.workspace_epoch is not None:
+                state.workspace_transitions.append((intent_head, data["candidate"]))
         elif event.kind == "adopted":
             if frozenset(data) != {"operation", "target", "expected_head", "commit", "tree"}:
                 raise WalCorruptError("adopted event has unexpected fields", oid=event.oid)
@@ -819,6 +941,16 @@ class Coordinator:
             state.pending.pop(operation)
             state.landed_operations[operation] = event
             state.landed.append(event)
+        elif event.kind == "workspace_protect":
+            try:
+                workspace.validate(data, self.repo)
+            except (ValueError, TypeError, KeyError, OnetreeError) as error:
+                raise WalCorruptError("invalid workspace baseline", oid=event.oid) from error
+            if state.workspace_epoch is not None:
+                raise WalCorruptError("workspace baseline cannot be silently replaced",
+                                      oid=event.oid)
+            state.workspace_epoch = data
+            state.workspace_transitions = []
         elif event.kind == "refused":
             refused_operation = data.get("operation")
             intent_id = data.get("intent")
@@ -833,10 +965,53 @@ class Coordinator:
                 state.refused_operations.add(refused_operation)
             action = _string(data, "action", event)
             reason = _string(data, "reason", event)
+            if "referee_receipt" in data:
+                self._validate_referee_receipt(event)
+                result = data["referee_receipt"]["result"]
+                if (action != "land" or result not in {"red", "timeout", "error"}
+                        or reason != "referee_" + result):
+                    raise WalCorruptError("referee receipt has no matching refusal", oid=event.oid)
+            if "gate_receipt" in data:
+                verdict = {
+                    "payload_gate_refused": "REFUSE", "payload_gate_degraded": "DEGRADED"
+                }.get(reason)
+                if action != "land" or verdict is None:
+                    raise WalCorruptError("gate receipt has no matching refusal", oid=event.oid)
+                self._validate_gate_receipt(event, verdict, _string_list(data, "paths", event))
             if action == "recover" and reason == "branch_diverged":
                 state.diverged_refusals.add(_divergence_key(data.get("divergences"), event))
         else:  # all event kinds are covered above
             raise AssertionError(f"unhandled WAL event: {event.kind}")
+
+    @staticmethod
+    def _validate_referee_receipt(event: EventRecord, candidate: str | None = None) -> None:
+        try:
+            referee.validate_receipt(event.data["referee_receipt"])
+        except (ValueError, TypeError) as error:
+            raise WalCorruptError("invalid referee evidence", oid=event.oid,
+                                  detail=str(error)) from error
+        if candidate is not None and event.data["referee_receipt"]["candidate"] != candidate:
+            raise WalCorruptError("referee candidate differs from intent", oid=event.oid)
+
+    @staticmethod
+    def _validate_gate_receipt(
+        event: EventRecord, verdict: str, paths: Sequence[str], candidate: str | None = None
+    ) -> None:
+        if "gate_receipt" not in event.data:
+            return
+        receipt = event.data["gate_receipt"]
+        try:
+            validate_payload_gate_receipt(receipt)
+        except (ValueError, TypeError) as error:
+            raise WalCorruptError(
+                "invalid retained gate evidence", oid=event.oid, detail=str(error)
+            ) from error
+        if (
+            receipt["report"]["verdict"] != verdict
+            or set(receipt["expected_paths"]) != set(paths)
+            or (candidate is not None and receipt["report"]["candidate"] != candidate)
+        ):
+            raise WalCorruptError("gate receipt differs from its WAL event", oid=event.oid)
 
     def _active_session(
         self,
@@ -919,6 +1094,39 @@ class Coordinator:
                 )
         raise GitError("session registration CAS retry limit exceeded")
 
+    def protect_workspace(self, actor: str) -> Mapping[str, Any]:
+        actor = _validate_actor(actor)
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            if state.workspace_epoch is not None:
+                detail = self._workspace_violation(state)
+                if detail is not None:
+                    raise LandingRefusedError(detail, reason="workspace_changed", paths=[])
+                return state.workspace_epoch
+            if state.pending or state.active_claims(time.time()):
+                raise LandingRefusedError("protection requires no pending intents or active claims",
+                                          reason="workspace_busy", paths=[])
+            try:
+                epoch = workspace.baseline(self.repo)
+            except (ValueError, OSError, GitError) as error:
+                raise LandingRefusedError(str(error), reason="workspace_unavailable",
+                                          paths=[]) from error
+            document = self.wal.document("workspace_protect", actor, epoch)
+            if self._try_append(state, snapshot, (document,)) is not None:
+                return epoch
+        raise GitError("workspace protection CAS retry limit exceeded")
+
+    def _workspace_violation(self, state: _FoldedState) -> str | None:
+        if state.workspace_epoch is None:
+            return None
+        refused = {
+            (str(intent.data["expected_head"]), str(intent.data["candidate"]))
+            for intent in state.refused_intents.values()
+        }
+        transitions = [item for item in state.workspace_transitions if item not in refused]
+        return workspace.violation(self.repo, state.workspace_epoch, transitions)
+
     def claim(
         self,
         actor: str,
@@ -996,6 +1204,128 @@ class Coordinator:
                 return ClaimResult(claims)
         raise GitError("claim CAS retry limit exceeded")
 
+    def narrow(self, actor: str, parent: str, paths: Sequence[str]) -> NarrowResult:
+        """Retain existing descendants without surrendering their coverage between writes.
+
+        Only the named parent generation is surrendered. Other claims survive,
+        and newly issued children inherit its remaining lease without renewal.
+        """
+
+        actor = _validate_actor(actor)
+        canonical_parent = self._canonical_path(parent)
+        canonical = tuple(sorted({self._canonical_path(path) for path in paths}))
+        if not canonical:
+            raise InvalidPathError("at least one retained path is required", reason="empty")
+        invalid = [
+            path
+            for path in canonical
+            if path == canonical_parent or not _covers(canonical_parent, path)
+        ]
+        if invalid:
+            raise InvalidPathError(
+                "retained paths must be proper descendants of the parent",
+                reason="not_descendant",
+                parent=canonical_parent,
+                paths=invalid,
+            )
+        children = tuple(
+            path
+            for path in canonical
+            if not any(other != path and _covers(other, path) for other in canonical)
+        )
+        selected_generation: str | None = None
+        for _ in range(MAX_CAS_RETRIES):
+            now = time.time()
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            session = self._active_session(state, actor, now)
+            if session is None:
+                raise IdentityError("session is not active", session=actor)
+            active = state.active_claims(now)
+            owned = tuple(claim for claim in active if claim.actor == actor)
+            parents = tuple(claim for claim in owned if claim.path == canonical_parent)
+            selected = parents[0] if len(parents) == 1 else None
+            reason: str | None = None
+            if selected is None:
+                reason = "not_held"
+            elif selected_generation is not None and selected.generation != selected_generation:
+                reason = "claim_changed"
+            else:
+                selected_generation = selected.generation
+                fenced = {
+                    str(fence.get("claim_generation"))
+                    for intent in state.pending.values()
+                    for fence in intent.data.get("fences", [])
+                    if isinstance(fence, dict)
+                }
+                if selected.generation in fenced:
+                    reason = "pending_land"
+            if reason is not None:
+                refusal = self.wal.document(
+                    "refused",
+                    actor,
+                    {
+                        "action": "narrow",
+                        "reason": reason,
+                        "parent": canonical_parent,
+                        "paths": list(children),
+                    },
+                )
+                if self._try_append(state, snapshot, (refusal,)) is None:
+                    continue
+                raise NarrowRefusedError(
+                    "narrow refused",
+                    reason=reason,
+                    parent=canonical_parent,
+                    paths=list(children),
+                )
+            assert selected is not None
+            remaining = tuple(claim for claim in owned if claim.generation != selected.generation)
+            needed = tuple(
+                path
+                for path in children
+                if not any(_covers(claim.path, path) for claim in remaining)
+            )
+            claims = tuple(
+                ClaimInfo(
+                    actor,
+                    path,
+                    uuid.uuid4().hex,
+                    session.generation,
+                    min(selected.expires_at, session.expires_at),
+                )
+                for path in needed
+            )
+            documents = tuple(
+                self.wal.document(
+                    "claim",
+                    actor,
+                    {
+                        "path": claim.path,
+                        "generation": claim.generation,
+                        "session_generation": claim.session_generation,
+                        "expires_at": claim.expires_at,
+                    },
+                )
+                for claim in claims
+            ) + (
+                self.wal.document(
+                    "release",
+                    actor,
+                    {"generations": [selected.generation], "paths": [canonical_parent]},
+                ),
+            )
+            if self._try_append(state, snapshot, documents) is not None:
+                retained = tuple(
+                    claim
+                    for claim in (*remaining, *claims)
+                    if any(_covers(claim.path, path) for path in children)
+                )
+                return NarrowResult(
+                    (canonical_parent,), tuple(sorted(retained, key=lambda claim: claim.path))
+                )
+        raise GitError("narrow CAS retry limit exceeded")
+
     def check(self, actor: str, path: str) -> CheckResult:
         actor = _validate_actor(actor)
         canonical = self._canonical_path(path)
@@ -1011,7 +1341,7 @@ class Coordinator:
 
     def release(self, actor: str, paths: Sequence[str] = ()) -> ReleaseResult:
         actor = _validate_actor(actor)
-        canonical = tuple(sorted({self._canonical_path(path) for path in paths}))
+        canonical = tuple(sorted({self._canonical_path(path, for_release=True) for path in paths}))
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
             snapshot = self._read_wal()
@@ -1086,6 +1416,9 @@ class Coordinator:
         operation: str,
         reason: str,
         paths: Sequence[str] = (),
+        *,
+        gate_receipt: Mapping[str, Any] | None = None,
+        referee_receipt: Mapping[str, Any] | None = None,
     ) -> bool:
         document = self.wal.document(
             "refused",
@@ -1095,6 +1428,9 @@ class Coordinator:
                 "reason": reason,
                 "operation": operation,
                 "paths": list(paths),
+                **({"gate_receipt": dict(gate_receipt)} if gate_receipt is not None else {}),
+                **({"referee_receipt": dict(referee_receipt)}
+                   if referee_receipt is not None else {}),
             },
         )
         return self._try_append(state, snapshot, (document,)) is not None
@@ -1196,6 +1532,24 @@ class Coordinator:
                     reason="nothing_staged",
                     paths=[],
                 )
+            invalidated = [change.path for change in changes]
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config", invalidated
+                ):
+                    continue
+                raise LandingRefusedError("invalid referee configuration",
+                                          reason="referee_config", paths=invalidated) from None
+            if state.workspace_epoch is not None and target_ref != state.workspace_epoch["target"]:
+                violation = "landing target is outside the protected shared branch"
+            if violation is not None:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "workspace_changed", invalidated
+                ):
+                    continue
+                raise LandingRefusedError(violation, reason="workspace_changed", paths=invalidated)
             active_claims = state.active_claims(now)
             owned = tuple(claim for claim in active_claims if claim.actor == actor)
             missing = tuple(
@@ -1236,14 +1590,15 @@ class Coordinator:
             if current is None:
                 raise GitError("landing target is unborn", reference=target_ref)
             if not self.repo.is_ancestor(session.base, current):
+                invalidated = [change.path for change in changes]
                 if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "target_diverged"
+                    state, snapshot, actor, operation, "target_diverged", invalidated
                 ):
                     continue
                 raise LandingRefusedError(
                     "landing target no longer descends from the session base",
                     reason="target_diverged",
-                    paths=[],
+                    paths=invalidated,
                 )
             current_entries = self.repo.tree_entries(current)
             conflicts = tuple(
@@ -1286,6 +1641,63 @@ class Coordinator:
             )
             context["candidate"] = commit
             payload_paths = [change.path for change in changes]
+            try:
+                configured_referee = referee.configuration(self.repo)
+            except LandingRefusedError:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("invalid referee configuration",
+                                          reason="referee_config", paths=payload_paths) from None
+            if configured_referee[0] is not None and any(
+                pending.data["target"] == target_ref for pending in state.pending.values()
+            ):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "train_pending", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("an earlier target intent is still pending",
+                                          reason="train_pending", paths=payload_paths)
+            try:
+                gate_receipt = self.repo.audit_commit_payload(
+                    commit, payload_paths, self.commit_payload
+                )
+            except LandingRefusedError as refusal:
+                # A gate verdict against the candidate is a landing refusal like the
+                # eight above, and every one of those is recorded before it is raised.
+                # Left unrecorded, the one refusal that inspects the payload itself is
+                # the one no peer and no later audit can see happened.
+                #
+                # PayloadGateError is deliberately not caught here. It says the broker
+                # could not obtain a trusted verdict at all, which is an operational
+                # failure of this process and not a statement about this candidate.
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, str(refusal.details["reason"]),
+                    payload_paths,
+                    gate_receipt=refusal.details.get("gate_receipt"),
+                ):
+                    continue
+                raise
+            try:
+                referee_receipt = referee.run(
+                    self.repo, commit, current, payload_paths, configured_referee
+                )
+            except LandingRefusedError as refusal:
+                rejected = self.wal.document("refused", actor, {
+                    "action": "land", "reason": str(refusal.details["reason"]),
+                    "operation": operation, "paths": list(payload_paths),
+                    "referee_receipt": refusal.details["referee_receipt"],
+                })
+                self._append_document(rejected, what="referee refusal")
+                raise
+            if not referee.configuration_matches(self.repo, configured_referee):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed during candidate audit",
+                                          reason="referee_config_changed", paths=payload_paths)
             lander_start = _pid_start(os.getpid())
             lander_warnings = _liveness_warnings(lander_start)
             intent = self.wal.document(
@@ -1310,11 +1722,40 @@ class Coordinator:
                     },
                     "fences": list(fences),
                     "payload": [change.event_payload() for change in changes],
+                    "gate_receipt": gate_receipt,
+                    "referee_receipt": referee_receipt,
                 },
                 event_id=intent_id,
             )
             if checkpoint is not None:
                 checkpoint("before_intent", context)
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError:
+                # The configuration was readable when the candidate was audited, so an
+                # unreadable one here is a change, the same refusal the unprotected
+                # path records below.
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed before admission",
+                                          reason="referee_config_changed",
+                                          paths=payload_paths) from None
+            if violation is not None:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "workspace_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError(violation, reason="workspace_changed",
+                                          paths=payload_paths)
+            if not referee.configuration_matches(self.repo, configured_referee):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed before admission",
+                                          reason="referee_config_changed", paths=payload_paths)
 
             # Fence sample. Everything above was audited against a WAL read that
             # is now old; this is the last look at the session and its claims
@@ -1323,7 +1764,7 @@ class Coordinator:
             fenced_generations = {str(fence["claim_generation"]) for fence in fences}
             if not _session_alive(session, landing_time):
                 if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "session_died_at_fence"
+                    state, snapshot, actor, operation, "session_died_at_fence", payload_paths
                 ):
                     continue
                 raise LandingRefusedError(
@@ -1331,13 +1772,14 @@ class Coordinator:
                     reason="session_died_at_fence",
                     paths=list(payload_paths),
                 )
-            expired = tuple(
-                sorted(
-                    claim.path
-                    for claim in owned
-                    if claim.generation in fenced_generations and claim.expires_at <= landing_time
-                )
-            )
+            expired_generations = {
+                claim.generation for claim in owned
+                if claim.generation in fenced_generations and claim.expires_at <= landing_time
+            }
+            expired = tuple(sorted(
+                str(fence["path"]) for fence in fences
+                if fence["claim_generation"] in expired_generations
+            ))
             if expired:
                 if not self._record_land_refusal(
                     state, snapshot, actor, operation, "claim_expired_at_fence", expired
@@ -1402,6 +1844,8 @@ class Coordinator:
                 operation,
                 intent_id,
                 lander_warnings,
+                gate_receipt,
+                referee_receipt,
             )
         raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
 
@@ -1685,6 +2129,15 @@ class Coordinator:
                     for audit_target in targets
                 )
             divergences = (*boundaries, *self._divergences(state, heads))
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError as refusal:
+                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
+            else:
+                if violation is not None:
+                    divergences = (
+                        *divergences, Divergence("workspace_changed", "HEAD", violation)
+                    )
             now = time.time()
             sessions = tuple(
                 sorted(actor for actor in state.sessions if state.session_active(actor, now))
@@ -1891,6 +2344,28 @@ class Coordinator:
             self._verify_landed(state)
             heads = self._audit_heads(state, target)
             divergences = self._divergences(state, heads)
+            try:
+                violation = self._workspace_violation(state)
+            except LandingRefusedError as refusal:
+                # The workspace cannot be audited until the setting is readable.
+                # On its own that is the operator's typo, not a branch that
+                # diverged from the WAL: refuse by type and record nothing, so
+                # correcting the setting is the whole remedy and no
+                # `branch_diverged` row outlives it. Beside a real divergence it
+                # is one more thing the operator must see, not a reason to hide
+                # the divergence recovery has already computed.
+                if not divergences:
+                    raise LandingRefusedError(
+                        f"recovery cannot audit the protected workspace: {refusal}",
+                        reason="referee_config", paths=[], repaired=repaired, refused=refused,
+                        pending=in_flight, locks=list(locks),
+                    ) from None
+                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
+            else:
+                if violation is not None:
+                    divergences = (
+                        *divergences, Divergence("workspace_changed", "HEAD", violation)
+                    )
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if not divergences:

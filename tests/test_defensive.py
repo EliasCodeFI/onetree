@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from conftest import GitFixture
 
+from onetree import git as git_module
 from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import (
@@ -256,12 +257,17 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
 
     assert adopted["v"] == 2
     assert collected["v"] == 1
+    protected = Wal.document("workspace_protect", "operator", {})
+    assert protected["v"] == 3
+    assert Wal._validate_document(dict(protected), oid="fixture") == protected
     assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
 
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**adopted, "v": 1}, oid="fixture")
     with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
-        Wal._validate_document({**collected, "v": 3}, oid="fixture")
+        Wal._validate_document({**collected, "v": 4}, oid="fixture")
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**protected, "v": 2}, oid="fixture")
     # ``True`` is the one that matters: it compares equal to 1, so a bool would
     # otherwise pass the per-kind check for every version-1 kind.
     for understated in (0, -1, True, "1", 1.0):
@@ -596,6 +602,66 @@ def test_git_wrapper_refusals_and_index_type(git_repo: GitFixture, tmp_path: Pat
     git_repo.git("checkout", "--quiet", "--detach")
     with pytest.raises(GitError, match="detached"):
         repository.head_ref()
+
+
+def test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`symbolic-ref --quiet` exits 1 for a detached HEAD; any other exit is git failing."""
+    repository = Repository(git_repo.root)
+    failed = subprocess.CompletedProcess(
+        ["git", "symbolic-ref"], 128, stdout=b"",
+        stderr=b"fatal: unable to parse command-line config\n",
+    )
+    # Control: the real detached exit keeps its diagnosis.
+    git_repo.git("checkout", "--quiet", "--detach")
+    with pytest.raises(GitError, match="detached"):
+        repository.head_ref()
+    assert repository.symbolic_head() is None
+    # A real input reaches the arm (Round BF3 DUO: it was proven against a fake only):
+    # HEAD naming a ref git refuses to resolve. The repository still opens.
+    (git_repo.root / ".git" / "HEAD").write_text("ref: refs/heads/a..b\n", encoding="utf-8")
+    reopened = Repository(git_repo.root)
+    for read in (reopened.head_ref, reopened.symbolic_head):
+        with pytest.raises(GitError, match="cannot read HEAD: fatal: No such ref: HEAD") as real:
+            read()
+        assert "detached" not in str(real.value)
+    monkeypatch.setattr(repository, "git", lambda *arguments, **options: failed)
+    with pytest.raises(GitError, match="unable to parse command-line config") as caught:
+        repository.head_ref()
+    assert "detached" not in str(caught.value)
+    with pytest.raises(GitError, match="unable to parse command-line config"):
+        repository.symbolic_head()
+
+
+def test_git_invocation_relabels_only_operating_system_errors(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_invoke` may relabel an OSError as a git-exec failure, and nothing else.
+
+    Every typed onetree error subclasses RuntimeError, so a handler widened to catch
+    RuntimeError would rewrite any precise refusal raised under the subprocess call into
+    "could not execute git" -- and the caller would then act on an inability to start git
+    rather than on the refusal that actually happened. The two arms below differ only in
+    the class of the injected exception, so what they pin is the width of that handler.
+    """
+
+    repository = Repository(git_repo.root)
+    sentinel = WalCorruptError("a typed refusal raised under the subprocess call")
+
+    def raise_sentinel(*_arguments: object, **_keywords: object) -> None:
+        raise sentinel
+
+    monkeypatch.setattr(git_module.subprocess, "run", raise_sentinel)
+    with pytest.raises(WalCorruptError) as crossed:
+        repository.head_ref()
+    assert crossed.value is sentinel
+
+    # Reached before the patched call above, so the two arms do not interact.
+    monkeypatch.setattr(git_module, "_GIT_EXECUTABLE", None)
+    with pytest.raises(GitError, match="could not execute git") as relabelled:
+        repository.head_ref()
+    assert relabelled.value.details["operation"] == "symbolic-ref"
 
 
 def test_cli_human_errors_and_environment_identity(
