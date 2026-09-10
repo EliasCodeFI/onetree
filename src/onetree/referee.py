@@ -39,11 +39,13 @@ def configuration(repo: Repository) -> tuple[str | None, float]:
     with its includes followed) and `worktree` (`.git/config.worktree`), both reached
     through `.git/config`, which every peer of the one tree shares. An include whose path
     git expands per operator (`~`) is still the repository's setting, but its content is
-    each peer's; the epoch comparison makes that difference a refusal, not a silent choice
-    of referee. The operator's global and system files and the command-line scope are not
-    the repository's: the broker's environment already drops the names that would inject
-    the command scope or redirect the read (`Repository._environment`), and this filter is
-    the only thing that drops a system file, which no environment can remove.
+    each peer's; under protection the epoch comparison makes that difference a refusal,
+    not a silent choice of referee, and the payload gate refuses it for every peer. The
+    operator's global and system files and the command-line scope are not the
+    repository's: the broker's environment drops the names that would inject the command
+    scope or redirect the read, and pops `GIT_CONFIG_NOSYSTEM` rather than setting it
+    (`Repository._environment`), so its git does read the system file and this filter is
+    what drops that value.
     Measured 2026-09-10: an effective-scope read ran a global red referee the repository
     never configured and put a global timeout into the epoch (Round BF DUO); a `--local`
     read skipped `[include]` and `config.worktree` and demoted a repository-configured

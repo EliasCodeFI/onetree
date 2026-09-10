@@ -254,7 +254,11 @@ def test_unreadable_referee_configuration_is_a_typed_refusal(
 ) -> None:
     """A value git cannot hand over as UTF-8 text is a real repository input; the other
     three are streams `git config --null --show-scope` does not produce, and the parser
-    refuses them rather than guessing at pairs (uncovered arms, Round BF3 DUO)."""
+    refuses them rather than guessing at pairs (uncovered arms, Round BF3 DUO). The fake
+    serves the malformed stream for `onetree.referee` only and "unset" for the timeout,
+    so an arm that stops refusing hands the value through instead of tripping the timeout
+    parse (Round BF4 DUO: one shared stream made every arm's red an "invalid referee
+    timeout" refusal, and the fixture red only on the message)."""
     coordinator = staged(git_repo)
     if shape == "not_utf8":
         git_repo.git("config", "onetree.referee", os.fsdecode(b"/bin/\xff"))
@@ -270,9 +274,19 @@ def test_unreadable_referee_configuration_is_a_typed_refusal(
             "unterminated": (0, b"local\0/bin/true"),
             "odd_fields": (0, b"local\0"),
         }[shape]
-        fake = subprocess.CompletedProcess(["git", "config"], returncode, stdout=stdout,
-                                           stderr=b"")
-        monkeypatch.setattr(coordinator.repo, "git", lambda *arguments, **options: fake)
+        streams = {
+            "onetree.referee": subprocess.CompletedProcess(
+                ["git", "config"], returncode, stdout=stdout, stderr=b"",
+            ),
+            "onetree.refereeTimeout": subprocess.CompletedProcess(
+                ["git", "config"], 1, stdout=b"", stderr=b"",
+            ),
+        }
+
+        def fake(*arguments: str, **options: Any) -> subprocess.CompletedProcess[bytes]:
+            return streams[arguments[-1]]
+
+        monkeypatch.setattr(coordinator.repo, "git", fake)
         expected = "cannot read referee configuration"
     with pytest.raises(LandingRefusedError, match=expected) as caught:
         referee.configuration(coordinator.repo)

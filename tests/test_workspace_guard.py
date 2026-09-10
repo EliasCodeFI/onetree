@@ -492,21 +492,68 @@ def test_recover_cli_human_mode_names_every_divergence(
     git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The JSON payload carried both items; the human register said only that the branch
-    and the WAL disagree (Round BF3 DUO)."""
+    and the WAL disagree (Round BF3 DUO). Each line carries the commit and operation its
+    detail means by "this commit": two landings missing from the branch are two
+    different lines, not one line twice (Round BF4 DUO)."""
     coordinator = protected(git_repo)
-    landed = coordinator.land("alpha")
-    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    first = coordinator.land("alpha")
+    session = coordinator.register_session("beta", pid=os.getpid())
+    coordinator.claim("beta", [str(git_repo.root / "b.txt")])
+    git_repo.write("b.txt", "beta\n")
+    git_repo.stage(session.index_path, "b.txt")
+    second = coordinator.land("beta")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, second.commit)
     break_referee_setting(git_repo, "timeout")
     assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     summary, *items = captured.err.splitlines()
     assert summary.startswith("onetree: the branch and the WAL disagree")
-    assert any(line.startswith("  landed_not_on_target at refs/heads/main: ") for line in items)
+    missing = [
+        line for line in items if line.startswith("  landed_not_on_target at refs/heads/main: ")
+    ]
+    assert len(missing) == 2
+    assert len(set(missing)) == 2
+    for landed in (first, second):
+        assert any(f"(commit {landed.commit}, operation {landed.operation})" in line
+                   for line in missing)
     assert any(
         line.startswith("  referee_config at HEAD: ") and "invalid referee timeout" in line
+        and "(commit" not in line
         for line in items
     )
+    # Every item is one line: the JSON payload lists the same number of divergences.
+    code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
+    assert code == 2
+    assert len(payload["recovery"]["divergences"]) == len(items)
+
+
+def test_recover_row_identity_excludes_the_detail(git_repo: GitFixture) -> None:
+    """One `branch_diverged` row per distinct divergence set, where a set is identified
+    by kind, target, commit and operation: the detail text is not part of it. A set that
+    recurs with a new detail is not recorded again; the row keeps the detail first
+    observed while the live error carries the fresh one (`_divergence_key`, Round BF4
+    DUO). A row per detail would grow the WAL with every rewording of one condition."""
+    coordinator = protected(git_repo)
+    landed = coordinator.land("alpha")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    break_referee_setting(git_repo, "timeout")
+    with pytest.raises(WalDivergedError):
+        coordinator.recover()
+    events = coordinator.wal.read().events
+    recorded = len(events)
+    first_row = {item["kind"]: item["detail"] for item in events[-1].data["divergences"]}
+    assert "invalid referee timeout" in first_row["referee_config"]
+    # Same kinds, same target, same commit and operation; another detail.
+    git_repo.git("config", "--unset-all", "onetree.refereeTimeout")
+    break_referee_setting(git_repo, "empty")
+    with pytest.raises(WalDivergedError) as fresh:
+        coordinator.recover()
+    reported = {item["kind"]: item["detail"] for item in fresh.value.details["divergences"]}
+    assert "one nonempty value" in reported["referee_config"]
+    events = coordinator.wal.read().events
+    assert len(events) == recorded
+    assert {item["kind"]: item["detail"] for item in events[-1].data["divergences"]} == first_row
 
 
 def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate(
@@ -514,13 +561,17 @@ def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_
 ) -> None:
     """`.git/config` may include a path git expands per operator (`~`): the setting is the
     repository's, its content is whatever each peer's HOME holds. Measured 2026-09-10
-    (Round BF3 DUO, task #164): a peer whose HOME reads another referee is refused by the
-    epoch comparison, and the peer whose HOME matches is refused by the payload gate,
-    whose child has no HOME by design, so its git cannot expand the include (git's
-    diagnostic reaches the refusal only as far as the gate forwards its stderr). Nobody
-    lands while the include is per-operator, and nothing is silent. This fixture asserts
-    that shape; a mechanism that admits HOME for path expansion, or refuses such
-    includes by name, flips it."""
+    (Round BF3 and BF4 DUOs, task #164): a peer whose HOME reads another referee is
+    refused by the epoch comparison; the peer whose HOME matches is refused by the
+    payload gate, whose git children run without HOME and cannot expand the include.
+    Nobody lands while the include is per-operator, and nothing is silent. What the gate
+    refusal looks like is the gate's: this suite's exact-output stub dies on its git
+    call, so the broker sees a gate that wrote to stderr (`PayloadGateError`, the stub's
+    traceback retained, no WAL row); the shipped gate returns DEGRADED naming the include
+    and the broker refuses `payload_gate_degraded` with a WAL row -- the estate-gate
+    variant in test_estate_gate_admission.py asserts that shape. A mechanism that refuses
+    such includes by name flips both; admitting HOME to the broker's environment (#164)
+    flips neither, because the shipped gate strips HOME from its own git children."""
     homes: dict[str, Path] = {}
     for peer, command in (("alpha", "/bin/true"), ("beta", "/bin/false")):
         homes[peer] = tmp_path / peer
@@ -545,6 +596,10 @@ def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_
     assert "wrote to stderr" in str(same_home.value)
     assert same_home.value.details["stderr"]
     assert git_repo.oid() == git_repo.base
+    assert not any(
+        event.kind == "refused" and event.data.get("reason", "").startswith("payload_gate")
+        for event in coordinator.wal.read().events
+    )
     # Control: a path git expands nowhere reads the same for every peer and lands.
     git_repo.git("config", "include.path", str(homes["alpha"] / "referee.gitconfig"))
     landed = coordinator.land("alpha")
@@ -665,10 +720,10 @@ def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture, sh
     """The two shapes task #151 records, each asserting the branch of the guard it reaches.
 
     `routine`: an entry older than `gc.reflogExpire` (90 days) sits inside the recorded
-    prefix and default expiry removes it, so the log is shorter than the recorded prefix
-    (the guard's length clause; the digest clause is the equal-length rewrite test's).
-    `emptied`: `--expire=now` leaves no entries at all. A #151 reconciliation flips the
-    shape it addresses; neither is the desired outcome for an unmoved workspace.
+    prefix and default expiry removes it, so the prefix as recorded is gone ("continuity
+    was lost"). `emptied`: `--expire=now` leaves no entries at all ("absent or
+    incomplete"). A #151 reconciliation flips the shape it addresses; neither is the
+    desired outcome for an unmoved workspace.
     """
     if shape == "routine":
         aged = os.environ.copy()

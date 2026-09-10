@@ -380,9 +380,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stderr.write(f"onetree: {error}{suffix}\n")
             # Each divergence names what the operator must reconcile; a second item
             # beside the branch divergence (an unreadable referee setting) was reported
-            # in the JSON payload only (Round BF3 DUO).
+            # in the JSON payload only (Round BF3 DUO). The detail says "this commit";
+            # the commit and operation it means are printed with it, one line per item
+            # whatever the detail carries (Round BF4 DUO).
             for item in divergences:
-                sys.stderr.write(f"  {item['kind']} at {item['target']}: {item['detail']}\n")
+                where = [
+                    f"{name} {item[name]}" for name in ("commit", "operation")
+                    if item.get(name) is not None
+                ]
+                suffix_text = f" ({', '.join(where)})" if where else ""
+                detail = " ".join(str(item["detail"]).split())
+                sys.stderr.write(
+                    f"  {item['kind']} at {item['target']}: {detail}{suffix_text}\n"
+                )
         return error.exit_code
 
     _emit(payload, json_output, human)

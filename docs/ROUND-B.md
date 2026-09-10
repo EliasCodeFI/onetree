@@ -13,14 +13,16 @@ without a shell. It is read from the repository's own configuration: the
 includes followed, and `.git/config.worktree`), both reached through the
 `.git/config` every peer of the one tree shares. An include whose path git
 expands per operator (`~`) is the repository's setting with each peer's
-content: a peer whose HOME reads another referee is refused by the epoch
-comparison, and under the payload gate — whose child has no HOME — nobody
-lands until the include names one path for everyone (measured 2026-09-10,
-task #164). The operator's global and system files, the command-line scope
+content: under protection a peer whose HOME reads another referee is refused
+by the epoch comparison, and the payload gate — whose git children run
+without HOME whatever the caller holds — refuses every peer until the include
+names one path for everyone (the shipped gate as `payload_gate_degraded` with
+a WAL row naming the include; measured 2026-09-10, task #164). The operator's global and system files, the command-line scope
 and the `GIT_CONFIG*` environment do not decide which referee runs or with
 what timeout, so every peer observes the pair the protected epoch records;
-the environment names are dropped before git runs, and the scope filter is
-what drops a system file, which no environment can remove. A value in both
+the environment names that inject or redirect are dropped before git runs,
+`GIT_CONFIG_NOSYSTEM` is popped rather than set, so the broker's git reads the
+system file and the scope filter is what drops that value. A value in both
 repository scopes is a duplicate and refuses; a value git cannot hand over as
 UTF-8 text refuses as `referee_config`. A shell pipeline requires an explicitly named shell in that
 command. Its executable and external dependencies are trusted operator inputs;
@@ -98,8 +100,10 @@ and as one stderr line per item in the human register) and records that set
 as one `branch_diverged` row; correcting the setting leaves the divergence to
 reconcile, and the audit that can now read the workspace reports the external
 move as `workspace_changed` beside it — a new divergence set, recorded once.
-One row per distinct set for the life of the WAL: an identical set recurring
-later is not recorded again. Do not remove the WAL or disable
+One row per distinct set for the life of the WAL, a set being identified by
+each item's kind, target, commit and operation — not its detail text: a set
+recurring with a reworded detail is not recorded again, the row keeps the
+detail first observed and the live error carries the fresh one. Do not remove the WAL or disable
 the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
@@ -316,12 +320,12 @@ unmeasured guards with fixtures:
 
 | Unmeasured guard or gap | Fixture | Observed red |
 | --- | --- | --- |
-| scope filter admitting `system` / `command` | `test_system_and_command_scopes_are_not_the_repositorys[system, command]` — the redirecting names are admitted into the broker's environment on purpose, so the pair reaches the filter | filter widened to `!= "global"`: the red referee ran |
-| referee stream refusals: non-UTF-8 value (real input), exit other than 0/1, unterminated stream, odd field count | `test_unreadable_referee_configuration_is_a_typed_refusal[not_utf8, exit_128, unterminated, odd_fields]` | each arm neutralised in turn: no refusal |
-| recovery's `branch_diverged` row asserted only through the raised error; one refusal shape sampled | `test_recover_keeps_a_real_divergence_beside_an_unreadable_setting[timeout, duplicate, empty, not_utf8]` reads the row, its `referee_config` detail, and the second set after correction | row recorded without the item: passed at `8aec20f` |
-| human-mode `wal --recover` named neither item | `test_recover_cli_human_mode_names_every_divergence` | summary line only at `8aec20f` |
-| per-operator include (`~`) in `.git/config`: the doc said both scopes are shared | `test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate` | epoch comparison neutralised: the other HOME's referee ran silently |
-| `head_ref` / `symbolic_head` non-1 exit proven against a fake only | the head_ref test writes `ref: refs/heads/a..b` into `.git/HEAD` and reads both | exit 128 mapped to `detached`: passed |
+| scope filter admitting `system` / `command` | `test_system_and_command_scopes_are_not_the_repositorys[system, command]` — the redirecting names are admitted into the broker's environment on purpose, so the pair reaches the filter | filter widened to `!= "global"`: `assert ('/bin/false', 300.0) == (None, 300.0)` at the configuration read, before any landing |
+| referee stream refusals: non-UTF-8 value (real input), exit other than 0/1, unterminated stream, odd field count | `test_unreadable_referee_configuration_is_a_typed_refusal[not_utf8, exit_128, unterminated, odd_fields]` | at `abe35ec` (one fake stream served for both keys): `not_utf8` DID NOT RAISE; `exit_128` and `unterminated` still refused as `invalid referee timeout` and the fixture failed on the message only; `odd_fields` an untyped `ValueError` from `zip(strict=True)`. Round BF5 corrected the fake; see its table |
+| recovery's `branch_diverged` row asserted only through the raised error; one refusal shape sampled | `test_recover_keeps_a_real_divergence_beside_an_unreadable_setting[timeout, duplicate, empty, not_utf8]` reads the row, its `referee_config` detail, and the second set after correction | row recorded without the item: the row/error equality assert fails; an unchanged set re-recorded: the event-count assert fails |
+| human-mode `wal --recover` named neither item | `test_recover_cli_human_mode_names_every_divergence` | at `8aec20f`: no item line under the summary (the fixture's line count assert) |
+| per-operator include (`~`) in `.git/config`: the doc said both scopes are shared | `test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_gate` | epoch comparison neutralised: `PayloadGateError: commit payload gate wrote to stderr` inside `pytest.raises(LandingRefusedError)` — the gate's git died on the include before any referee ran |
+| `head_ref` / `symbolic_head` non-1 exit proven against a fake only | the head_ref test writes `ref: refs/heads/a..b` into `.git/HEAD` and reads both | `head_ref` mapping exit 128 to `detached` was already failed by the fake at `8aec20f` (regex mismatch); the `symbolic_head` mapping passed there and the new fixture is what fails it (`DID NOT RAISE GitError`) |
 
 The reflog-expiry fixture's docstring now names the clause the routine shape
 reaches (the log is shorter than the recorded prefix; the digest clause is the
@@ -334,6 +338,54 @@ Receipt: `round-bf4-red-first.txt` in the local evidence directory (one
 behaviour red against `8aec20f`, four fixtures green there as expected, eleven
 guard-neutralised runs failing, the three touched files green as the control;
 a first run's control failed once on a stale `__pycache__` entry compiled from
-a same-length mutant, and the harness now runs without bytecode). Gates at the
-BF4 commit: ruff clean, strict mypy clean, 586 passed / 30 skipped, coverage
-91.78%.
+a same-length mutant, and the harness now runs without bytecode). That receipt
+records pass/fail tails only; the "Observed red" column above was rewritten
+in Round BF5 from the failure texts the BF4 DUO captured, replacing cells that
+had been inferred from the neutralisation rather than read from the run.
+Gates at the BF4 commit: ruff clean, strict mypy clean, 586 passed / 30
+skipped, coverage 91.78%.
+
+### Round BF5 (fix round after the Round BF4 DUO, 2026-09-10)
+
+The Round BF4 DUO read `8aec20f..abe35ec`: the adversarial review returned
+clean and the silent-failure hunt returned new-debt. Its findings are about
+the account of the measurement and the fixtures' reasons for going red, not
+about a broker behaviour: the BF4 table's "Observed red" column narrated
+hypotheticals in four of six rows (the receipt kept pass/fail tails only); the
+stream fixture's fake served one stream for both keys, so a neutralised arm
+still refused as `invalid referee timeout` and the fixture was red on the
+message alone; the reflog-expiry docstring named the clause the routine shape
+reaches, which no fixture can assert (a shorter log cannot hash to the recorded
+digest either); the divergence-set identity excludes the detail text, which
+the doc's "identical" did not say; the new human-mode lines omitted the commit
+and operation their detail calls "this commit"; the referee docstring said a
+system file is one "no environment can remove" (`GIT_CONFIG_NOSYSTEM=1`
+removes it — the broker pops that name rather than setting it); and the `~`
+include fixture pinned the stub gate's refusal shape while the shipped gate
+refuses `payload_gate_degraded` with a WAL row. Round BF5 changes one
+behaviour — each human-mode divergence line carries `(commit …, operation …)`
+when the item has them and is a single line whatever the detail carries — and
+corrects the fixtures and prose:
+
+| Corrected guard, fixture or claim | Fixture | Observed red (first failure line, `round-bf5-red-first.txt`) |
+| --- | --- | --- |
+| stream fixture red for the wrong reason | the fake serves the malformed stream for `onetree.referee` and "unset" for the timeout | rc arm removed: `DID NOT RAISE LandingRefusedError`; terminator arm removed: `DID NOT RAISE`; `errors="replace"`: `DID NOT RAISE`; odd-field arm removed: `ValueError: zip() argument 2 is shorter than argument 1` (the strict zip is a second, untyped guard) |
+| human-mode lines name the commit and operation | `test_recover_cli_human_mode_names_every_divergence` lands twice, moves the branch back, asserts two distinct `landed_not_on_target` lines each naming its commit and operation, and one line per JSON item | at `abe35ec`: `assert 1 == 2` (two identical lines); suffix removed: `assert 1 == 2`; item loop removed: `assert 0 == 2` |
+| divergence-set identity excludes the detail | `test_recover_row_identity_excludes_the_detail`: a reworded detail over the same set adds no row and the row keeps the first detail | `detail` added to the key: `assert 7 == 6` (a row was added) |
+| the `~` include under the shipped gate | `test_real_gate_refuses_a_per_operator_include_as_degraded` (ONETREE_TEST_ESTATE_GATE, test_estate_gate_admission.py): `payload_gate_degraded`, `degraded[]` names the include, one WAL row; the stub-gate fixture additionally asserts that the stub leaves no WAL row | gap-shape fixtures: green at `abe35ec` by design; the epoch comparison removed still fails the stub-gate fixture with `PayloadGateError` from the gate |
+| the earlier neutralisations, re-observed | scope filter widened: `assert ('/bin/false', 300.0) == (None, 300.0)`; row without the item: row/error equality assert; unchanged set re-recorded: `assert 8 == (5 + 2)`; `head_ref` exit 128 as detached: `Regex pattern did not match`; `symbolic_head`: `DID NOT RAISE GitError` | as listed |
+
+Docstrings: the reflog-expiry fixture states the two outcomes ("continuity was
+lost", "absent or incomplete") without naming a clause; the referee docstring
+says the broker pops `GIT_CONFIG_NOSYSTEM` rather than setting it, so its git
+reads the system file and the filter is what drops that value, and that the
+epoch comparison is a protected-workspace mechanism; the include fixture
+docstring describes both gates' shapes. The estate-gate variant runs only
+where `ONETREE_TEST_ESTATE_GATE` names the shipped gate (task #96); it was
+observed green against `/home/anvil/.claude/tools/commit_payload.py` here.
+
+Receipt: `round-bf5-red-first.txt` (one behaviour red against `abe35ec`, four
+fixtures green there as expected, thirteen guard-neutralised runs failing with
+their first failure line recorded, the four touched test files green as the
+control, the estate-gate file included with the shipped gate). Gates at the
+BF5 commit are recorded in the commit message.

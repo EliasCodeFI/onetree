@@ -13,6 +13,7 @@ import pytest
 from conftest import GitFixture, KillGit
 
 from onetree import git as git_module
+from onetree import referee
 from onetree.core import Coordinator
 from onetree.errors import LandingRefusedError
 
@@ -225,3 +226,46 @@ def test_landing_message_does_not_execute_configured_trailer_commands(
     assert "Onetree-Operation:" in message
     assert f"Onetree-Operation: {'a' * 32}" in message
     assert not marker.exists()
+
+
+def test_real_gate_refuses_a_per_operator_include_as_degraded(
+    git_repo: GitFixture,
+    estate_gate: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped gate's git children run without HOME whatever the caller holds, so a
+    `~` include in `.git/config` fails their config read; the gate reports DEGRADED naming
+    the include and the broker refuses `payload_gate_degraded` with a WAL row. The stub
+    gate of the ordinary suite dies on the same input (`PayloadGateError`, no row); the
+    workspace-guard fixture asserts that shape, this one the shipped gate's (Round BF4
+    DUO, task #164)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    git_repo.git("config", "--file", str(home / "referee.gitconfig"), "onetree.referee",
+                 "/bin/true")
+    git_repo.git("config", "include.path", "~/referee.gitconfig")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _SESSION)
+    coordinator = Coordinator(git_repo.root, commit_payload=estate_gate)
+    session = coordinator.register_session("admission", pid=os.getpid(), ttl=300)
+    coordinator.claim("admission", [str(git_repo.root / "a.txt")])
+    git_repo.write("a.txt", "per-operator include\n")
+    git_repo.stage(session.index_path, "a.txt")
+    message = (
+        "Per-operator include\n\nCo-Authored-By: Claude <claude@example.invalid>\n"
+        f"Claude-Session: {_SESSION}\n"
+    )
+    # Control: the broker's own read, which keeps HOME, sees the included referee.
+    assert referee.configuration(coordinator.repo) == ("/bin/true", referee.DEFAULT_TIMEOUT)
+    with pytest.raises(LandingRefusedError) as refused:
+        coordinator.land("admission", message=message)
+    assert refused.value.details["reason"] == "payload_gate_degraded"
+    assert any("referee.gitconfig" in str(row) for row in refused.value.details["degraded"])
+    assert git_repo.oid() == git_repo.base
+    assert [
+        (event.kind, event.data.get("reason"))
+        for event in coordinator.wal.read().events
+        if event.kind in {"refused", "land_intent", "landed"}
+    ] == [("refused", "payload_gate_degraded")]
