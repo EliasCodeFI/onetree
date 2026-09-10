@@ -627,12 +627,19 @@ def test_recover_cli_human_mode_keeps_each_item_on_one_line(
     which can be several lines) is still one stderr line per item; the fragment would
     otherwise start a line of its own at column 0. No shipped producer of such a detail
     was demonstrated (Round BF5 DUO), so the input is synthetic: the reflog-switch read
-    raising a git failure whose message carries every break a line reader honours --
-    LF, CR, NEL and LINE SEPARATOR -- so a collapse of the newline alone fails it (Round
-    BF6 DUO)."""
+    raising a git failure whose message carries every boundary `str.splitlines` honours
+    -- the eleven of its own documentation, LF, CR, CRLF, VT, FF, FS, GS, RS, NEL, LINE
+    SEPARATOR and PARAGRAPH SEPARATOR -- so a collapse of any subset fails it (Round BF6
+    and BF7 DUOs: four of the eleven left a four-break collapse green)."""
     coordinator = protected(git_repo)
     coordinator.land("alpha")
-    breaks = "fatal: bad config line 3 in file .git/config\nhint: fix\rthe\x85file\u2028now"
+    boundaries = ["\n", "\r", "\r\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
+                  "\u2028", "\u2029"]
+    words = [f"w{index}" for index in range(len(boundaries) + 1)]
+    breaks = "fatal: bad config line 3 in file .git/config" + "".join(
+        boundary + word for boundary, word in zip(boundaries, words[1:], strict=True)
+    )
+    assert breaks.splitlines() == ["fatal: bad config line 3 in file .git/config", *words[1:]]
 
     def failing(repo: Any) -> bool:
         raise GitError(breaks)
@@ -641,12 +648,11 @@ def test_recover_cli_human_mode_keeps_each_item_on_one_line(
     assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert len(breaks.splitlines()) == 5
     summary, *items = captured.err.splitlines()
     assert summary.startswith("onetree: the branch and the WAL disagree")
     assert len(items) == 1
     assert items[0].startswith("  workspace_changed at HEAD: workspace observation failed: ")
-    assert "bad config line 3 in file .git/config hint: fix the file now" in items[0]
+    assert "bad config line 3 in file .git/config " + " ".join(words[1:]) in items[0]
     # Control: the JSON payload keeps the detail's newline.
     code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
     assert code == 2
@@ -661,24 +667,27 @@ def test_cli_human_mode_keeps_the_summary_on_one_line(
     synthetic: `.git/config` includes a path git expands per operator while the broker's
     environment has no HOME, so the broker's own git dies before any command runs and the
     GitError carries git's two-line diagnostic; without the collapse the `fatal:` line
-    started at column 0 as if it were a second message (Round BF6 DUO). JSON carries the
-    message as git wrote it."""
-    git_repo.git("config", "include.path", "~/referee.gitconfig")
+    started at column 0 as if it were a second message (Round BF6 DUO). The include path
+    itself carries a NEL, which git passes through its stderr as it does every non-ASCII
+    byte, so the line has a break that is not a newline and a collapse of the newline
+    alone fails the line reader (Round BF7 DUO). JSON carries the message as git wrote
+    it."""
+    git_repo.git("config", "include.path", "~/ref\x85ee.gitconfig")
     monkeypatch.delenv("HOME")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.count("\n") == 1
+    assert len(captured.err.splitlines()) == 1
     assert captured.err.startswith("onetree: git ")
     assert (
-        "could not expand include path '~/referee.gitconfig' fatal: bad config line"
+        "could not expand include path '~/ref ee.gitconfig' fatal: bad config line"
         in captured.err
     )
     code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
     assert code == 2
     assert payload["error"]["type"] == "git_error"
-    assert "could not expand include path '~/referee.gitconfig'\nfatal: bad config line" in (
+    assert "could not expand include path '~/ref\x85ee.gitconfig'\nfatal: bad config line" in (
         payload["error"]["message"]
     )
 

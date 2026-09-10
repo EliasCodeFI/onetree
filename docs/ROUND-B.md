@@ -15,13 +15,14 @@ includes followed, and `.git/config.worktree`), both reached through the
 expands per operator (`~`) is the repository's setting with each peer's
 content: under protection a peer whose HOME reads another referee is refused
 by the epoch comparison, and the payload gate — whose audit children run
-without HOME whatever the caller holds, on the `commit` path the broker
-invokes — refuses every peer until the include names one path for everyone
-(the shipped gate as `payload_gate_degraded` with a WAL row naming the
-include; past the gate, the referee's own clone runs without HOME as well and
-refuses `referee_error`; measured 2026-09-10, task #164; the gate's
-index-check path is another matter — its safe.directory probe forwards HOME,
-and without HOME the probe's own failure is the DEGRADED there). The operator's global and system files, the command-line scope
+without HOME whatever the caller holds — refuses every peer until the include
+names one path for everyone (the shipped gate as `payload_gate_degraded`, the
+include named in the WAL row, the JSON payload and the human-mode lines under
+the summary; past the gate, the referee's own clone runs without HOME as well
+and refuses `referee_error`; measured 2026-09-10, task #164). The broker
+invokes the gate's `commit` mode; the index-check mode runs a safe.directory
+probe first that forwards HOME, so without HOME the probe's own failure is
+the DEGRADED there, naming the include just the same. The operator's global and system files, the command-line scope
 and the `GIT_CONFIG*` environment do not decide which referee runs or with
 what timeout, so every peer observes the pair the protected epoch records;
 the environment names that inject or redirect are dropped before git runs,
@@ -107,7 +108,9 @@ move as `workspace_changed` beside it — a new divergence set, recorded once.
 One row per distinct set for the life of the WAL, a set being identified by
 each item's kind, target, commit and operation — not its detail text: a set
 recurring with a reworded detail is not recorded again, the row keeps the
-detail first observed and the live error carries the fresh one. Do not remove the WAL or disable
+detail first observed and the live error carries the fresh one (the commit is
+the half of that identity a shipped input can separate; no shipped input
+separates two sets by the operation alone, Round BF7). Do not remove the WAL or disable
 the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
@@ -450,11 +453,13 @@ NEL and LINE SEPARATOR as well. On an adjacent surface the round had not
 claimed, the summary line `onetree: {error}` printed a `GitError` as carried:
 git's diagnostic for an include it cannot expand is two lines, and the
 `fatal:` fragment started a line of its own at column 0. And "the audit
-children run without HOME" was over-general: on the gate's index-check path a
-safe.directory probe that forwards HOME runs first, and without HOME its own
-failure is the DEGRADED there; the broker invokes `commit` mode only, where
-that probe never runs. Round BF7 changes one behaviour — the summary line is
-one line, as the item lines are — and reshapes two fixtures:
+children run without HOME" left something out: on the gate's index-check path
+a safe.directory probe — not an audit child in the gate's own vocabulary —
+runs first and forwards HOME, so without HOME its own failure is the DEGRADED
+there (the audit children run without HOME on both paths, as the BF6 sentence
+said; the broker invokes `commit` mode only, where that probe never runs).
+Round BF7 changes one behaviour — the summary line is one line, as the item
+lines are — and reshapes two fixtures:
 
 | Claim without its measurement | Fixture | Observed red (first failure line, `round-bf7-red-first.txt`) |
 | --- | --- | --- |
@@ -474,4 +479,45 @@ fixtures green there as expected, five guard-neutralised runs failing with
 their first failure line, one documented gap observed green, four test files
 green as the control — the two the commit touches, `test_cli.py` for the
 summary line's other callers and `test_referee.py`, the estate-gate file under
-the shipped gate). Gates at the BF7 commit are in the commit message.
+the shipped gate). Gates at the BF7 commit: ruff clean, strict mypy clean,
+590 passed / 31 skipped, coverage 91.78%; CI run 34513872537 three legs
+success (91.81/91.81/91.78%).
+
+### Round BF8 (fix round after the Round BF7 DUO, 2026-09-10)
+
+The Round BF7 DUO read `4320afd..8020596`; both seats returned new-debt, no
+execution-miss, and the owner routed the round as "apply the DUO's fixes,
+commit, merge" — this round is the last fix round of the chain and no DUO
+reads it; its receipt is the harness run below, CI, and CodeRabbit's review of
+PR #8. The findings: the summary-line fixture repeated, in the same commit
+that widened the item-line fixture, the shape that fixture had been widened
+for — it carried LF only and read with `count("\n")`, so a collapse of the
+newline alone passed it, while a NEL inside the include path travels git's
+stderr as every non-ASCII byte does; the item-line fixture said "every break
+a line reader honours" while carrying four of the eleven boundaries
+`str.splitlines` documents, so a collapse of exactly those four passed it; the
+BF7 narrative called the BF6 clause over-general when it had left the probe
+out; and, on an adjacent surface, human mode named a degraded gate's verdict
+and nothing else — the rows saying what it could not audit were in the WAL
+row and the JSON payload only, the shape Round BF4 had fixed for divergence
+items. Round BF8 changes two behaviours: the one-line rendering joins the
+lines a line reader sees and keeps the message's own spacing (a path with two
+spaces is that path; the previous whitespace collapse would have printed one),
+and a degraded gate's rows are printed under the summary, one line each.
+
+| Claim without its measurement | Fixture | Observed red (first failure line, `round-bf8-red-first.txt`) |
+| --- | --- | --- |
+| the summary line is one line whatever break it carries | `test_cli_human_mode_keeps_the_summary_on_one_line`: the include path carries a NEL (`~/ref\x85ee.gitconfig`), git echoes it, the reader is `splitlines()` | collapse of `\n` alone: `assert 2 == 1`; rendering removed: `assert 3 == 1` (the NEL and the newline both break) |
+| one stderr line per item over every boundary a line reader honours | `test_recover_cli_human_mode_keeps_each_item_on_one_line`: the synthetic detail carries all eleven, asserted against `splitlines()` itself | collapse of the four BF7 sampled: `assert 7 == 1`; rendering removed: `assert 12 == 1` |
+| a degraded gate's rows reach the operator in human mode, each with its own spacing | `test_cli_human_mode_names_what_a_degraded_gate_could_not_audit`: a scripted DEGRADED gate whose first row is the shipped gate's text for a per-operator include, newline included, and a second row naming `'a  b.txt'` | at `8020596`: `assert [] == ['  degraded: ...']` — no line under the summary; row loop removed: the same; the whitespace-run rendering of `8020596` restored: `'a b.txt'` against `'a  b.txt'` |
+
+Prose: the contract paragraph says where the include is named (WAL row, JSON,
+human mode) and states the index-check probe without calling the audit
+children over-general; the identity sentence says which half of the identity
+a shipped input can separate; the BF7 narrative reads as the seats measured.
+
+Receipt: `round-bf8-red-first.txt` (one behaviour red against `8020596`, two
+fixtures green there as expected, six guard-neutralised runs failing with
+their first failure line, five test files green as the control — the two the
+commit touches, `test_cli.py`, `test_referee.py` and the estate-gate file
+under the shipped gate). Gates at the BF8 commit are in the commit message.

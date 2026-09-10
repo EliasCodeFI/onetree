@@ -643,6 +643,60 @@ def test_degraded_payload_gate_without_a_payload_census_is_a_typed_refusal(
     )
 
 
+def test_cli_human_mode_names_what_a_degraded_gate_could_not_audit(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A degraded gate's rows name what it could not audit. They were in the WAL row and
+    the JSON payload only; human mode said `commit payload gate degraded the candidate`
+    and nothing more (Round BF7 DUO). Each row is one stderr line under the summary
+    whatever break it carries, and a row's own spacing stays: a path with two spaces is
+    that path (Round BF8; the earlier rendering collapsed every whitespace run). The gate
+    is scripted; the first row is the shipped gate's text for a per-operator include, with
+    the newline git's diagnostic carries."""
+    row = (
+        "commit audit: rev-parse exited 128: error: could not expand include path "
+        "'~/referee.gitconfig'\nfatal: bad config line 10 in file .git/config"
+    )
+    spaced = "census unavailable for 'a  b.txt'"
+    gate = _write_gate(
+        tmp_path / "degraded.py",
+        {
+            "repository": str(git_repo.root),
+            "staged_files": [],
+            "findings": [],
+            "degraded": [row, spaced],
+            "verdict": "DEGRADED",
+        },
+        2,
+    )
+    _register_and_stage(git_repo, "alpha", "degraded gate\n", commit_payload=gate)
+    argv = [
+        "land", "--repo", str(git_repo.root), "--session", "alpha",
+        "--commit-payload", str(gate),
+    ]
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    summary, *items = captured.err.splitlines()
+    assert summary == "onetree: commit payload gate degraded the candidate"
+    assert items == [
+        (
+            "  degraded: commit audit: rev-parse exited 128: error: could not expand "
+            "include path '~/referee.gitconfig' fatal: bad config line 10 in file .git/config"
+        ),
+        f"  degraded: {spaced}",
+    ]
+    # Control: JSON carries the rows as the gate wrote them.
+    assert main([*argv, "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["reason"] == "payload_gate_degraded"
+    assert payload["error"]["degraded"] == [row, spaced]
+
+
 def test_degraded_payload_gate_for_a_different_repository_fails_closed(
     git_repo: GitFixture,
     tmp_path: Path,

@@ -135,6 +135,13 @@ def _actor(explicit: str | None) -> str:
     return candidates.pop()
 
 
+def _one_line(text: str) -> str:
+    """One stderr line per message: every boundary a line reader honours becomes a
+    space, and the message's own spacing stays (a path with two spaces is that path).
+    JSON carries the message as written."""
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
 def _emit(payload: Mapping[str, Any], json_output: bool, human: str) -> None:
     if json_output:
         sys.stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
@@ -377,10 +384,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pending_divergence
                 else ""
             )
-            # The summary is one line whatever the message carries: a GitError carries
-            # git's stderr, two lines for an include git cannot expand (Round BF6 DUO).
-            message = " ".join(str(error).split())
-            sys.stderr.write(f"onetree: {message}{suffix}\n")
+            # The summary is one line whatever break the message carries: a GitError
+            # carries git's stderr, two lines for an include git cannot expand (Round
+            # BF6 DUO), and git passes non-ASCII breaks through (Round BF7 DUO).
+            sys.stderr.write(f"onetree: {_one_line(str(error))}{suffix}\n")
             # Each divergence names what the operator must reconcile; a second item
             # beside the branch divergence (an unreadable referee setting) was reported
             # in the JSON payload only (Round BF3 DUO). The detail says "this commit";
@@ -392,10 +399,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if item.get(name) is not None
                 ]
                 suffix_text = f" ({', '.join(where)})" if where else ""
-                detail = " ".join(str(item["detail"]).split())
                 sys.stderr.write(
-                    f"  {item['kind']} at {item['target']}: {detail}{suffix_text}\n"
+                    f"  {item['kind']} at {item['target']}: "
+                    f"{_one_line(str(item['detail']))}{suffix_text}\n"
                 )
+            # A degraded gate names what it could not audit; the rows were in the WAL
+            # row and the JSON payload only (Round BF7 DUO).
+            for row in error.details.get("degraded") or []:
+                sys.stderr.write(f"  degraded: {_one_line(str(row))}\n")
         return error.exit_code
 
     _emit(payload, json_output, human)
