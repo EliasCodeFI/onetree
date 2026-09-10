@@ -35,13 +35,17 @@ def test_ci_covers_every_supported_python_minor_and_uses_node24_actions() -> Non
     checkout_versions = {
         line for line in workflow_lines if line.startswith("- uses: actions/checkout@")
     }
-    setup_python_versions = {
-        line for line in workflow_lines if line.startswith("- uses: actions/setup-python@")
+    setup_uv_versions = {
+        line.split(" #", 1)[0]
+        for line in workflow_lines
+        if line.startswith("- uses: astral-sh/setup-uv@")
     }
 
     assert python_matrices == {'python-version: ["3.11", "3.12", "3.13"]'}
     assert checkout_versions == {"- uses: actions/checkout@v7"}
-    assert setup_python_versions == {"- uses: actions/setup-python@v7"}
+    assert setup_uv_versions == {
+        "- uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+    }
 
 
 def test_coverage_configuration_measures_python_subprocesses() -> None:
