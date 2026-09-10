@@ -38,7 +38,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(session)
     session.add_argument("--pid", type=int, help="Long-lived session body PID (default: parent).")
     session.add_argument("--ttl", type=float, default=86400.0, help="Session lease seconds.")
-    session.add_argument("--target", help="Full refs/heads target (default: symbolic HEAD).")
+    session.add_argument(
+        "--target",
+        help="Full refs/heads target (default: HEAD branch or unique same-tip branch).",
+    )
     _add_output(session)
 
     claim = subparsers.add_parser("claim", help="Claim one or more absolute existing paths.")
@@ -63,13 +66,30 @@ def _build_parser() -> argparse.ArgumentParser:
     land = subparsers.add_parser("land", help="Audit and CAS-land the session index.")
     _add_repo(land)
     _add_actor(land)
-    land.add_argument("--target", help="Full refs/heads target (default: symbolic HEAD).")
+    land.add_argument(
+        "--target",
+        help="Full refs/heads target (required while HEAD is detached).",
+    )
     land.add_argument("-m", "--message", help="Commit message.")
     _add_output(land)
 
     wal = subparsers.add_parser("wal", help="Verify and inspect refs/onetree/wal.")
     _add_repo(wal)
-    wal.add_argument("--recover", action="store_true", help="Resolve any exposed intent.")
+    wal_action = wal.add_mutually_exclusive_group()
+    wal_action.add_argument("--recover", action="store_true", help="Resolve any exposed intent.")
+    wal_action.add_argument(
+        "--adopt",
+        action="store_true",
+        help="Record broker landings found by the local branch audit.",
+    )
+    wal.add_argument(
+        "--target",
+        help=(
+            "One refs/heads branch. Only --adopt narrows anything: it limits which "
+            "landings are recorded. In every mode the audit and the report stay "
+            "repository-wide, and naming a branch only adds it to that audit."
+        ),
+    )
     _add_output(wal)
 
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")
@@ -189,13 +209,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             human = f"landed {land_result.commit} on {land_result.target}"
             if land_result.warnings:
                 human += f" [warning: {', '.join(land_result.warnings)}]"
+        elif args.command == "wal" and args.adopt:
+            adoption_result = coordinator.adopt_landings(args.target)
+            wal_result = adoption_result.report
+            return_code = 0 if wal_result.consistent else 1
+            payload = {
+                "ok": wal_result.consistent,
+                "adoption": {
+                    "ref": "refs/onetree/wal",
+                    "head": wal_result.head,
+                    "consistent": wal_result.consistent,
+                    "pending_intents": wal_result.pending_intents,
+                    "divergences": [item.payload() for item in wal_result.divergences],
+                    "commits": [event.data["commit"] for event in adoption_result.adopted],
+                },
+            }
+            human = (
+                f"WAL adoption recorded {len(adoption_result.adopted)} landing(s): "
+                f"{'consistent' if wal_result.consistent else 'INCONSISTENT'}"
+            )
         elif args.command == "wal" and args.recover:
             # Exit codes differ between the two `wal` modes on purpose. Inspection
             # is a report: 1 means "I looked and the state is not clean", the way
             # a diff reports difference. Recovery is an action: a divergence it
             # cannot repair raises, and a raised OnetreeError exits 2, because the
             # command it was asked to complete did not complete.
-            recovery_result = coordinator.recover()
+            recovery_result = coordinator.recover(args.target)
             return_code = 0 if recovery_result.consistent else 1
             payload = {
                 "ok": recovery_result.consistent,
@@ -221,7 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{', '.join(recovery_result.locks)}"
                 )
         elif args.command == "wal":
-            wal_result = coordinator.inspect_wal()
+            wal_result = coordinator.inspect_wal(args.target)
             return_code = 0 if wal_result.consistent else 1
             payload = {
                 "ok": True,

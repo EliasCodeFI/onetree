@@ -109,7 +109,12 @@ def test_land_refuses_nothing_staged_wrong_target_and_diverged_target(
     assert diverged.value.details["reason"] == "target_diverged"
 
 
-def test_claim_expiry_at_transaction_fence_refuses(git_repo: GitFixture) -> None:
+def test_claim_expiry_at_transaction_fence_refuses(
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_000_000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
     coordinator = Coordinator(git_repo.root)
     session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     coordinator.claim("alpha", [str(git_repo.root / "a.txt")], ttl=0.2)
@@ -118,7 +123,7 @@ def test_claim_expiry_at_transaction_fence_refuses(git_repo: GitFixture) -> None
 
     def expire(point: str, _context: Mapping[str, Any]) -> None:
         if point == "before_intent":
-            time.sleep(0.25)
+            clock[0] += 0.25
 
     with pytest.raises(LandingRefusedError) as refused:
         coordinator.land("alpha", checkpoint=expire)
@@ -237,6 +242,31 @@ def test_recovery_resolves_an_exposed_intent(
     else:
         assert recovered.refused == 1
         coordinator.release("alpha", [str(git_repo.root / "a.txt")])
+
+
+def test_wal_document_version_tracks_the_event_kind() -> None:
+    """`v` names the lowest reader a kind needs, and a document may not understate it."""
+
+    adopted = Wal.document("adopted", "operator", {"operation": "a" * 32})
+    collected = Wal.document(
+        "gc",
+        "alpha",
+        {"claim_generations": [], "session_generations": []},
+    )
+
+    assert adopted["v"] == 2
+    assert collected["v"] == 1
+    assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
+
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**adopted, "v": 1}, oid="fixture")
+    with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
+        Wal._validate_document({**collected, "v": 3}, oid="fixture")
+    # ``True`` is the one that matters: it compares equal to 1, so a bool would
+    # otherwise pass the per-kind check for every version-1 kind.
+    for understated in (0, -1, True, "1", 1.0):
+        with pytest.raises(WalCorruptError, match="WAL schema version is invalid"):
+            Wal._validate_document({**collected, "v": understated}, oid="fixture")
 
 
 def test_wal_document_validator_and_empty_wal_paths(git_repo: GitFixture) -> None:

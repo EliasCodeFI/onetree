@@ -17,7 +17,7 @@ from conftest import GitFixture, KillGit, install_kill_git
 
 from onetree import core
 from onetree.core import Coordinator
-from onetree.errors import LandingRefusedError, WalDivergedError
+from onetree.errors import LandingRefusedError, UnrecordedLandingError
 
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
@@ -413,12 +413,14 @@ def test_inv7_de_ordered_protocol_leaves_an_unrecorded_landing_that_is_detected(
     assert [item.kind for item in report.divergences] == ["unrecorded_landing"]
     assert report.divergences[0].commit == git_repo.oid()
 
-    with pytest.raises(WalDivergedError) as diverged:
+    wal_before = coordinator.wal.head()
+    with pytest.raises(UnrecordedLandingError) as diverged:
         coordinator.recover()
     assert diverged.value.details["divergences"][0]["kind"] == "unrecorded_landing"
+    assert coordinator.wal.head() == wal_before
     recorded = [
         event
         for event in coordinator.inspect_wal().events
         if event.kind == "refused" and event.data.get("reason") == "branch_diverged"
     ]
-    assert len(recorded) == 1
+    assert recorded == []

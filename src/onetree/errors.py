@@ -25,6 +25,30 @@ class GitError(OnetreeError):
     kind = "git_error"
 
 
+class UnsupportedWorktreeError(OnetreeError):
+    """Gate 1 coordination was invoked from a linked Git worktree."""
+
+    kind = "unsupported_worktree"
+
+
+class UnrecordedLandingError(OnetreeError):
+    """A branch carries broker landings that the local WAL does not record."""
+
+    kind = "unrecorded_landing"
+
+
+class ShallowHistoryError(OnetreeError):
+    """The repository's shallow boundary prevents a complete landing audit."""
+
+    kind = "shallow_history"
+
+
+class LegacyGraftError(OnetreeError):
+    """A legacy graft can make the stored commit graph incomplete to an audit."""
+
+    kind = "legacy_grafts"
+
+
 class IdentityError(OnetreeError):
     """A session identity is absent, ambiguous, or malformed."""
 
