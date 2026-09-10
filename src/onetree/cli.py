@@ -1,4 +1,4 @@
-"""Command-line adapter for the Round A broker."""
+"""Command-line interface for shared-tree coordination."""
 
 from __future__ import annotations
 
@@ -32,6 +32,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="Report version and build phase.")
     _add_output(status)
+
+    protect = subparsers.add_parser("protect", help="Protect the current shared branch baseline.")
+    _add_repo(protect)
+    _add_actor(protect)
+    _add_output(protect)
 
     session = subparsers.add_parser("session", help="Register or inspect a session index.")
     _add_repo(session)
@@ -151,9 +156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": True,
             "name": "onetree",
             "version": __version__,
-            "phase": "gate-1-round-a",
+            "phase": "gate-1-round-b",
         }
-        _emit(payload, json_output, f"onetree {__version__} (phase: gate-1-round-a)")
+        _emit(payload, json_output, f"onetree {__version__} (phase: gate-1-round-b)")
         return 0
 
     try:
@@ -214,6 +219,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if check_result.blocked
                 else f"CLEAR {check_result.path}"
             )
+        elif args.command == "protect":
+            epoch = coordinator.protect_workspace(_actor(args.actor))
+            payload = {"ok": True, "workspace": dict(epoch)}
+            human = f"protected {epoch['target']} at {epoch['tip']}"
         elif args.command == "land":
             land_result = coordinator.land(
                 _actor(args.actor),
@@ -232,6 +241,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "intent": land_result.intent,
                     "warnings": list(land_result.warnings),
                     "gate_receipt": land_result.gate_receipt,
+                    "referee_receipt": land_result.referee_receipt,
                 },
             }
             human = f"landed {land_result.commit} on {land_result.target}"

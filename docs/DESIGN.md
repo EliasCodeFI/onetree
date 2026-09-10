@@ -38,8 +38,12 @@ this document is the implementation contract for the first two rounds.
    otherwise it reports the demonstrated failing combination or explicitly
    unresolved localization. Red and timed-out candidates remain refused.
    Minimality and localization-cost claims require supporting evidence
-   (see `docs/ROUND-B-AMENDMENT.md`). Plus: branch-operation refusal (`switch`/
-   `checkout`/destructive `reset` in a shared clone), and a typed rejection
+   (see `docs/ROUND-B-AMENDMENT.md`). Plus: Git-layer detection of unexplained
+   branch operations (`switch`/`checkout`/destructive `reset`) in a protected
+   shared clone, with persistent refusal of subsequent landings. This does not
+   prevent the external operation or recover erased unstaged work; the measured
+   boundary and evidence-loss residuals are explicit in `docs/ROUND-B.md`.
+   A typed rejection
    contract that names exactly the invalidated paths so a session repairs
    minimally.
 
@@ -50,7 +54,10 @@ implemented as a commit chain on a dedicated ref, pure git plumbing. Each
 event is a commit whose tree carries one JSON document; the parent is the
 previous WAL head; CAS on the WAL ref serializes appends. Event kinds:
 `session_register`, `claim`, `release`, `land_intent` (fence), `landed`,
-`adopted`, `refused`, `gc`. `adopted` records the operator's explicit
+`adopted`, `refused`, `gc`, `workspace_protect`. `workspace_protect` records
+the explicitly established shared-branch, reflog and referee baseline; it
+requires reader version 3 and cannot be silently replaced by registration.
+`adopted` records the operator's explicit
 acceptance of a broker landing the WAL did not record; every other kind is
 written by the broker itself. The working tree stays pristine — no state files
 in the tree, ever. History cannot be edited without showing in the ref.

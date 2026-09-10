@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from onetree import referee, workspace
 from onetree.errors import (
     ClaimConflictError,
     GitError,
@@ -140,6 +141,7 @@ class LandResult:
     intent: str
     warnings: tuple[str, ...] = ()
     gate_receipt: Mapping[str, Any] | None = None
+    referee_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,8 @@ class _FoldedState:
     event_ids: set[str] = field(default_factory=set)
     session_generations: set[str] = field(default_factory=set)
     claim_generations: set[str] = field(default_factory=set)
+    workspace_epoch: Mapping[str, Any] | None = None
+    workspace_transitions: list[tuple[str, str]] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> _FoldedState:
@@ -311,6 +315,8 @@ class _FoldedState:
             event_ids=set(self.event_ids),
             session_generations=set(self.session_generations),
             claim_generations=set(self.claim_generations),
+            workspace_epoch=self.workspace_epoch,
+            workspace_transitions=list(self.workspace_transitions),
         )
 
     def observe_position(self, target: str, *positions: str) -> None:
@@ -686,6 +692,8 @@ class Coordinator:
         data = event.data
         if "gate_receipt" in data and event.kind not in {"land_intent", "refused"}:
             raise WalCorruptError("gate receipt is on the wrong event kind", oid=event.oid)
+        if "referee_receipt" in data and event.kind not in {"land_intent", "refused"}:
+            raise WalCorruptError("referee receipt is on the wrong event kind", oid=event.oid)
         if event.event_id in state.event_ids:
             raise WalCorruptError("duplicate WAL event id", oid=event.oid)
         state.event_ids.add(event.event_id)
@@ -836,7 +844,16 @@ class Coordinator:
                     "land_intent fences do not match its payload", oid=event.oid
                 )
             self._validate_gate_receipt(event, "CLEAN", intent_payload_paths, data["candidate"])
+            if "referee_receipt" in data:
+                self._validate_referee_receipt(event, data["candidate"])
+                if data["referee_receipt"]["result"] not in {"pass", "not_configured"}:
+                    raise WalCorruptError("intent has a failed referee", oid=event.oid)
+                if data["referee_receipt"]["baseline"] != intent_head:
+                    raise WalCorruptError("referee baseline differs from intent", oid=event.oid)
             state.pending[operation] = event
+            if (state.workspace_epoch is not None
+                    and intent_target == state.workspace_epoch["target"]):
+                state.workspace_transitions.append((intent_head, data["candidate"]))
         elif event.kind == "adopted":
             if frozenset(data) != {"operation", "target", "expected_head", "commit", "tree"}:
                 raise WalCorruptError("adopted event has unexpected fields", oid=event.oid)
@@ -907,6 +924,16 @@ class Coordinator:
             state.pending.pop(operation)
             state.landed_operations[operation] = event
             state.landed.append(event)
+        elif event.kind == "workspace_protect":
+            try:
+                workspace.validate(data, self.repo)
+            except (ValueError, TypeError, KeyError, OnetreeError) as error:
+                raise WalCorruptError("invalid workspace baseline", oid=event.oid) from error
+            if state.workspace_epoch is not None:
+                raise WalCorruptError("workspace baseline cannot be silently replaced",
+                                      oid=event.oid)
+            state.workspace_epoch = data
+            state.workspace_transitions = []
         elif event.kind == "refused":
             refused_operation = data.get("operation")
             intent_id = data.get("intent")
@@ -921,6 +948,12 @@ class Coordinator:
                 state.refused_operations.add(refused_operation)
             action = _string(data, "action", event)
             reason = _string(data, "reason", event)
+            if "referee_receipt" in data:
+                self._validate_referee_receipt(event)
+                result = data["referee_receipt"]["result"]
+                if (action != "land" or result not in {"red", "timeout", "error"}
+                        or reason != "referee_" + result):
+                    raise WalCorruptError("referee receipt has no matching refusal", oid=event.oid)
             if "gate_receipt" in data:
                 verdict = {
                     "payload_gate_refused": "REFUSE", "payload_gate_degraded": "DEGRADED"
@@ -932,6 +965,16 @@ class Coordinator:
                 state.diverged_refusals.add(_divergence_key(data.get("divergences"), event))
         else:  # all event kinds are covered above
             raise AssertionError(f"unhandled WAL event: {event.kind}")
+
+    @staticmethod
+    def _validate_referee_receipt(event: EventRecord, candidate: str | None = None) -> None:
+        try:
+            referee.validate_receipt(event.data["referee_receipt"])
+        except (ValueError, TypeError) as error:
+            raise WalCorruptError("invalid referee evidence", oid=event.oid,
+                                  detail=str(error)) from error
+        if candidate is not None and event.data["referee_receipt"]["candidate"] != candidate:
+            raise WalCorruptError("referee candidate differs from intent", oid=event.oid)
 
     @staticmethod
     def _validate_gate_receipt(
@@ -1033,6 +1076,39 @@ class Coordinator:
                     warnings=warnings,
                 )
         raise GitError("session registration CAS retry limit exceeded")
+
+    def protect_workspace(self, actor: str) -> Mapping[str, Any]:
+        actor = _validate_actor(actor)
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            if state.workspace_epoch is not None:
+                detail = self._workspace_violation(state)
+                if detail is not None:
+                    raise LandingRefusedError(detail, reason="workspace_changed", paths=[])
+                return state.workspace_epoch
+            if state.pending or state.active_claims(time.time()):
+                raise LandingRefusedError("protection requires no pending intents or active claims",
+                                          reason="workspace_busy", paths=[])
+            try:
+                epoch = workspace.baseline(self.repo)
+            except (ValueError, OSError, GitError) as error:
+                raise LandingRefusedError(str(error), reason="workspace_unavailable",
+                                          paths=[]) from error
+            document = self.wal.document("workspace_protect", actor, epoch)
+            if self._try_append(state, snapshot, (document,)) is not None:
+                return epoch
+        raise GitError("workspace protection CAS retry limit exceeded")
+
+    def _workspace_violation(self, state: _FoldedState) -> str | None:
+        if state.workspace_epoch is None:
+            return None
+        refused = {
+            (str(intent.data["expected_head"]), str(intent.data["candidate"]))
+            for intent in state.refused_intents.values()
+        }
+        transitions = [item for item in state.workspace_transitions if item not in refused]
+        return workspace.violation(self.repo, state.workspace_epoch, transitions)
 
     def claim(
         self,
@@ -1325,6 +1401,7 @@ class Coordinator:
         paths: Sequence[str] = (),
         *,
         gate_receipt: Mapping[str, Any] | None = None,
+        referee_receipt: Mapping[str, Any] | None = None,
     ) -> bool:
         document = self.wal.document(
             "refused",
@@ -1335,6 +1412,8 @@ class Coordinator:
                 "operation": operation,
                 "paths": list(paths),
                 **({"gate_receipt": dict(gate_receipt)} if gate_receipt is not None else {}),
+                **({"referee_receipt": dict(referee_receipt)}
+                   if referee_receipt is not None else {}),
             },
         )
         return self._try_append(state, snapshot, (document,)) is not None
@@ -1436,6 +1515,16 @@ class Coordinator:
                     reason="nothing_staged",
                     paths=[],
                 )
+            violation = self._workspace_violation(state)
+            if state.workspace_epoch is not None and target_ref != state.workspace_epoch["target"]:
+                violation = "landing target is outside the protected shared branch"
+            if violation is not None:
+                invalidated = [change.path for change in changes]
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "workspace_changed", invalidated
+                ):
+                    continue
+                raise LandingRefusedError(violation, reason="workspace_changed", paths=invalidated)
             active_claims = state.active_claims(now)
             owned = tuple(claim for claim in active_claims if claim.actor == actor)
             missing = tuple(
@@ -1476,14 +1565,15 @@ class Coordinator:
             if current is None:
                 raise GitError("landing target is unborn", reference=target_ref)
             if not self.repo.is_ancestor(session.base, current):
+                invalidated = [change.path for change in changes]
                 if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "target_diverged"
+                    state, snapshot, actor, operation, "target_diverged", invalidated
                 ):
                     continue
                 raise LandingRefusedError(
                     "landing target no longer descends from the session base",
                     reason="target_diverged",
-                    paths=[],
+                    paths=invalidated,
                 )
             current_entries = self.repo.tree_entries(current)
             conflicts = tuple(
@@ -1527,6 +1617,24 @@ class Coordinator:
             context["candidate"] = commit
             payload_paths = [change.path for change in changes]
             try:
+                configured_referee = referee.configuration(self.repo)
+            except LandingRefusedError:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("invalid referee configuration",
+                                          reason="referee_config", paths=payload_paths) from None
+            if configured_referee[0] is not None and any(
+                pending.data["target"] == target_ref for pending in state.pending.values()
+            ):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "train_pending", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("an earlier target intent is still pending",
+                                          reason="train_pending", paths=payload_paths)
+            try:
                 gate_receipt = self.repo.audit_commit_payload(
                     commit, payload_paths, self.commit_payload
                 )
@@ -1546,6 +1654,25 @@ class Coordinator:
                 ):
                     continue
                 raise
+            try:
+                referee_receipt = referee.run(
+                    self.repo, commit, current, payload_paths, configured_referee
+                )
+            except LandingRefusedError as refusal:
+                rejected = self.wal.document("refused", actor, {
+                    "action": "land", "reason": str(refusal.details["reason"]),
+                    "operation": operation, "paths": list(payload_paths),
+                    "referee_receipt": refusal.details["referee_receipt"],
+                })
+                self._append_document(rejected, what="referee refusal")
+                raise
+            if not referee.configuration_matches(self.repo, configured_referee):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed during candidate audit",
+                                          reason="referee_config_changed", paths=payload_paths)
             lander_start = _pid_start(os.getpid())
             lander_warnings = _liveness_warnings(lander_start)
             intent = self.wal.document(
@@ -1571,11 +1698,27 @@ class Coordinator:
                     "fences": list(fences),
                     "payload": [change.event_payload() for change in changes],
                     "gate_receipt": gate_receipt,
+                    "referee_receipt": referee_receipt,
                 },
                 event_id=intent_id,
             )
             if checkpoint is not None:
                 checkpoint("before_intent", context)
+            violation = self._workspace_violation(state)
+            if violation is not None:
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "workspace_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError(violation, reason="workspace_changed",
+                                          paths=payload_paths)
+            if not referee.configuration_matches(self.repo, configured_referee):
+                if not self._record_land_refusal(
+                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                ):
+                    continue
+                raise LandingRefusedError("referee configuration changed before admission",
+                                          reason="referee_config_changed", paths=payload_paths)
 
             # Fence sample. Everything above was audited against a WAL read that
             # is now old; this is the last look at the session and its claims
@@ -1584,7 +1727,7 @@ class Coordinator:
             fenced_generations = {str(fence["claim_generation"]) for fence in fences}
             if not _session_alive(session, landing_time):
                 if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "session_died_at_fence"
+                    state, snapshot, actor, operation, "session_died_at_fence", payload_paths
                 ):
                     continue
                 raise LandingRefusedError(
@@ -1592,13 +1735,14 @@ class Coordinator:
                     reason="session_died_at_fence",
                     paths=list(payload_paths),
                 )
-            expired = tuple(
-                sorted(
-                    claim.path
-                    for claim in owned
-                    if claim.generation in fenced_generations and claim.expires_at <= landing_time
-                )
-            )
+            expired_generations = {
+                claim.generation for claim in owned
+                if claim.generation in fenced_generations and claim.expires_at <= landing_time
+            }
+            expired = tuple(sorted(
+                str(fence["path"]) for fence in fences
+                if fence["claim_generation"] in expired_generations
+            ))
             if expired:
                 if not self._record_land_refusal(
                     state, snapshot, actor, operation, "claim_expired_at_fence", expired
@@ -1664,6 +1808,7 @@ class Coordinator:
                 intent_id,
                 lander_warnings,
                 gate_receipt,
+                referee_receipt,
             )
         raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
 
@@ -1947,6 +2092,9 @@ class Coordinator:
                     for audit_target in targets
                 )
             divergences = (*boundaries, *self._divergences(state, heads))
+            violation = self._workspace_violation(state)
+            if violation is not None:
+                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
             now = time.time()
             sessions = tuple(
                 sorted(actor for actor in state.sessions if state.session_active(actor, now))
@@ -2153,6 +2301,9 @@ class Coordinator:
             self._verify_landed(state)
             heads = self._audit_heads(state, target)
             divergences = self._divergences(state, heads)
+            violation = self._workspace_violation(state)
+            if violation is not None:
+                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if not divergences:

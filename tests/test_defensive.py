@@ -257,12 +257,17 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
 
     assert adopted["v"] == 2
     assert collected["v"] == 1
+    protected = Wal.document("workspace_protect", "operator", {})
+    assert protected["v"] == 3
+    assert Wal._validate_document(dict(protected), oid="fixture") == protected
     assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
 
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**adopted, "v": 1}, oid="fixture")
     with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
-        Wal._validate_document({**collected, "v": 3}, oid="fixture")
+        Wal._validate_document({**collected, "v": 4}, oid="fixture")
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**protected, "v": 2}, oid="fixture")
     # ``True`` is the one that matters: it compares equal to 1, so a bool would
     # otherwise pass the per-kind check for every version-1 kind.
     for understated in (0, -1, True, "1", 1.0):

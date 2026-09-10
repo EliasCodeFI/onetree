@@ -32,6 +32,7 @@ _KIND_VERSIONS = {
     "adopted": 2,
     "refused": 1,
     "gc": 1,
+    "workspace_protect": 3,
 }
 WAL_READER_VERSION = max(_KIND_VERSIONS.values())
 EVENT_KINDS = frozenset(_KIND_VERSIONS)
