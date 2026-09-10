@@ -44,8 +44,11 @@ jobs:
               echo '::error::PATH carries an empty entry (a leading, doubled or trailing colon).'
               exit 1 ;;
           esac
-          IFS=: read -r -a entries <<< "$PATH"
-          for entry in "${entries[@]}"; do
+          # Byte-wise split: `read -a` would stop at the first newline in PATH.
+          rest="$PATH:"
+          while [ -n "$rest" ]; do
+            entry="${rest%%:*}"
+            rest="${rest#*:}"
             case "$entry" in
               /*) ;;
               *) echo "::error::PATH carries a relative entry '$entry'."; exit 1 ;;

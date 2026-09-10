@@ -2348,16 +2348,24 @@ class Coordinator:
                 violation = self._workspace_violation(state)
             except LandingRefusedError as refusal:
                 # The workspace cannot be audited until the setting is readable.
-                # That is the operator's typo, not a branch that diverged from the
-                # WAL: refuse by type and record nothing, so correcting the setting
-                # is the whole remedy and no `branch_diverged` row outlives it.
-                raise LandingRefusedError(
-                    f"recovery cannot audit the protected workspace: {refusal}",
-                    reason="referee_config", paths=[], repaired=repaired, refused=refused,
-                    pending=in_flight, locks=list(locks),
-                ) from None
-            if violation is not None:
-                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
+                # On its own that is the operator's typo, not a branch that
+                # diverged from the WAL: refuse by type and record nothing, so
+                # correcting the setting is the whole remedy and no
+                # `branch_diverged` row outlives it. Beside a real divergence it
+                # is one more thing the operator must see, not a reason to hide
+                # the divergence recovery has already computed.
+                if not divergences:
+                    raise LandingRefusedError(
+                        f"recovery cannot audit the protected workspace: {refusal}",
+                        reason="referee_config", paths=[], repaired=repaired, refused=refused,
+                        pending=in_flight, locks=list(locks),
+                    ) from None
+                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
+            else:
+                if violation is not None:
+                    divergences = (
+                        *divergences, Divergence("workspace_changed", "HEAD", violation)
+                    )
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if not divergences:

@@ -604,6 +604,25 @@ def test_git_wrapper_refusals_and_index_type(git_repo: GitFixture, tmp_path: Pat
         repository.head_ref()
 
 
+def test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`symbolic-ref --quiet` exits 1 for a detached HEAD; any other exit is git failing."""
+    repository = Repository(git_repo.root)
+    failed = subprocess.CompletedProcess(
+        ["git", "symbolic-ref"], 128, stdout=b"",
+        stderr=b"fatal: unable to parse command-line config\n",
+    )
+    # Control: the real detached exit keeps its diagnosis.
+    git_repo.git("checkout", "--quiet", "--detach")
+    with pytest.raises(GitError, match="detached"):
+        repository.head_ref()
+    monkeypatch.setattr(repository, "git", lambda *arguments, **options: failed)
+    with pytest.raises(GitError, match="unable to parse command-line config") as caught:
+        repository.head_ref()
+    assert "detached" not in str(caught.value)
+
+
 def test_git_invocation_relabels_only_operating_system_errors(
     git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

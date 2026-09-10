@@ -28,19 +28,25 @@ def valid_seconds(value: Any, *, allow_zero: bool = False) -> bool:
         return False
 
 
+REPOSITORY_SCOPES = frozenset({"local", "worktree"})
+
+
 def configuration(repo: Repository) -> tuple[str | None, float]:
     """Read the referee the repository configures, and nothing an operator brings along.
 
-    The protected epoch records this pair and every peer must observe the same one,
-    so the read is repository-scoped: `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
-    and the system file are the operator's, not the repository's. Measured 2026-09-10
-    (Round BF DUO): an effective-scope read ran a global red referee the repository
-    never configured and recorded a global timeout in the epoch, which then refused
-    a peer under another HOME as a workspace change.
+    The protected epoch records this pair and every peer must observe the same one, so
+    only the repository's own scopes count: what git reports as `local` (`.git/config`
+    with its includes followed) and `worktree` (`.git/config.worktree`), both of which
+    live under `.git/` and are shared by every peer of the one tree. The operator's
+    global and system files and the command-line scope are not the repository's.
+    Measured 2026-09-10: an effective-scope read ran a global red referee the repository
+    never configured and put a global timeout into the epoch (Round BF DUO); a `--local`
+    read skipped `[include]` and `config.worktree` and demoted a repository-configured
+    red referee to `not_configured` (Round BF2 DUO).
     """
     values: list[str | None] = []
     for key in ("onetree.referee", "onetree.refereeTimeout"):
-        result = repo.git("config", "--local", "--null", "--get-all", key, check=False)
+        result = repo.git("config", "--null", "--show-scope", "--get-all", key, check=False)
         if result.returncode == 1:
             values.append(None)
             continue
@@ -48,10 +54,20 @@ def configuration(repo: Repository) -> tuple[str | None, float]:
             raise LandingRefusedError("cannot read referee configuration", reason="referee_config",
                                       paths=[])
         try:
-            items = result.stdout[:-1].decode("utf-8", errors="strict").split("\0")
+            fields = result.stdout[:-1].decode("utf-8", errors="strict").split("\0")
         except UnicodeError as error:
             raise LandingRefusedError("referee configuration is not UTF-8",
                                       reason="referee_config", paths=[]) from error
+        if len(fields) % 2:
+            raise LandingRefusedError("cannot read referee configuration", reason="referee_config",
+                                      paths=[])
+        items = [
+            value for scope, value in zip(fields[::2], fields[1::2], strict=True)
+            if scope in REPOSITORY_SCOPES
+        ]
+        if not items:
+            values.append(None)
+            continue
         if len(items) != 1 or not items[0].strip():
             raise LandingRefusedError("referee configuration must have one nonempty value",
                                       reason="referee_config", paths=[])

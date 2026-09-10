@@ -522,8 +522,11 @@ class Repository:
             # and what git itself does, from outside the repository. GIT_CONFIG
             # alone was measured demoting a configured red referee to
             # `not_configured` and landing the candidate (Round B DUO, 2026-09-10).
-            # The referee read is repository-scoped on its own (`config --local`);
-            # the first three pops are what keeps the guard's effective-scope
+            # The referee read keeps only the `local` and `worktree` scopes, so
+            # the command scope these names add is filtered there too; GIT_CONFIG
+            # is different: it redirects the `git config` command itself, so its
+            # pop is what keeps that read pointed at the repository at all. The
+            # first three pops also keep the guard's effective-scope
             # `core.logAllRefUpdates` read honest (fixture: the reflog-switch
             # channel test). The last three cannot override a local setting and
             # have no fixture that fails without them: hygiene, not a guard.
@@ -911,8 +914,14 @@ class Repository:
 
     def head_ref(self) -> str:
         result = self.git("symbolic-ref", "--quiet", "HEAD", check=False)
-        if result.returncode != 0:
+        if result.returncode == 1:
             raise GitError("HEAD is detached; pass a branch ref", operation="symbolic-ref")
+        if result.returncode != 0:
+            # Any other exit is git failing to answer, not an answer of "detached"
+            # (Round BF2 DUO: a malformed GIT_CONFIG_COUNT environment was reported as
+            # a detached HEAD).
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
         reference = result.stdout.decode("ascii", errors="strict").strip()
         self.validate_branch_ref(reference)
         return reference

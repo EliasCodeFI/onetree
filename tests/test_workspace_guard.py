@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import os
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture
+from conftest import _GIT_EXECUTABLE, GitFixture
 from test_cli import _json_call
 from test_referee import inherited_config_values, operator_config, referee_command
 
@@ -362,6 +363,8 @@ def test_forged_intent_evidence_is_refused_on_replay(git_repo: GitFixture) -> No
     def drop_receipt(data: dict[str, Any]) -> None:
         del data["referee_receipt"]
 
+    git_repo.git("branch", "other")
+
     def retarget(data: dict[str, Any]) -> None:
         data["target"] = "refs/heads/other"
 
@@ -420,6 +423,27 @@ def test_invalid_referee_setting_under_protection_is_not_a_quarantine(
     landed = coordinator.land("alpha")
     assert git_repo.oid() == landed.commit
     assert coordinator.inspect_wal().consistent
+
+
+def test_recover_keeps_a_real_divergence_beside_an_unreadable_setting(
+    git_repo: GitFixture,
+) -> None:
+    coordinator = protected(git_repo)
+    landed = coordinator.land("alpha")
+    git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
+    git_repo.git("config", "onetree.refereeTimeout", "3O0")
+    # Control: the setting alone is the typed refusal (the test above); here the
+    # branch has also moved away from what the broker landed.
+    with pytest.raises(WalDivergedError) as caught:
+        coordinator.recover()
+    kinds = {item["kind"] for item in caught.value.details["divergences"]}
+    assert {"landed_not_on_target", "referee_config"} <= kinds
+    assert "workspace_changed" not in kinds
+    # Correcting the setting does not make the divergence go away.
+    git_repo.git("config", "--unset", "onetree.refereeTimeout")
+    with pytest.raises(WalDivergedError) as still:
+        coordinator.recover()
+    assert "landed_not_on_target" in {item["kind"] for item in still.value.details["divergences"]}
 
 
 def test_recover_cli_names_the_setting_not_a_divergence(
@@ -530,14 +554,41 @@ def test_path_form_checkouts_erase_peer_work_without_a_reflog_transition(
     assert coordinator.inspect_wal().consistent
 
 
-def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture) -> None:
-    """The shape of task #151: routine `git gc` reflog expiry rewrites the recorded prefix."""
+@pytest.mark.parametrize("shape", ["routine", "emptied"])
+def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture, shape: str) -> None:
+    """The two shapes task #151 records, each asserting the branch of the guard it reaches.
+
+    `routine`: an entry older than `gc.reflogExpire` (90 days) sits inside the recorded
+    prefix and default expiry removes it, so the prefix digest no longer matches.
+    `emptied`: `--expire=now` leaves no entries at all. A #151 reconciliation flips the
+    shape it addresses; neither is the desired outcome for an unmoved workspace.
+    """
+    if shape == "routine":
+        aged = os.environ.copy()
+        aged.pop("GIT_INDEX_FILE", None)
+        aged["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
+        git_repo.write("b.txt", "aged\n")
+        for arguments in (["add", "--", "b.txt"], ["commit", "--quiet", "-m", "aged"]):
+            subprocess.run([_GIT_EXECUTABLE, "-C", str(git_repo.root), *arguments],
+                           check=True, capture_output=True, env=aged)
+    tip = git_repo.oid()
     coordinator = protected(git_repo)
-    git_repo.git("reflog", "expire", "--expire=now", "--all")
+    log_before = (git_repo.root / ".git/logs/HEAD").read_bytes()
+    if shape == "routine":
+        git_repo.git("reflog", "expire", "--all")
+        expected = "continuity was lost"
+    else:
+        git_repo.git("reflog", "expire", "--expire=now", "--all")
+        expected = "absent or incomplete"
+    log_after = (git_repo.root / ".git/logs/HEAD").read_bytes()
+    # Control: expiry rewrote the log (routine: shorter but not empty; emptied: empty).
+    assert log_after != log_before
+    assert (log_after == b"") == (shape == "emptied")
     with pytest.raises(LandingRefusedError) as caught:
         coordinator.land("alpha")
     assert caught.value.details["reason"] == "workspace_changed"
-    assert git_repo.oid() == git_repo.base
+    assert expected in str(caught.value)
+    assert git_repo.oid() == tip
 
 
 def test_reflog_switch_read_failure_is_an_observation_failure(

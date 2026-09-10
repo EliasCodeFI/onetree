@@ -177,6 +177,49 @@ def test_referee_is_repository_configuration_not_the_operators(
     assert git_repo.changed_paths(landed.commit) == {"a.txt"}
 
 
+@pytest.mark.parametrize("source", ["include", "includeIf", "worktree"])
+def test_repository_includes_and_worktree_config_are_the_repositorys(
+    git_repo: GitFixture, tmp_path: Path, source: str,
+) -> None:
+    """`.git/config` includes and `.git/config.worktree` are repository configuration."""
+    red = referee_command("raise SystemExit(6)")
+    if source == "worktree":
+        git_repo.git("config", "extensions.worktreeConfig", "true")
+        git_repo.git("config", "--worktree", "onetree.referee", red)
+    else:
+        included = tmp_path / "included.gitconfig"
+        git_repo.git("config", "--file", str(included), "onetree.referee", red)
+        section = "include" if source == "include" else f"includeIf.gitdir:{git_repo.root}/"
+        git_repo.git("config", f"{section}.path", str(included))
+    # RED control: git's effective read sees the red command, and a `--local` read
+    # (no includes, no worktree file) does not.
+    assert inherited_config_values(git_repo, "onetree.referee") == [red]
+    local_only = git_repo.git("config", "--local", "--get-all", "onetree.referee", check=False)
+    assert local_only.stdout.strip() != red
+
+    coordinator = staged(git_repo)
+    with pytest.raises(LandingRefusedError) as caught:
+        coordinator.land("alpha")
+    assert caught.value.details["reason"] == "referee_red"
+    assert caught.value.details["referee_receipt"]["command"] == red
+    assert git_repo.oid() == git_repo.base
+
+
+def test_referee_in_both_local_and_worktree_scope_is_a_duplicate(git_repo: GitFixture) -> None:
+    configure(git_repo, "pass")
+    git_repo.git("config", "extensions.worktreeConfig", "true")
+    git_repo.git("config", "--worktree", "onetree.referee", referee_command("raise SystemExit(2)"))
+    # RED control: git's effective value is the worktree one, the red command; an
+    # evaluator taking the local value alone would run the passing referee and land.
+    effective = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
+    assert effective == referee_command("raise SystemExit(2)")
+    coordinator = staged(git_repo)
+    with pytest.raises(LandingRefusedError) as caught:
+        coordinator.land("alpha")
+    assert caught.value.details["reason"] == "referee_config"
+    assert git_repo.oid() == git_repo.base
+
+
 def test_duplicate_or_empty_referee_setting_is_a_typed_refusal(git_repo: GitFixture) -> None:
     git_repo.git("config", "onetree.referee", referee_command("raise SystemExit(9)"))
     git_repo.git("config", "--add", "onetree.referee", referee_command("pass"))
@@ -201,10 +244,14 @@ def test_duplicate_or_empty_referee_setting_is_a_typed_refusal(git_repo: GitFixt
     assert coordinator.land("alpha").referee_receipt["result"] == "pass"
 
 
-ADMITTED_REFEREE_ENVIRONMENT = {
-    "PATH", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_NO_REPLACE_OBJECTS",
-    "GIT_GRAFT_FILE", "GIT_TERMINAL_PROMPT", "ONETREE_CANDIDATE", "ONETREE_BASELINE",
-}
+def admitted_referee_environment(candidate: str, baseline: str) -> dict[str, str]:
+    """The referee child's whole environment: every name set to a fixed value, never forwarded."""
+    return {
+        "PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": os.devnull, "GIT_TERMINAL_PROMPT": "0",
+        "ONETREE_CANDIDATE": candidate, "ONETREE_BASELINE": baseline,
+    }
 
 
 def test_referee_child_sees_only_the_admitted_environment(
@@ -213,26 +260,32 @@ def test_referee_child_sees_only_the_admitted_environment(
     dump = tmp_path / "referee-environment.json"
     configure(git_repo, "import json, os, pathlib; "
               f"pathlib.Path({str(dump)!r}).write_text(json.dumps(dict(os.environ)))")
-    monkeypatch.setenv("ONETREE_TEST_CANARY", "leaked")
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "caller-site"))
-    monkeypatch.setenv("PATH", str(tmp_path / "caller-bin") + os.pathsep + os.environ["PATH"])
+    # Caller values under every admitted name and two names that are not admitted.
+    caller = {
+        "PATH": str(tmp_path / "caller-bin") + os.pathsep + os.environ["PATH"],
+        "LC_ALL": "en_US.UTF-8", "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "caller.gitconfig"), "GIT_NO_REPLACE_OBJECTS": "0",
+        "GIT_GRAFT_FILE": str(tmp_path / "caller-grafts"), "GIT_TERMINAL_PROMPT": "1",
+        "ONETREE_CANDIDATE": "caller", "ONETREE_BASELINE": "caller",
+        "ONETREE_TEST_CANARY": "leaked", "PYTHONPATH": str(tmp_path / "caller-site"),
+    }
+    for name, value in caller.items():
+        monkeypatch.setenv(name, value)
     command = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
-    # RED control: the same command run with the inherited environment records the
-    # canaries and the caller's PATH, so a child that inherited, or that was handed
-    # the caller's PATH alone, fails the equalities below.
+    # RED control: the same command run with the inherited environment records every
+    # caller value, so a child that inherited, or that was handed any one caller
+    # value under an admitted name, differs from the mapping asserted below.
     subprocess.run(shlex.split(command), check=True, env=os.environ.copy())
     inherited = json.loads(dump.read_text())
-    assert {"ONETREE_TEST_CANARY", "PYTHONPATH"} <= set(inherited)
-    assert inherited["PATH"].startswith(str(tmp_path / "caller-bin"))
+    assert all(inherited[name] == value for name, value in caller.items())
     dump.unlink()
 
     landed = staged(git_repo).land("alpha")
     assert landed.referee_receipt["result"] == "pass"
     admitted = json.loads(dump.read_text())
-    assert set(admitted) == ADMITTED_REFEREE_ENVIRONMENT
-    assert admitted["PATH"] == os.defpath
-    assert admitted["ONETREE_CANDIDATE"] == landed.commit
-    assert admitted["ONETREE_BASELINE"] == git_repo.base
+    expected = admitted_referee_environment(landed.commit, git_repo.base)
+    assert admitted == expected
+    assert not any(admitted[name] == caller[name] for name in expected)
 
 
 def _alive(pid: int) -> bool:
@@ -267,10 +320,16 @@ def test_referee_timeout_kills_the_whole_process_group(
         sleeper.wait()
     assert not _alive(sleeper.pid)
 
+    started = time.monotonic()
     with pytest.raises(LandingRefusedError) as caught:
         coordinator.land("alpha")
+    elapsed = time.monotonic() - started
     assert caught.value.details["reason"] == "referee_timeout"
     assert git_repo.oid() == git_repo.base
+    # A kill that missed the group (no session of its own, ESRCH swallowed) is
+    # followed by a wait for the sleeper: 30 s, not the 0.5 s timeout.
+    assert elapsed < 5
+    assert caught.value.details["referee_receipt"]["duration_seconds"] < 5
     grandchild = int(marker.read_text())
     deadline = time.monotonic() + 5
     while _alive(grandchild) and time.monotonic() < deadline:

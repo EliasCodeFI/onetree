@@ -8,10 +8,13 @@ CI, Gate 2 battery and live parent fleet receipts.
 ## Referee contract
 
 `onetree.referee` is an owner-configured command, parsed as quoted arguments
-without a shell. It is read from the repository's own configuration
-(`git config --local`): the operator's global and system files and the
-`GIT_CONFIG*` environment do not decide which referee runs or with what
-timeout, so every peer observes the pair the protected epoch records. A shell pipeline requires an explicitly named shell in that
+without a shell. It is read from the repository's own configuration: the
+`local` and `worktree` scopes as git reports them (`.git/config` with its
+includes followed, and `.git/config.worktree`), which every peer of the one
+tree shares. The operator's global and system files, the command-line scope
+and the `GIT_CONFIG*` environment do not decide which referee runs or with
+what timeout, so every peer observes the pair the protected epoch records. A
+value in both repository scopes is a duplicate and refuses. A shell pipeline requires an explicitly named shell in that
 command. Its executable and external dependencies are trusted operator inputs;
 this is a test runner, not a sandbox for hostile commands. A missing setting
 is explicitly reported as `not_configured`, meaning structural checks only.
@@ -80,8 +83,11 @@ disposition. An unreadable referee setting under protection is not a
 quarantine: it refuses as `referee_config` (or `referee_config_changed` inside
 the fence window), `wal --json` reports a `referee_config` divergence,
 `wal --recover` refuses as `referee_config` without recording a
-`branch_diverged` row, and correcting the setting is the whole remedy. Do not
-remove the WAL or disable the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
+`branch_diverged` row, and correcting the setting is the whole remedy. When the
+branch has also diverged from the WAL, recovery reports both (`wal_diverged`
+with a `referee_config` item beside the branch divergence) and correcting the
+setting leaves the divergence to reconcile. Do not remove the WAL or disable
+the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
 ## Rejection union and repair scope
@@ -215,9 +221,10 @@ were described as closing. Round BF2 changes three behaviours:
 
 and strengthens the fixtures the DUO showed blind: the timeout fixture now
 starts a grandchild and asserts it is dead (`process.kill()` in place of
-`os.killpg` fails it); the environment fixture asserts the child's whole
-environment equals the admitted set with `PATH == os.defpath` (forwarding the
-caller's `PATH` alone fails it); the forged-intent fixture refuses a valid
+`os.killpg` fails it); the environment fixture asserts the child's environment
+names equal the admitted set with `PATH == os.defpath` (forwarding the
+caller's `PATH` alone fails it; Round BF2's DUO then showed the values of the
+other names unmeasured, closed in Round BF3); the forged-intent fixture refuses a valid
 passing receipt that differs in the command alone or in the timeout alone (a
 check weakened to `command is None` fails it); the CLI-stdout half reads file
 descriptor 1 through `capfd` (an `os.write(1, ...)` leak fails it and, run
@@ -238,3 +245,46 @@ the BF2 commit: ruff clean, strict mypy clean, 568 passed / 30 skipped,
 coverage 91.53%. One earlier local run measured 81.80% while a scratch-clone
 harness shared the virtualenv concurrently; its cause was not established and
 the clean run above is the receipt.
+
+### Round BF3 (fix round after the Round BF2 DUO, 2026-09-10)
+
+The Round BF2 DUO read `e0fe782..08d0216`: the adversarial review returned
+new-debt and the silent-failure hunt returned execution-miss. Its major finding
+is a regression Round BF2 introduced: `git config --local` skips `[include]` and
+`[includeIf]` processing and never reads `.git/config.worktree`, so a red
+referee the repository configured through either was demoted to
+`not_configured` and the candidate landed (it refused `referee_red` at
+`e0fe782`). Round BF3 changes four behaviours:
+
+| Defect or unmeasured guard | Fixture | Observed red |
+| --- | --- | --- |
+| `--local` read skipped repository includes and the worktree file | `test_repository_includes_and_worktree_config_are_the_repositorys[include, includeIf, worktree]`, `test_referee_in_both_local_and_worktree_scope_is_a_duplicate` | landed with `not_configured` at `08d0216` |
+| `wal --recover` discarded a computed branch divergence when the referee setting was unreadable | `test_recover_keeps_a_real_divergence_beside_an_unreadable_setting` | `LandingRefusedError` in place of `wal_diverged` at `08d0216` |
+| `head_ref` reported every failed `symbolic-ref` as a detached HEAD | `test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached` | message `detached` for exit 128 at `08d0216` |
+| CI PATH check read the first line of `PATH` only | the seven-value harness gains `$'/usr/bin:\nrel'` | exit 0 at `08d0216` |
+
+The referee read is now the effective `git config --show-scope --get-all`
+filtered to the `local` and `worktree` scopes, so includes are followed and the
+operator's scopes are dropped by name rather than by flag. Fixtures the BF2 DUO
+showed blind: the grandchild fixture asserts the wall-clock bound too (dropping
+`start_new_session` and keeping `os.killpg` used to pass it after a 30 s wait);
+the environment fixture asserts the child's whole mapping, every admitted name
+set to its fixed value while the caller carries a different value under each
+(forwarding `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_NOSYSTEM` fails it); the
+retarget case names an existing second branch; the reflog-expiry fixture is
+parametrised over the two shapes task #151 records — `routine` (an entry older
+than `gc.reflogExpire` inside the recorded prefix, default expiry removes it:
+"continuity was lost") and `emptied` (`--expire=now`: "absent or incomplete") —
+each asserting its own message so a #151 reconciliation flips the shape it
+addresses. Receipt-quality notes from the DUO are folded into the harness: the
+`GIT_CONFIG_COUNT` case removes the `COUNT` pop and the `KEY_/VALUE_` loop
+together (the switch-read mechanism, not a git parse failure), and the recover
+mutant restores the BF2 behaviour cleanly. `PATH=/usr/bin:/proc/self/cwd/bin`
+is an absolute entry that names the checkout at runtime; the check cannot see
+it and no runner mechanism produces it (Round BF2 DUO).
+
+Receipt: `round-bf3-red-first.txt` in the local evidence directory (six
+behaviour reds against `08d0216`, the BF2 CI step mismatching on the newline
+value, twelve guard-neutralised runs failing, the `/proc/self/cwd/bin` boundary
+listed as accepted). Gates at the BF3 commit: ruff clean, strict mypy clean,
+575 passed / 30 skipped, coverage 91.53%.
