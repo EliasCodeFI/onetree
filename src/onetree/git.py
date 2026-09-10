@@ -518,12 +518,18 @@ class Repository:
             "GIT_SHALLOW_FILE",
             "GIT_TEST_COMMIT_GRAPH",
             "GIT_TEST_MULTI_PACK_INDEX",
-            # The referee command and the workspace guard's reflog switch are read
-            # through `git config`. Each of these names redirects or extends what
-            # that read returns from outside the repository, so an inherited value
-            # decides which referee runs, or whether one runs at all. GIT_CONFIG
+            # Each of these names redirects or extends what `git config` returns,
+            # and what git itself does, from outside the repository. GIT_CONFIG
             # alone was measured demoting a configured red referee to
             # `not_configured` and landing the candidate (Round B DUO, 2026-09-10).
+            # The referee read is repository-scoped on its own (`config --local`);
+            # the first three pops are what keeps the guard's effective-scope
+            # `core.logAllRefUpdates` read honest (fixture: the reflog-switch
+            # channel test). The last three cannot override a local setting and
+            # have no fixture that fails without them: hygiene, not a guard.
+            # HOME and XDG_CONFIG_HOME stay: the referee child gets an admitted
+            # environment and the broker's git keeps the operator's global
+            # settings that are not referee scope.
             "GIT_CONFIG",
             "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_COUNT",

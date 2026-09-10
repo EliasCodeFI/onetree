@@ -29,9 +29,18 @@ def valid_seconds(value: Any, *, allow_zero: bool = False) -> bool:
 
 
 def configuration(repo: Repository) -> tuple[str | None, float]:
+    """Read the referee the repository configures, and nothing an operator brings along.
+
+    The protected epoch records this pair and every peer must observe the same one,
+    so the read is repository-scoped: `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
+    and the system file are the operator's, not the repository's. Measured 2026-09-10
+    (Round BF DUO): an effective-scope read ran a global red referee the repository
+    never configured and recorded a global timeout in the epoch, which then refused
+    a peer under another HOME as a workspace change.
+    """
     values: list[str | None] = []
     for key in ("onetree.referee", "onetree.refereeTimeout"):
-        result = repo.git("config", "--null", "--get-all", key, check=False)
+        result = repo.git("config", "--local", "--null", "--get-all", key, check=False)
         if result.returncode == 1:
             values.append(None)
             continue

@@ -8,7 +8,10 @@ CI, Gate 2 battery and live parent fleet receipts.
 ## Referee contract
 
 `onetree.referee` is an owner-configured command, parsed as quoted arguments
-without a shell. A shell pipeline requires an explicitly named shell in that
+without a shell. It is read from the repository's own configuration
+(`git config --local`): the operator's global and system files and the
+`GIT_CONFIG*` environment do not decide which referee runs or with what
+timeout, so every peer observes the pair the protected epoch records. A shell pipeline requires an explicitly named shell in that
 command. Its executable and external dependencies are trusted operator inputs;
 this is a test runner, not a sandbox for hostile commands. A missing setting
 is explicitly reported as `not_configured`, meaning structural checks only.
@@ -75,9 +78,10 @@ A quarantined baseline is not silently refreshed by `protect`, registration,
 or ordinary recovery. Reconciliation requires a separate explicit operator
 disposition. An unreadable referee setting under protection is not a
 quarantine: it refuses as `referee_config` (or `referee_config_changed` inside
-the fence window), `wal --json` reports a `referee_config` divergence, and
-correcting the setting is the whole remedy. Do not remove the WAL or disable the guard to restore a green
-status. A successful broker CAS remains a successful landing even if a later
+the fence window), `wal --json` reports a `referee_config` divergence,
+`wal --recover` refuses as `referee_config` without recording a
+`branch_diverged` row, and correcting the setting is the whole remedy. Do not
+remove the WAL or disable the guard to restore a green status. A successful broker CAS remains a successful landing even if a later
 external action creates a separate workspace violation.
 
 ## Rejection union and repair scope
@@ -142,8 +146,10 @@ The corrected focused run passed 55 checks. Both independent review lenses
 accepted the runtime and final exact-path changes and released their freezes.
 The final full run passed 559 tests in 206.07 seconds with 90.79% coverage,
 including the real estate payload-gate cases; that count needs
-`ONETREE_TEST_ESTATE_GATE` set. CI sets nothing and runs 529 passed with 30
-skipped per matrix leg (run 34425990890). Ruff and strict mypy passed.
+`ONETREE_TEST_ESTATE_GATE` set. CI sets nothing and runs the same suite less
+those 30 per matrix leg (529 passed at `15842ba`, run 34425990890; 552 passed
+at `e0fe782`, run 34472133996, all three legs green with 91.4% coverage).
+Ruff and strict mypy passed.
 The bounded detection decision is `3a9692e15528`; it does not authorize a
 workspace reconciliation or replace the remaining cutover gates.
 
@@ -190,4 +196,45 @@ in `DESIGN.md` gained its direct byte-level measurement
 (`test_build_leaves_shared_index_and_worktree_untouched`), and the INV6
 control now executes the fail-open reference evaluator instead of asserting a
 tautology. CI additionally refuses a runner environment without `HOME` or with
-a relative `PATH` entry (measured on run 34425990890).
+a relative `PATH` entry (measured on run 34425990890); Round BF2 extends that
+to an empty entry anywhere in `PATH`, the trailing colon included.
+
+### Round BF2 (fix round after the Round BF DUO, 2026-09-10)
+
+The Round BF DUO read `15842ba..e0fe782`: the adversarial review returned
+new-debt and the silent-failure hunt returned execution-miss, because three
+rows of the table above stayed green under a neutralisation other than the
+author's, and because the `GIT_CONFIG*` pops did not close the channel they
+were described as closing. Round BF2 changes three behaviours:
+
+| Defect or unmeasured guard | Fixture | Observed red |
+| --- | --- | --- |
+| `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and the system file still decided the referee and its timeout; a global timeout entered the epoch and refused a peer under another `HOME` as `workspace_changed` | `test_inherited_git_config_environment_cannot_demote_a_red_referee[HOME, XDG_CONFIG_HOME, GIT_CONFIG_SYSTEM]`, `test_referee_is_repository_configuration_not_the_operators`, `test_operator_global_config_does_not_enter_the_protected_epoch` | `referee_config == referee_red`, `LandingRefusedError: candidate referee did not pass`, `60.0 == 300.0` at `e0fe782` |
+| `wal --recover` under a referee typo raised `wal_diverged` and appended `refused(action=recover, reason=branch_diverged)` | `test_invalid_referee_setting_under_protection_is_not_a_quarantine` (recover arm), `test_recover_cli_names_the_setting_not_a_divergence` | `WalDivergedError` raised, exit `2 == 1` at `e0fe782` |
+| A `land_intent` targeting another branch replayed under a protected epoch although the broker refuses to write one | `test_forged_intent_evidence_is_refused_on_replay[outside the shared branch]` | `DID NOT RAISE WalCorruptError` at `e0fe782` |
+
+and strengthens the fixtures the DUO showed blind: the timeout fixture now
+starts a grandchild and asserts it is dead (`process.kill()` in place of
+`os.killpg` fails it); the environment fixture asserts the child's whole
+environment equals the admitted set with `PATH == os.defpath` (forwarding the
+caller's `PATH` alone fails it); the forged-intent fixture refuses a valid
+passing receipt that differs in the command alone or in the timeout alone (a
+check weakened to `command is None` fails it); the CLI-stdout half reads file
+descriptor 1 through `capfd` (an `os.write(1, ...)` leak fails it and, run
+against the Round BF test, passes: the blindness the finding named). The
+`GIT_CONFIG`, `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` pops gained the
+fixture they lacked, `test_inherited_git_config_environment_cannot_disable_the_reflog_switch`
+(removing any one of them fails it); the `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`
+and `GIT_CONFIG_NOSYSTEM` pops cannot override a local setting and have no
+fixture that fails without them, and the source says so. The measured
+boundary gained fixtures that assert its shape and flip when a later mechanism
+closes it: `test_path_form_checkouts_erase_peer_work_without_a_reflog_transition`
+and `test_reflog_expiry_quarantines_an_unmoved_workspace` (task #151).
+
+Receipt: `round-bf2-red-first.txt` in the local evidence directory (the three
+behaviour changes and the CI step against `e0fe782`; every neutralised run
+listed above failing; the CI step judged over seven `PATH` values). Gates at
+the BF2 commit: ruff clean, strict mypy clean, 568 passed / 30 skipped,
+coverage 91.53%. One earlier local run measured 81.80% while a scratch-clone
+harness shared the virtualenv concurrently; its cause was not established and
+the clean run above is the receipt.

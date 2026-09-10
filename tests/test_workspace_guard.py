@@ -10,11 +10,12 @@ from typing import Any
 import pytest
 from conftest import GitFixture
 from test_cli import _json_call
-from test_referee import referee_command
+from test_referee import inherited_config_values, operator_config, referee_command
 
-from onetree import workspace
+from onetree import referee, workspace
+from onetree.cli import main
 from onetree.core import Coordinator
-from onetree.errors import LandingRefusedError, WalCorruptError, WalDivergedError
+from onetree.errors import GitError, LandingRefusedError, WalCorruptError, WalDivergedError
 from onetree.wal import EventRecord
 
 
@@ -361,13 +362,23 @@ def test_forged_intent_evidence_is_refused_on_replay(git_repo: GitFixture) -> No
     def drop_receipt(data: dict[str, Any]) -> None:
         del data["referee_receipt"]
 
+    def retarget(data: dict[str, Any]) -> None:
+        data["target"] = "refs/heads/other"
+
     cases = [
         (receipt(result="red", returncode=1), "failed referee"),
         (receipt(candidate="0" * 40, tested=["0" * 40]), "candidate differs"),
         (receipt(baseline="1" * 40), "baseline differs"),
         (receipt(command=None, result="not_configured", tested=[], returncode=None),
          "another referee"),
+        # A valid passing receipt from a referee the epoch does not name, differing
+        # in the command alone or in the timeout alone.
+        (receipt(command="/bin/true"), "another referee"),
+        (receipt(timeout_seconds=5.0), "another referee"),
         (drop_receipt, "no referee evidence"),
+        # The broker refuses every landing outside the protected branch, so an
+        # intent elsewhere under the epoch did not come from it.
+        (retarget, "outside the shared branch"),
     ]
     for mutate, expected in cases:
         with pytest.raises(WalCorruptError, match=expected):
@@ -391,10 +402,86 @@ def test_invalid_referee_setting_under_protection_is_not_a_quarantine(
     with pytest.raises(LandingRefusedError) as protect:
         coordinator.protect_workspace("operator")
     assert protect.value.details["reason"] == "referee_config"
+    # Recovery cannot audit the workspace either; it says so by type and records
+    # no `branch_diverged` row that would outlive the corrected setting.
+    events_before = len(coordinator.wal.read().events)
+    with pytest.raises(LandingRefusedError) as recover:
+        coordinator.recover()
+    assert recover.value.details["reason"] == "referee_config"
+    assert len(coordinator.wal.read().events) == events_before
+    assert not any(
+        event.kind == "refused" and event.data.get("action") == "recover"
+        for event in coordinator.wal.read().events
+    )
 
     # Fixing the setting is the whole remedy: no baseline reconciliation follows.
     git_repo.git("config", "--unset", "onetree.refereeTimeout")
+    assert coordinator.recover().consistent
     landed = coordinator.land("alpha")
+    assert git_repo.oid() == landed.commit
+    assert coordinator.inspect_wal().consistent
+
+
+def test_recover_cli_names_the_setting_not_a_divergence(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
+) -> None:
+    protected(git_repo)
+    git_repo.git("config", "onetree.refereeTimeout", "3O0")
+    code, payload = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["error"]["reason"] == "referee_config"
+    assert "recovery" not in payload
+    assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "referee" in captured.err
+    assert "disagree" not in captured.err
+
+
+@pytest.mark.parametrize("channel", ["GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"])
+def test_inherited_git_config_environment_cannot_disable_the_reflog_switch(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
+) -> None:
+    """The guard reads `core.logAllRefUpdates` at effective scope, because that is what
+    git consults when it writes the reflog; the environment channels that override or
+    redirect that read are dropped from every broker git invocation instead."""
+    coordinator = protected(git_repo)
+    if channel == "GIT_CONFIG":
+        operator_config(tmp_path, monkeypatch, channel, "")
+    elif channel == "GIT_CONFIG_PARAMETERS":
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.logAllRefUpdates=false'")
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.logAllRefUpdates")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
+    # RED control: git under the inherited environment no longer reports the switch
+    # as enabled, so a broker reading through it would see protection disabled.
+    assert inherited_config_values(git_repo, "core.logAllRefUpdates") != ["true"]
+
+    landed = coordinator.land("alpha")
+    assert git_repo.oid() == landed.commit
+    assert coordinator.inspect_wal().consistent
+
+
+def test_operator_global_config_does_not_enter_the_protected_epoch(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two operators with different global git configs protect and land the same epoch."""
+    git_repo.git("config", "onetree.referee", referee_command("pass"))
+    operator_config(tmp_path, monkeypatch, "HOME", "[onetree]\n\trefereeTimeout = 60\n")
+    # RED control: the first operator's effective-scope git sees the 60 s timeout.
+    assert inherited_config_values(git_repo, "onetree.refereeTimeout") == ["60"]
+    coordinator = protected(git_repo)
+    epoch = coordinator.protect_workspace("operator")
+    assert epoch["referee"][1] == referee.DEFAULT_TIMEOUT
+
+    # The second operator: no global timeout at all.
+    monkeypatch.setenv("HOME", str(tmp_path / "other-home"))
+    (tmp_path / "other-home").mkdir()
+    assert inherited_config_values(git_repo, "onetree.refereeTimeout") == []
+    landed = Coordinator(git_repo.root).land("alpha")
+    assert landed.referee_receipt["timeout_seconds"] == referee.DEFAULT_TIMEOUT
     assert git_repo.oid() == landed.commit
     assert coordinator.inspect_wal().consistent
 
@@ -413,3 +500,58 @@ def test_setting_broken_inside_the_fence_window_is_a_configuration_change(
     assert caught.value.details["reason"] == "referee_config_changed"
     assert coordinator.inspect_wal().events[-1].data["reason"] == "referee_config_changed"
     assert git_repo.oid() == git_repo.base
+
+
+@pytest.mark.parametrize("operation", ["checkout_path", "restore", "read_tree", "checkout_index"])
+def test_path_form_checkouts_erase_peer_work_without_a_reflog_transition(
+    git_repo: GitFixture, operation: str,
+) -> None:
+    """The measured boundary of the reflog guard: this fixture asserts the gap's shape.
+
+    None of these operations moves a ref, so the guard has no evidence and the landing
+    proceeds over the erased peer work. A later mechanism that detects them flips this
+    test; it must not be read as the desired outcome.
+    """
+    coordinator = protected(git_repo)
+    git_repo.write("b.txt", "peer dirty\n")
+    if operation == "checkout_path":
+        git_repo.git("checkout", "--quiet", "--", "b.txt")
+    elif operation == "restore":
+        git_repo.git("restore", "b.txt")
+    elif operation == "read_tree":
+        git_repo.git("read-tree", "-u", "--reset", "HEAD")
+    else:
+        git_repo.git("checkout-index", "-f", "-a")
+    assert (git_repo.root / "b.txt").read_text() == "b0\n"
+    # The control is the `reset` case of the quarantine test above: the same
+    # erasure through a ref transition refuses as `workspace_changed`.
+    landed = coordinator.land("alpha")
+    assert git_repo.oid() == landed.commit
+    assert coordinator.inspect_wal().consistent
+
+
+def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture) -> None:
+    """The shape of task #151: routine `git gc` reflog expiry rewrites the recorded prefix."""
+    coordinator = protected(git_repo)
+    git_repo.git("reflog", "expire", "--expire=now", "--all")
+    with pytest.raises(LandingRefusedError) as caught:
+        coordinator.land("alpha")
+    assert caught.value.details["reason"] == "workspace_changed"
+    assert git_repo.oid() == git_repo.base
+
+
+def test_reflog_switch_read_failure_is_an_observation_failure(
+    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = protected(git_repo)
+    state = coordinator._fold(coordinator.wal.read())
+
+    def failing(repo: Any) -> bool:
+        raise GitError("git config could not be executed")
+
+    monkeypatch.setattr(workspace, "_enabled", failing)
+    violation = coordinator._workspace_violation(state)
+    assert violation is not None
+    assert violation.startswith("workspace observation failed")
+    monkeypatch.undo()
+    assert coordinator._workspace_violation(state) is None

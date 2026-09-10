@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import shlex
 import subprocess
@@ -97,8 +98,38 @@ def test_referee_timeout_never_moves_target(git_repo: GitFixture) -> None:
     assert receipt["duration_seconds"] < 5
 
 
+_GLOBAL_REFEREE = "[onetree]\n\treferee = /bin/true\n"
+
+
+def operator_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str, content: str,
+) -> None:
+    """Route `channel` at a config file carrying `content`, the way an operator's shell would."""
+    if channel == "GIT_CONFIG":
+        # The deprecated redirect: `git config` reads this file instead of the repository.
+        target = tmp_path / "redirected-config"
+    elif channel == "HOME":
+        home = tmp_path / "home"
+        home.mkdir()
+        target = home / ".gitconfig"
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    elif channel == "XDG_CONFIG_HOME":
+        target = tmp_path / "xdg" / "git" / "config"
+        target.parent.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    else:
+        target = tmp_path / (channel.lower() + "-config")
+        if channel == "GIT_CONFIG_SYSTEM":
+            monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    target.write_text(content, encoding="utf-8")
+    if channel in {"GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}:
+        monkeypatch.setenv(channel, str(target))
+
+
 @pytest.mark.parametrize("channel", ["GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-                                     "GIT_CONFIG_GLOBAL"])
+                                     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HOME",
+                                     "XDG_CONFIG_HOME"])
 def test_inherited_git_config_environment_cannot_demote_a_red_referee(
     git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
 ) -> None:
@@ -106,10 +137,7 @@ def test_inherited_git_config_environment_cannot_demote_a_red_referee(
     red = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
     coordinator = staged(git_repo)
     if channel == "GIT_CONFIG":
-        # The deprecated redirect: `git config` reads this file instead of the repository.
-        empty = tmp_path / "empty-config"
-        empty.write_text("", encoding="utf-8")
-        monkeypatch.setenv("GIT_CONFIG", str(empty))
+        operator_config(tmp_path, monkeypatch, channel, "")
     elif channel == "GIT_CONFIG_PARAMETERS":
         monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'onetree.referee=/bin/true'")
     elif channel == "GIT_CONFIG_COUNT":
@@ -117,9 +145,7 @@ def test_inherited_git_config_environment_cannot_demote_a_red_referee(
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "onetree.referee")
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/bin/true")
     else:
-        alternate = tmp_path / "global-config"
-        alternate.write_text("[onetree]\n\treferee = /bin/true\n", encoding="utf-8")
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(alternate))
+        operator_config(tmp_path, monkeypatch, channel, _GLOBAL_REFEREE)
 
     # RED control: under the environment the lander inherits, git itself no longer
     # answers with the one red command, so an evaluator reading through that
@@ -131,6 +157,24 @@ def test_inherited_git_config_environment_cannot_demote_a_red_referee(
     assert caught.value.details["reason"] == "referee_red"
     assert caught.value.details["referee_receipt"]["command"] == red
     assert git_repo.oid() == git_repo.base
+
+
+def test_referee_is_repository_configuration_not_the_operators(
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A referee in the operator's own config runs nowhere; the repository decides."""
+    operator_config(tmp_path, monkeypatch, "HOME",
+                    "[onetree]\n\treferee = /bin/false\n\trefereeTimeout = 0.001\n")
+    # RED control: the effective-scope read the operator's git performs sees that
+    # referee, so an evaluator using it would run the operator's red command.
+    assert inherited_config_values(git_repo, "onetree.referee") == ["/bin/false"]
+    assert inherited_config_values(git_repo, "onetree.refereeTimeout") == ["0.001"]
+
+    landed = staged(git_repo).land("alpha")
+    assert landed.referee_receipt["result"] == "not_configured"
+    assert landed.referee_receipt["command"] is None
+    assert landed.referee_receipt["timeout_seconds"] == referee.DEFAULT_TIMEOUT
+    assert git_repo.changed_paths(landed.commit) == {"a.txt"}
 
 
 def test_duplicate_or_empty_referee_setting_is_a_typed_refusal(git_repo: GitFixture) -> None:
@@ -157,19 +201,83 @@ def test_duplicate_or_empty_referee_setting_is_a_typed_refusal(git_repo: GitFixt
     assert coordinator.land("alpha").referee_receipt["result"] == "pass"
 
 
+ADMITTED_REFEREE_ENVIRONMENT = {
+    "PATH", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_NO_REPLACE_OBJECTS",
+    "GIT_GRAFT_FILE", "GIT_TERMINAL_PROMPT", "ONETREE_CANDIDATE", "ONETREE_BASELINE",
+}
+
+
 def test_referee_child_sees_only_the_admitted_environment(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    configure(git_repo, "import os; raise SystemExit(3 if 'ONETREE_TEST_CANARY' in os.environ "
-              "else 0)")
+    dump = tmp_path / "referee-environment.json"
+    configure(git_repo, "import json, os, pathlib; "
+              f"pathlib.Path({str(dump)!r}).write_text(json.dumps(dict(os.environ)))")
     monkeypatch.setenv("ONETREE_TEST_CANARY", "leaked")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "caller-site"))
+    monkeypatch.setenv("PATH", str(tmp_path / "caller-bin") + os.pathsep + os.environ["PATH"])
     command = git_repo.git("config", "--get", "onetree.referee").stdout.strip()
-    # RED control: the same command run with the inherited environment sees the
-    # canary and exits red, so a referee child that inherited would refuse below.
-    inherited = subprocess.run(shlex.split(command), check=False, env=os.environ.copy())
-    assert inherited.returncode == 3
+    # RED control: the same command run with the inherited environment records the
+    # canaries and the caller's PATH, so a child that inherited, or that was handed
+    # the caller's PATH alone, fails the equalities below.
+    subprocess.run(shlex.split(command), check=True, env=os.environ.copy())
+    inherited = json.loads(dump.read_text())
+    assert {"ONETREE_TEST_CANARY", "PYTHONPATH"} <= set(inherited)
+    assert inherited["PATH"].startswith(str(tmp_path / "caller-bin"))
+    dump.unlink()
+
     landed = staged(git_repo).land("alpha")
     assert landed.referee_receipt["result"] == "pass"
+    admitted = json.loads(dump.read_text())
+    assert set(admitted) == ADMITTED_REFEREE_ENVIRONMENT
+    assert admitted["PATH"] == os.defpath
+    assert admitted["ONETREE_CANDIDATE"] == landed.commit
+    assert admitted["ONETREE_BASELINE"] == git_repo.base
+
+
+def _alive(pid: int) -> bool:
+    """Whether `pid` is a running process. A zombie is dead: nothing of it can still write."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            return handle.read().rsplit(b")", 1)[1].split()[0] not in {b"Z", b"X"}
+    except FileNotFoundError:
+        return False
+    except OSError:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+
+def test_referee_timeout_kills_the_whole_process_group(
+    git_repo: GitFixture, tmp_path: Path,
+) -> None:
+    marker = tmp_path / "grandchild.pid"
+    configure(git_repo, "import pathlib, subprocess; child = subprocess.Popen(['sleep', '30']); "
+              f"pathlib.Path({str(marker)!r}).write_text(str(child.pid)); child.wait()")
+    git_repo.git("config", "onetree.refereeTimeout", "0.5")
+    coordinator = staged(git_repo)
+    # RED control: `_alive` tells a live sleeper from a killed one.
+    sleeper = subprocess.Popen(["sleep", "30"])  # noqa: S607 - fixture control
+    try:
+        assert _alive(sleeper.pid)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert not _alive(sleeper.pid)
+
+    with pytest.raises(LandingRefusedError) as caught:
+        coordinator.land("alpha")
+    assert caught.value.details["reason"] == "referee_timeout"
+    assert git_repo.oid() == git_repo.base
+    grandchild = int(marker.read_text())
+    deadline = time.monotonic() + 5
+    while _alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    # The referee's own child outlives a kill aimed at the referee alone; only a
+    # process-group kill reaches it.
+    assert not _alive(grandchild)
 
 
 def test_referee_retests_candidate_after_wal_and_target_race(git_repo: GitFixture) -> None:
@@ -265,7 +373,7 @@ def test_missing_program_is_an_unexecuted_error(git_repo: GitFixture) -> None:
 
 
 def test_referee_output_is_bounded_and_kept_out_of_cli_stdout(
-    git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
+    git_repo: GitFixture, capfd: pytest.CaptureFixture[str],
 ) -> None:
     configure(git_repo, "import sys; print('x' * 5000); print('bad', file=sys.stderr); "
               "raise SystemExit(8)")
@@ -277,9 +385,11 @@ def test_referee_output_is_bounded_and_kept_out_of_cli_stdout(
     assert receipt["stderr_tail"] == "bad\n"
 
     # The CLI's JSON stdout is exactly one object; the referee's own printing
-    # reaches it only inside the recorded receipt tail.
+    # reaches it only inside the recorded receipt tail. `capfd` reads file
+    # descriptor 1, which is where a child's inherited stdout would land;
+    # `capsys` sees only this interpreter's sys.stdout.
     configure(git_repo, "print('JUNK-NOT-JSON'); raise SystemExit(5)")
-    code, payload = _json_call(capsys, ["land", "--repo", str(git_repo.root), "--session", "alpha"])
+    code, payload = _json_call(capfd, ["land", "--repo", str(git_repo.root), "--session", "alpha"])
     assert code != 0
     assert payload["ok"] is False
     assert payload["error"]["reason"] == "referee_red"

@@ -30,13 +30,20 @@ jobs:
       - name: Require HOME and an absolute PATH on the runner
         # Measured 2026-09-10 (run 34425990890): with HOME unset, setup-uv prepends
         # "undefined/.local/bin" to PATH, a cwd-relative entry a checked-out file
-        # could satisfy before /usr/bin/git. Refuse that environment instead of
-        # running the gates inside it.
+        # could satisfy before /usr/bin/git. An empty entry is the cwd as well,
+        # and `read -a` drops a trailing one (Round BF DUO, 2026-09-10), so empty
+        # entries are refused on the joined string first. Refuse that environment
+        # instead of running the gates inside it.
         run: |
           if [ -z "${HOME:-}" ]; then
             echo '::error::HOME is unset on this runner.'
             exit 1
           fi
+          case ":${PATH}:" in
+            *::*)
+              echo '::error::PATH carries an empty entry (a leading, doubled or trailing colon).'
+              exit 1 ;;
+          esac
           IFS=: read -r -a entries <<< "$PATH"
           for entry in "${entries[@]}"; do
             case "$entry" in

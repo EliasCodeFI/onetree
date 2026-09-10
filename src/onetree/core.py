@@ -850,12 +850,15 @@ class Coordinator:
                     raise WalCorruptError("intent has a failed referee", oid=event.oid)
                 if data["referee_receipt"]["baseline"] != intent_head:
                     raise WalCorruptError("referee baseline differs from intent", oid=event.oid)
-            if (state.workspace_epoch is not None
-                    and intent_target == state.workspace_epoch["target"]):
-                # The epoch records which referee guards the shared branch. The broker
-                # that honours it never writes an intent without that referee's
-                # evidence, so an intent lacking it, or carrying another referee's,
-                # did not come from the broker.
+            if state.workspace_epoch is not None:
+                # The epoch records which branch is protected and which referee
+                # guards it. The broker that honours it refuses every landing outside
+                # that branch and never writes an intent without that referee's
+                # evidence, so an intent elsewhere, lacking the evidence, or carrying
+                # another referee's, did not come from the broker.
+                if intent_target != state.workspace_epoch["target"]:
+                    raise WalCorruptError("protected intent targets outside the shared branch",
+                                          oid=event.oid)
                 if "referee_receipt" not in data:
                     raise WalCorruptError("protected intent has no referee evidence",
                                           oid=event.oid)
@@ -866,8 +869,7 @@ class Coordinator:
                     raise WalCorruptError("protected intent evidence names another referee",
                                           oid=event.oid)
             state.pending[operation] = event
-            if (state.workspace_epoch is not None
-                    and intent_target == state.workspace_epoch["target"]):
+            if state.workspace_epoch is not None:
                 state.workspace_transitions.append((intent_head, data["candidate"]))
         elif event.kind == "adopted":
             if frozenset(data) != {"operation", "target", "expected_head", "commit", "tree"}:
@@ -2345,12 +2347,17 @@ class Coordinator:
             try:
                 violation = self._workspace_violation(state)
             except LandingRefusedError as refusal:
-                divergences = (*divergences, Divergence("referee_config", "HEAD", str(refusal)))
-            else:
-                if violation is not None:
-                    divergences = (
-                        *divergences, Divergence("workspace_changed", "HEAD", violation)
-                    )
+                # The workspace cannot be audited until the setting is readable.
+                # That is the operator's typo, not a branch that diverged from the
+                # WAL: refuse by type and record nothing, so correcting the setting
+                # is the whole remedy and no `branch_diverged` row outlives it.
+                raise LandingRefusedError(
+                    f"recovery cannot audit the protected workspace: {refusal}",
+                    reason="referee_config", paths=[], repaired=repaired, refused=refused,
+                    pending=in_flight, locks=list(locks),
+                ) from None
+            if violation is not None:
+                divergences = (*divergences, Divergence("workspace_changed", "HEAD", violation))
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if not divergences:
