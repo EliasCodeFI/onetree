@@ -1748,20 +1748,19 @@ class Coordinator:
                     commit, payload_paths, self.commit_payload
                 )
             except LandingRefusedError as refusal:
-                # A gate verdict against the candidate is a landing refusal like the
-                # eight above, and every one of those is recorded before it is raised.
-                # Left unrecorded, the one refusal that inspects the payload itself is
-                # the one no peer and no later audit can see happened.
-                #
-                # PayloadGateError is deliberately not caught here. It says the broker
-                # could not obtain a trusted verdict at all, which is an operational
-                # failure of this process and not a statement about this candidate.
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, str(refusal.details["reason"]),
-                    payload_paths,
-                    gate_receipt=refusal.details.get("gate_receipt"),
-                ):
-                    continue
+                # The verdict is terminal for this candidate. WAL contention may
+                # retry its recording, but must never rerun the gate or discard
+                # its evidence. A recording failure remains visible to the caller.
+                rejected = self.wal.document("refused", actor, {
+                    "action": "land", "reason": str(refusal.details["reason"]),
+                    "operation": operation, "paths": list(payload_paths),
+                    "gate_receipt": refusal.details["gate_receipt"],
+                })
+                try:
+                    self._append_document(rejected, what="payload gate refusal")
+                except OnetreeError as recording_error:
+                    refusal.details["recording_error"] = recording_error.payload()
+                    raise refusal from recording_error
                 raise
             try:
                 referee_receipt = referee.run(
