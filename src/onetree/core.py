@@ -2023,23 +2023,47 @@ class Coordinator:
         )
 
     def _verify_landed(self, state: _FoldedState) -> None:
+        if not state.landed:
+            return
+        # One batch read establishes, for every ordinary commit the records
+        # name, its parents, its tree and which recorded operations its message
+        # carries; each body is reduced as it is read and not kept. A record
+        # whose object Git did not hand back as a commit -- absent,
+        # uninflatable, a blob, a tag, a name that is no object ID -- keeps the
+        # per-object probes, the only readers that separate "not a commit I
+        # have" (WAL corruption) from the plumbing failing (a GitError). Nothing
+        # outlives this call: every mutation and inspection re-reads the store,
+        # so an object that vanishes under a stable WAL head is refused by the
+        # next call.
+        requests: dict[str, set[str]] = {}
+        for event in state.landed:
+            named = event.data.get("commit")
+            if not isinstance(named, str):
+                continue
+            operations = requests.setdefault(named, set())
+            recorded_operation = event.data.get("operation")
+            if event.kind == "adopted" and isinstance(recorded_operation, str):
+                operations.add(recorded_operation)
+        evidence = self.repo.landed_evidence(requests, reference=WAL_REF)
         for event in state.landed:
             commit = _string(event.data, "commit", event)
             expected_tree = _string(event.data, "tree", event)
-            try:
-                self.repo.require_commit(commit)
-            except RefCorruptError as error:
-                # Only Git's own answer -- "this object is not a commit I have" --
-                # is WAL corruption. A GitError here is the plumbing failing, and
-                # blaming the WAL for it sends the reader to the wrong repair.
-                raise WalCorruptError(
-                    "landed commit does not resolve; restore or fetch the recorded commit "
-                    "object before running recovery again",
-                    oid=event.oid,
-                    commit=commit,
-                ) from error
+            known = evidence.get(commit)
+            if known is None:
+                try:
+                    self.repo.require_commit(commit)
+                except RefCorruptError as error:
+                    # Only Git's own answer -- "this object is not a commit I have" --
+                    # is WAL corruption. A GitError here is the plumbing failing, and
+                    # blaming the WAL for it sends the reader to the wrong repair.
+                    raise WalCorruptError(
+                        "landed commit does not resolve; restore or fetch the recorded commit "
+                        "object before running recovery again",
+                        oid=event.oid,
+                        commit=commit,
+                    ) from error
             expected_parent = _string(event.data, "expected_head", event)
-            parents = self.repo.commit_parents(commit)
+            parents = self.repo.commit_parents(commit) if known is None else known.parents
             if event.kind == "adopted":
                 actual_expected = parents[0] if parents else self.repo.zero_oid
                 parents_match = actual_expected == expected_parent
@@ -2047,12 +2071,21 @@ class Coordinator:
                 parents_match = parents == (expected_parent,)
             if not parents_match:
                 raise WalCorruptError("landed commit parent differs from WAL", oid=event.oid)
-            actual_tree = self.repo.git_text("show", "-s", "--format=%T", commit)
+            actual_tree = (
+                self.repo.git_text("show", "-s", "--format=%T", commit)
+                if known is None
+                else known.tree
+            )
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
             if event.kind == "adopted":
                 operation = _string(event.data, "operation", event)
-                if not self.repo.commit_has_landing_operation(commit, operation):
+                carried = (
+                    self.repo.commit_has_landing_operation(commit, operation)
+                    if known is None
+                    else operation in known.operations
+                )
+                if not carried:
                     raise WalCorruptError(
                         "adopted commit does not carry the recorded landing trailer",
                         oid=event.oid,
