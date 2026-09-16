@@ -179,6 +179,14 @@ never failed is not evidence.
   that is change detection for the next landing and for an operator, not a
   control over the verdict just produced: the child executed a snapshot, so what
   the configured path holds afterwards cannot bear on what already ran.
+  The gate is the leader of its own process group, and when the broker's bounded
+  wait ends in a timeout or is cancelled the whole group is killed before the
+  exception propagates, so a descendant the gate forked cannot outlive a refused
+  landing while it holds the broker's output pipe. The broker observes the gate's
+  exit without reaping it and reaps only after that signal, so the group it
+  signals is always the gate's own. A descendant that calls `setsid` has left the
+  group and is outside that contract, and a successful gate's descendants are not
+  signalled (POSIX only; `docs/ROUND-GATE-GROUP.md`).
   The gate's complete report and admitted source digest are retained in the
   intent, or in a classified gate-refusal event. Landed and recovered records
   refer to that immutable carrier. Hook suite evidence, advisories and allowed

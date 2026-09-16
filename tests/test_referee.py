@@ -110,12 +110,14 @@ def operator_config(
         # The deprecated redirect: `git config` reads this file instead of the repository.
         target = tmp_path / "redirected-config"
     elif channel == "HOME":
+        monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
         home = tmp_path / "home"
         home.mkdir()
         target = home / ".gitconfig"
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     elif channel == "XDG_CONFIG_HOME":
+        monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
         target = tmp_path / "xdg" / "git" / "config"
         target.parent.mkdir(parents=True)
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))

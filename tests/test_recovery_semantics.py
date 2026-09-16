@@ -1689,9 +1689,12 @@ def test_hidden_history_cannot_launder_an_unrecorded_landing(
     git_repo: GitFixture,
     hidden_by: str,
     expected_refusal: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The audit sees the object graph that exists below local history rewrites."""
 
+    monkeypatch.delenv("GIT_NO_REPLACE_OBJECTS", raising=False)
+    monkeypatch.delenv("GIT_GRAFT_FILE", raising=False)
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     hidden = _unrecorded_landing(coordinator, git_repo.base, "a" * 32)

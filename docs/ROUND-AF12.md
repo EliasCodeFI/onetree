@@ -271,8 +271,9 @@ timeout and not the cause. The figures are POSIX figures: on timeout CPython's
 while its Windows branch calls `communicate()` after the kill and would block on
 the handles the grandchild still holds (`subprocess.py`, `run`, the
 `TimeoutExpired` branch, read in the 3.14.4 interpreter used here; unmeasured on
-Windows). The grandchild itself outlives the broker's kill, because the child is
-not made a process group (onetree #142).
+Windows). The grandchild itself outlived the broker's kill at the time, because the
+child was not made a process group (onetree #142); the gate is now the leader of
+its own group and the group is killed on timeout (`docs/ROUND-GATE-GROUP.md`).
 
 ## Remediation round
 

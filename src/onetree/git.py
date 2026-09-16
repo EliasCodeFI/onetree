@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -73,6 +76,40 @@ PAYLOAD_GATE_IDENTITY_ENVIRONMENT_NAMES = (
     "CODEX_THREAD_ID",
 )
 """Optional caller identity for attribution comparison, never candidate-derived."""
+
+
+def _drain_until_exit(process: subprocess.Popen[bytes], timeout: float) -> tuple[bytes, bytes]:
+    """Collect both pipes to end-of-file and observe the leader's exit without reaping it.
+
+    Raises ``subprocess.TimeoutExpired`` at the deadline. The caller owns the reap, so the
+    leader keeps its pid, and with it its process group id, until the caller has decided
+    whether to signal that group.
+    """
+
+    stdout, stderr = process.stdout, process.stderr
+    if stdout is None or stderr is None:  # pragma: no cover - both pipes are always requested
+        raise GitError("commit payload gate pipes are missing")
+    deadline = time.monotonic() + timeout
+    chunks: dict[int, list[bytes]] = {stdout.fileno(): [], stderr.fileno(): []}
+    with selectors.DefaultSelector() as selector:
+        for descriptor in chunks:
+            selector.register(descriptor, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in selector.select(remaining):
+                data = os.read(key.fd, 65536)
+                if data:
+                    chunks[key.fd].append(data)
+                else:
+                    selector.unregister(key.fd)
+    while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        time.sleep(min(0.05, remaining))
+    return b"".join(chunks[stdout.fileno()]), b"".join(chunks[stderr.fileno()])
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1451,6 +1488,42 @@ class Repository:
         oid = self.git_text(*arguments, input_bytes=(message.rstrip("\n") + "\n").encode())
         return self.validate_oid(oid, label="commit")
 
+    def _run_payload_gate(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+        """Run the pinned gate as the leader of its own process group.
+
+        The wait is bounded by ``PAYLOAD_GATE_TIMEOUT_SECONDS`` and ends only when both
+        output pipes are closed and the leader has exited, so a descendant holding a pipe
+        after the gate printed its verdict is still a timeout. When the wait ends in any
+        exception, timeout or cancellation alike, the whole group is killed, not only the
+        leader. Nothing here reaps the leader before that signal: exit is observed with
+        ``waitid(WNOWAIT)`` and the only reaping call runs after the kill, so the group id
+        signalled is always the gate's own and cannot have been recycled. Descendants
+        that call ``setsid`` have left the group and are outside this contract. POSIX
+        only: ``start_new_session``, ``killpg`` and ``waitid``.
+        """
+
+        process = subprocess.Popen(  # noqa: S603 - exact Python + source argv
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.root,
+            env=self._payload_gate_environment(),
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = _drain_until_exit(process, PAYLOAD_GATE_TIMEOUT_SECONDS)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            process.wait()
+        return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
     def audit_commit_payload(
         self,
         commit: str,
@@ -1519,14 +1592,7 @@ class Repository:
                     str(self.root),
                     "--json",
                 )
-                completed = subprocess.run(  # noqa: S603 - exact Python + source argv
-                    arguments,
-                    check=False,
-                    capture_output=True,
-                    cwd=self.root,
-                    env=self._payload_gate_environment(),
-                    timeout=PAYLOAD_GATE_TIMEOUT_SECONDS,
-                )
+                completed = self._run_payload_gate(arguments)
         except subprocess.TimeoutExpired as error:
             raise PayloadGateError(
                 "commit payload gate timed out",

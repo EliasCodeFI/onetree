@@ -673,7 +673,7 @@ def test_cli_human_mode_keeps_the_summary_on_one_line(
     alone fails the line reader (Round BF7 DUO). JSON carries the message as git wrote
     it."""
     git_repo.git("config", "include.path", "~/ref\x85ee.gitconfig")
-    monkeypatch.delenv("HOME")
+    monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert main(["wal", "--repo", str(git_repo.root), "--recover"]) == 2
     captured = capsys.readouterr()
