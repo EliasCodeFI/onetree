@@ -283,6 +283,7 @@ class _FoldedState:
     session_generations: set[str] = field(default_factory=set)
     claim_generations: set[str] = field(default_factory=set)
     workspace_epoch: Mapping[str, Any] | None = None
+    workspace_epoch_id: str | None = None
     workspace_transitions: list[tuple[str, str]] = field(default_factory=list)
 
     @classmethod
@@ -316,6 +317,7 @@ class _FoldedState:
             session_generations=set(self.session_generations),
             claim_generations=set(self.claim_generations),
             workspace_epoch=self.workspace_epoch,
+            workspace_epoch_id=self.workspace_epoch_id,
             workspace_transitions=list(self.workspace_transitions),
         )
 
@@ -950,6 +952,28 @@ class Coordinator:
                 raise WalCorruptError("workspace baseline cannot be silently replaced",
                                       oid=event.oid)
             state.workspace_epoch = data
+            state.workspace_epoch_id = event.event_id
+            state.workspace_transitions = []
+        elif event.kind == "workspace_reconcile":
+            try:
+                if set(data) != {"previous_epoch", "reason", "violation", "baseline"}:
+                    raise ValueError("invalid reconciliation fields")
+                if (state.workspace_epoch_id is None
+                        or data["previous_epoch"] != state.workspace_epoch_id):
+                    raise ValueError("reconciliation names a different prior epoch")
+                if not isinstance(data["reason"], str) or not data["reason"].strip():
+                    raise ValueError("reconciliation requires an operator reason")
+                if data["violation"] is not None and (
+                    not isinstance(data["violation"], str) or not data["violation"].strip()
+                ):
+                    raise ValueError("invalid prior violation")
+                if state.pending or state.claims:
+                    raise ValueError("reconciliation requires no claims or pending intents")
+                workspace.validate(data["baseline"], self.repo, allow_empty=True)
+            except (ValueError, TypeError, KeyError, OnetreeError) as error:
+                raise WalCorruptError("invalid workspace reconciliation", oid=event.oid) from error
+            state.workspace_epoch = data["baseline"]
+            state.workspace_epoch_id = event.event_id
             state.workspace_transitions = []
         elif event.kind == "refused":
             refused_operation = data.get("operation")
@@ -1116,6 +1140,66 @@ class Coordinator:
             if self._try_append(state, snapshot, (document,)) is not None:
                 return epoch
         raise GitError("workspace protection CAS retry limit exceeded")
+
+    def reconcile_workspace(
+        self, actor: str, *, expected_epoch: str, reason: str,
+    ) -> Mapping[str, Any]:
+        """Accept an explicitly reviewed workspace without repairing branch or file state.
+
+        The caller binds the current protection event and supplies the operator's
+        reason. History remains in the WAL, and active claims, pending intents or
+        unrelated branch/WAL divergence prevent replacing its baseline.
+        """
+
+        actor = _validate_actor(actor)
+        if not isinstance(reason, str) or not reason.strip():
+            raise LandingRefusedError("reconciliation requires an operator reason",
+                                      reason="reconciliation_reason", paths=[])
+        for _ in range(MAX_CAS_RETRIES):
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            if state.workspace_epoch_id is None:
+                raise LandingRefusedError("workspace is not protected",
+                                          reason="workspace_unprotected", paths=[])
+            if expected_epoch != state.workspace_epoch_id:
+                raise LandingRefusedError("workspace epoch no longer matches the request",
+                                          reason="workspace_epoch_changed", paths=[])
+            if state.pending or state.active_claims(time.time()):
+                raise LandingRefusedError(
+                    "reconciliation requires no pending intents or active claims",
+                    reason="workspace_busy", paths=[],
+                )
+            self._verify_landed(state)
+            heads = self._audit_heads(state, None)
+            divergences = self._divergences(state, heads)
+            if divergences:
+                raise WalDivergedError("reconciliation cannot resolve branch/WAL divergence",
+                                       divergences=[item.payload() for item in divergences])
+            violation = self._workspace_violation(state)
+            try:
+                baseline = workspace.baseline(self.repo, allow_empty=True)
+                workspace.validate(baseline, self.repo, allow_empty=True)
+                if (workspace.violation(self.repo, baseline, ()) is not None
+                        or workspace.baseline(self.repo, allow_empty=True) != baseline):
+                    raise ValueError("workspace changed during reconciliation observation")
+            except (ValueError, OSError, GitError) as error:
+                raise LandingRefusedError(str(error), reason="workspace_unavailable",
+                                          paths=[]) from error
+            if self.wal.head() != snapshot.head or self._audit_heads(state, None) != heads:
+                continue
+            documents: list[Mapping[str, Any]] = []
+            if state.claims:
+                documents.append(self.wal.document("gc", actor, {
+                    "claim_generations": sorted(state.claims),
+                    "session_generations": [], "temp_indexes": [],
+                }))
+            data = {"previous_epoch": expected_epoch, "reason": reason,
+                    "violation": violation, "baseline": baseline}
+            document = self.wal.document("workspace_reconcile", actor, data)
+            documents.append(document)
+            if self._try_append(state, snapshot, documents) is not None:
+                return {"epoch": document["event_id"], **data}
+        raise GitError("workspace reconciliation CAS retry limit exceeded")
 
     def _workspace_violation(self, state: _FoldedState) -> str | None:
         if state.workspace_epoch is None:

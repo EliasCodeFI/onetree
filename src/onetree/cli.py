@@ -38,6 +38,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(protect)
     _add_output(protect)
 
+    reconcile = subparsers.add_parser(
+        "reconcile", help="Explicitly accept an inspected workspace baseline.",
+    )
+    _add_repo(reconcile)
+    _add_actor(reconcile)
+    reconcile.add_argument("--expected-epoch", required=True, help="Current protection event id.")
+    reconcile.add_argument(
+        "--reason", required=True, help="Operator's reason for accepting the state.",
+    )
+    _add_output(reconcile)
+
     session = subparsers.add_parser("session", help="Register or inspect a session index.")
     _add_repo(session)
     _add_actor(session)
@@ -273,6 +284,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             epoch = coordinator.protect_workspace(_actor(args.actor))
             payload = {"ok": True, "workspace": dict(epoch)}
             human = f"protected {epoch['target']} at {epoch['tip']}"
+        elif args.command == "reconcile":
+            reconciled = coordinator.reconcile_workspace(
+                _actor(args.actor), expected_epoch=args.expected_epoch, reason=args.reason,
+            )
+            payload = {"ok": True, "workspace": dict(reconciled)}
+            human = f"reconciled workspace; epoch {reconciled['epoch']}"
         elif args.command == "land":
             land_result = coordinator.land(
                 _actor(args.actor),

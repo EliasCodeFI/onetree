@@ -58,9 +58,16 @@ implemented as a commit chain on a dedicated ref, pure git plumbing. Each
 event is a commit whose tree carries one JSON document; the parent is the
 previous WAL head; CAS on the WAL ref serializes appends. Event kinds:
 `session_register`, `claim`, `release`, `land_intent` (fence), `landed`,
-`adopted`, `refused`, `gc`, `workspace_protect`. `workspace_protect` records
+`adopted`, `refused`, `gc`, `workspace_protect`, `workspace_reconcile`.
+`workspace_protect` records
 the explicitly established shared-branch, reflog and referee baseline; it
 requires reader version 3 and cannot be silently replaced by registration.
+`workspace_reconcile` requires reader version 4. It records an explicit
+operator reason, the prior epoch id and violation, and a new observed baseline
+after claims and pending intents are clear. Earlier epochs remain in the WAL;
+ordinary protection and recovery cannot perform this operation. Reconciliation
+does not repair branch or file state and does not dismiss other WAL/branch
+divergence. The operator workflow is in `ROUND-WORKSPACE-RECONCILIATION.md`.
 `adopted` records the operator's explicit
 acceptance of a broker landing the WAL did not record; every other kind is
 written by the broker itself. The working tree stays pristine — no state files
