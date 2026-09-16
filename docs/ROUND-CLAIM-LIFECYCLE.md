@@ -32,6 +32,6 @@ restored in a finally block; the case is skipped where POSIX access checks do
 not apply.
 
 Evidence is retained in
-`/home/anvil/claude-diag-806b39cf/onetree-claim-lifecycle/`: the initial three
+`/anvil/claude-diag-806b39cf/onetree-claim-lifecycle/`: the initial three
 failures, focused controls, full-suite receipts and independent review. This
 release fix alone does not complete the remaining estate adoption prerequisites.

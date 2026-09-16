@@ -65,7 +65,7 @@ contract instead of the original repair's obsolete unchanged-WAL assumption.
 ## Verification and remaining adoption work
 
 Evidence is retained under
-`/home/anvil/claude-diag-806b39cf/onetree-adoption-integration/`, including exact
+`/anvil/claude-diag-806b39cf/onetree-adoption-integration/`, including exact
 input patch, failing controls, final full-suite XML/text, hashes and reviews.
 Final verification explicitly supplies both `ONETREE_TEST_ESTATE_GATE` and
 `ONETREE_TEST_SHIPPED_GATE`; a skipped real-gate test is not admission evidence.

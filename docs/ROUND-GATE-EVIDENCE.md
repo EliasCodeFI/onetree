@@ -62,7 +62,7 @@ under a different current pin. `_expose_intent` supplies legacy records without
 evidence. Forged inputs are written only into temporary fixture WALs.
 
 Evidence is retained at
-`/home/anvil/claude-diag-806b39cf/onetree-gate-evidence/`, including the observed
+`/anvil/claude-diag-806b39cf/onetree-gate-evidence/`, including the observed
 old refusal, corrected red baseline, evidence-link failures, actual gate report
 properties, focused/full-suite receipts and review/publication records. The
 referee, broker-only branch protections and estate cutover remain separate work.

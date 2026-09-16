@@ -44,7 +44,7 @@ is `tests/test_cli.py::_json_call`. Contention controls move the real WAL,
 replace a claim, expire a lease, rotate a session or expose a pending landing
 before the first attempted CAS. None rely on a fabricated successful append.
 
-Evidence: `/home/anvil/claude-diag-806b39cf/onetree-atomic-narrow/` contains the
+Evidence: `/anvil/claude-diag-806b39cf/onetree-atomic-narrow/` contains the
 known-bad composition and failing receipt, focused and full-suite receipts,
 frozen-file hashes and review/publication records. This addition resolves the
 new-file claim handoff; referee, broker-only enforcement and estate cutover
