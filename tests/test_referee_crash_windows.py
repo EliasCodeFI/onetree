@@ -258,7 +258,7 @@ def test_death_during_candidate_construction_leaves_no_trace_and_the_referee_unr
     assert _kinds(coordinator) == [*kinds_before, "land_intent", "landed"]
 
 
-def test_death_during_the_referee_leaves_no_trace_and_orphans_the_referee(
+def test_death_during_the_referee_leaves_no_trace_and_cleans_the_referee(
     git_repo: GitFixture, tmp_path: Path,
 ) -> None:
     coordinator, referee, log, scratch = _prepare(git_repo, tmp_path)
@@ -293,17 +293,9 @@ def test_death_during_the_referee_leaves_no_trace_and_orphans_the_referee(
         assert not _reachable(git_repo, candidate)
         _assert_no_landing_trace(git_repo, coordinator, kinds_before)
 
-        # Observed shape of this gap, pinned so a later change flips it visibly:
-        # the referee runs in its own session (``start_new_session=True``), so
-        # the broker's death does not reach it. It outlives its broker, and the
-        # scratch clone it runs in is never removed, because the cleanup that
-        # would do both lives in the dead process. No contract in ROUND-B.md
-        # speaks to submitter death; the timeout contract's process-group kill
-        # is a different path and is not exercised here (task 171).
-        assert _alive(referee_pid)
-        residue = sorted(path.name for path in scratch.glob("onetree-referee-*"))
-        assert len(residue) == 1
-        assert Path(str(running["cwd"])).is_relative_to(scratch / residue[0])
+        _wait_for(lambda: not _alive(referee_pid), "production referee cleanup", timeout=5)
+        _wait_for(lambda: not list(scratch.glob("onetree-referee-*")),
+                  "production scratch cleanup", timeout=5)
     finally:
         if process.is_alive():
             process.kill()

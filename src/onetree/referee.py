@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import contextlib
+import json
 import math
 import os
 import shlex
-import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from onetree.errors import GitError, LandingRefusedError
+from onetree import git
+from onetree.errors import LandingRefusedError
 from onetree.git import Repository
 
 DEFAULT_TIMEOUT = 300.0
@@ -167,44 +168,51 @@ def run(
         arguments = shlex.split(command)
         if not arguments:
             raise ValueError("referee command has no arguments")
-        if os.name != "posix":
-            raise ValueError("configured referee requires POSIX process-group cleanup")
-        with tempfile.TemporaryDirectory(prefix="onetree-referee-") as directory:
-            scratch = Path(directory)
-            snapshot = scratch / "candidate"
-            environment = {
-                "PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
-                "GIT_GRAFT_FILE": os.devnull, "GIT_TERMINAL_PROMPT": "0",
-                "ONETREE_CANDIDATE": candidate, "ONETREE_BASELINE": baseline,
-            }
-            repo._invoke(scratch, ("clone", "--quiet", "--shared", "--no-checkout",
-                                   "--template=", "--", str(repo.root), str(snapshot)),
-                         environment=environment, check=True)
-            repo._invoke(snapshot, ("-c", "core.hooksPath=" + os.devnull,
-                                    "checkout", "--quiet", "--detach", candidate),
-                         environment=environment, check=True)
-            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                process = subprocess.Popen(  # noqa: S603 - owner-configured argv, no shell
-                    arguments, cwd=snapshot, env=environment, stdin=subprocess.DEVNULL,
-                    stdout=stdout, stderr=stderr, start_new_session=True,
-                )
-                receipt["tested"] = [candidate]
-                try:
-                    code = process.wait(timeout=timeout)
-                    receipt.update(result="pass" if code == 0 else "red", returncode=code)
-                except subprocess.TimeoutExpired:
-                    receipt["result"] = "timeout"
-                finally:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                for name, stream in (("stdout_tail", stdout), ("stderr_tail", stderr)):
-                    size = stream.seek(0, os.SEEK_END)
-                    stream.seek(max(0, size - OUTPUT_TAIL_BYTES))
-                    receipt[name] = stream.read().decode("utf-8", errors="replace")
-                    receipt["output_truncated"] |= size > OUTPUT_TAIL_BYTES
-    except (OSError, ValueError, GitError) as error:
+        if os.name != "posix" or not hasattr(os, "WNOWAIT"):
+            raise ValueError("configured referee requires POSIX waitable process-group cleanup")
+        if git._GIT_EXECUTABLE is None:
+            raise ValueError("git executable was not found on PATH")
+        environment = {
+            "PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_GRAFT_FILE": os.devnull, "GIT_TERMINAL_PROMPT": "0",
+            "ONETREE_CANDIDATE": candidate, "ONETREE_BASELINE": baseline,
+        }
+        request = {
+            "root": str(repo.root), "candidate": candidate, "arguments": arguments,
+            "git": [git._GIT_EXECUTABLE, *git._GIT_COMMON_OPTIONS],
+            "timeout": timeout, "environment": environment, "tempdir": tempfile.gettempdir(),
+        }
+        reader, writer = os.pipe()
+        process = None
+        try:
+            process = subprocess.Popen(  # noqa: S603 - installed supervisor, isolated interpreter
+                [sys.executable, "-I", str(Path(__file__).with_name("_referee_supervisor.py")),
+                 str(reader), str(os.getpid())],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(reader,), start_new_session=True, env=environment,
+            )
+            os.close(reader)
+            reader = -1
+            stdout, stderr = process.communicate((json.dumps(request) + "\n").encode())
+            if process.returncode != 0:
+                raise ValueError("referee supervisor failed: " + stderr[-OUTPUT_TAIL_BYTES:].decode(
+                    "utf-8", errors="replace"))
+            result = json.loads(stdout)
+            expected = {"result", "returncode", "tested", "stdout_tail", "stderr_tail",
+                        "output_truncated"}
+            if not isinstance(result, dict) or set(result) != expected:
+                raise ValueError("invalid referee supervisor result")
+            complete_receipt = {**receipt, **result}
+            validate_receipt(complete_receipt)
+            receipt = complete_receipt
+        finally:
+            if reader != -1:
+                os.close(reader)
+            os.close(writer)
+            if process is not None:
+                process.wait()
+    except (OSError, ValueError) as error:
         receipt.update(result="error", stderr_tail=str(error))
     receipt["duration_seconds"] = time.monotonic() - started
     if receipt["result"] != "pass":

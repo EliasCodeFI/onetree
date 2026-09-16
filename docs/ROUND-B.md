@@ -61,6 +61,19 @@ minimality. Referee output is captured separately from CLI JSON and retained
 as labelled tails. Process-group cleanup is required for configured execution,
 so unsupported platforms refuse instead of silently weakening cleanup.
 
+Task171 extends that ownership across abrupt lander death. A separate supervisor
+owns clone preparation, checkout, the referee process group, and the scratch
+directory. Loss of the lander cancels the active stage and cleans those resources;
+the supervisor must finish cleanup before returning a passing result. Parent
+identity is checked as well as pipe closure, so an unrelated fork retaining a
+descriptor cannot keep an abandoned referee running. The configured timeout
+still starts with referee execution; preparation remains cancellable on lander
+death without consuming that execution budget.
+This requires POSIX wait-without-reaping support. Deliberately detached children,
+killing both the lander and supervisor, and host failure are outside this cleanup
+contract; arbitrary same-user commands remain outside sandbox guarantees.
+`ROUND-G2-LIFETIME.md` carries the crash controls and limits.
+
 ## Workspace protection contract
 
 `onetree protect --repo REPO --session OPERATOR --json` records the current

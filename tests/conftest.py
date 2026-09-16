@@ -7,13 +7,49 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
+from coverage import Coverage
 
 from onetree import git as git_module
+from onetree import referee
+
+
+@pytest.fixture(autouse=True)
+def collect_referee_supervisor() -> Iterator[None]:
+    """Measure the isolated supervisor without widening production child environments.
+
+    Coverage's subprocess collector needs its configuration passed explicitly.
+    Its package-name filter also misses a package file executed as a script,
+    so include the same source directory. Only the installed supervisor receives
+    this test instrumentation; referee commands keep their production environment.
+    """
+    config = os.environ.get("COVERAGE_PROCESS_CONFIG")
+    if config is None:
+        yield
+        return
+    decoded = Coverage(config_file=f":data:{config}").config
+    decoded.source_dirs = [*decoded.source_dirs, str(Path(referee.__file__).parent)]
+    config = decoded.serialize()
+    supervisor = str(Path(referee.__file__).with_name("_referee_supervisor.py"))
+    original = subprocess.Popen
+
+    def measured(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        arguments = args[0] if args else kwargs.get("args", ())
+        if isinstance(arguments, (list, tuple)) and tuple(arguments[:3]) == (
+            sys.executable, "-I", supervisor,
+        ):
+            kwargs["env"] = {**kwargs["env"], "COVERAGE_PROCESS_CONFIG": config}
+        return original(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(subprocess, "Popen", measured)
+        yield
 
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
