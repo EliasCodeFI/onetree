@@ -394,7 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if wal_result.pending_intents:
                 human += f"; {wal_result.pending_intents} pending intent(s)"
             if wal_result.divergences:
-                human += f"; DIVERGED on {len(wal_result.divergences)} record(s)"
+                human += f"; DIVERGED on {len(wal_result.divergences)} audit-target finding(s)"
             # Residue is not inconsistency -- a ref lock is held for milliseconds
             # during every healthy append, so folding it into `consistent` would
             # fail a sound repo whenever a peer happens to be writing. It still

@@ -27,6 +27,52 @@ def _json_call(
     return code, payload
 
 
+@pytest.mark.parametrize("boundary", ["grafts", "shallow"])
+@pytest.mark.parametrize("with_wal", [False, True])
+def test_repository_boundary_reports_audit_target_findings(
+    git_repo: GitFixture, capsys: pytest.CaptureFixture[str], boundary: str, with_wal: bool
+) -> None:
+    coordinator = core.Coordinator(git_repo.root)
+    if with_wal:
+        coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
+    tip = git_repo.external_commit("b.txt", "ordinary tip\n", "ordinary tip")
+    git_repo.git("branch", "other", tip)
+    command = ["wal", "--repo", str(git_repo.root)]
+    code, clean = _json_call(capsys, command)
+    assert code == 0
+    assert clean["wal"]["consistent"] is True
+    wal_before = coordinator.wal.head()
+    refs_before = git_repo.git("show-ref").stdout
+
+    if boundary == "grafts":
+        marker = coordinator.repo.git_dir / "info" / "grafts"
+        marker.parent.mkdir(exist_ok=True)
+        marker.write_text(f"{tip} {git_repo.base}\n", encoding="ascii")
+        assert coordinator.repo.nonempty_graft_file() == marker
+        kind = "legacy_grafts"
+    else:
+        coordinator.repo.git_path("shallow").write_text(tip + "\n", encoding="ascii")
+        kind = "shallow_history"
+
+    code, document = _json_call(capsys, command)
+    repeat_code, repeated = _json_call(capsys, command)
+    assert code == repeat_code == 1
+    assert document == repeated
+    assert document["wal"]["consistent"] is False
+    rows = document["wal"]["divergences"]
+    assert len(rows) == 3
+    assert {row["target"] for row in rows} == {"HEAD", "refs/heads/main", "refs/heads/other"}
+    assert {row["kind"] for row in rows} == {kind}
+    assert all(set(row) == {"kind", "target", "detail", "commit", "operation"} for row in rows)
+    assert all(isinstance(row["target"], str) for row in rows)
+    assert main(command) == 1
+    human = capsys.readouterr()
+    assert human.err == ""
+    assert coordinator.wal.head() == wal_before
+    assert git_repo.git("show-ref").stdout == refs_before
+    assert "DIVERGED on 3 audit-target finding(s)" in human.out
+
+
 def test_status_human_and_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["status"]) == 0
     out = capsys.readouterr()
@@ -134,7 +180,7 @@ def test_cli_reports_divergence_liveness_warnings_and_swept_residue(
     assert wal["wal"]["ref_locks"] == []
 
     assert main(["wal", "--repo", str(git_repo.root)]) == 1
-    assert "DIVERGED on 1 record(s)" in capsys.readouterr().out
+    assert "DIVERGED on 1 audit-target finding(s)" in capsys.readouterr().out
 
     code, failed = _json_call(capsys, ["wal", "--repo", str(git_repo.root), "--recover"])
     assert code == 2
