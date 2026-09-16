@@ -2946,17 +2946,22 @@ def test_infrastructure_failure_while_verifying_a_landing_is_not_called_wal_corr
     coordinator = Coordinator(git_repo.root)
     session = _register(coordinator, git_repo, "alpha", "a.txt")
     _stage(git_repo, session, "a.txt", "verified\n")
-    coordinator.land("alpha", message="verified landing")
-
-    def broken(self: Repository, reference: str) -> str:
-        raise GitError("could not execute git: injected", operation="rev-parse")
-
-    monkeypatch.setattr(Repository, "require_commit", broken)
-    # RED control: the shipped except-arm caught GitError alongside
-    # RefCorruptError, so a broken toolchain was reported as a corrupt WAL and
-    # sent the reader to repair the wrong thing.
-    with pytest.raises(GitError, match="injected"):
+    landed = coordinator.land("alpha", message="verified landing").commit
+    # A real plumbing failure: the loose object Git must inflate to verify the
+    # landing is cut in half, so every reader of it fails inside Git rather
+    # than answering "not a commit". The shipped except-arm once caught
+    # GitError alongside RefCorruptError, so a broken store was reported as a
+    # corrupt WAL and sent the reader to repair the wrong thing; the earlier
+    # control injected the failure by replacing require_commit, which the
+    # batched read no longer consults for an object Git hands back.
+    loose = git_repo.root / ".git" / "objects" / landed[:2] / landed[2:]
+    assert loose.exists()
+    raw = loose.read_bytes()
+    loose.chmod(0o644)
+    loose.write_bytes(raw[: len(raw) // 2])
+    with pytest.raises(GitError, match="corrupt loose object") as failure:
         coordinator.inspect_wal()
+    assert not isinstance(failure.value, WalCorruptError)
 
 
 @pytest.mark.parametrize(

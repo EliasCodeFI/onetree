@@ -455,6 +455,19 @@ class MarkedCommit:
 
 
 @dataclass(frozen=True)
+class LandedEvidence:
+    """What one raw commit object establishes for landed-record verification.
+
+    ``operations`` is the subset of the requested landing operations the
+    message carries; the body itself is not kept.
+    """
+
+    parents: tuple[str, ...]
+    tree: str
+    operations: frozenset[str]
+
+
+@dataclass(frozen=True)
 class GitResult:
     """Captured output from one non-raising Git call."""
 
@@ -1646,13 +1659,18 @@ class Repository:
             findings=findings,
         )
 
-    def commit_parents(self, commit: str) -> tuple[str, ...]:
-        content = self.git("cat-file", "commit", commit).stdout
-        header, separator, _ = content.partition(b"\n\n")
+    @staticmethod
+    def _commit_header(raw_object: bytes, *, commit: str) -> bytes:
+        header, separator, _ = raw_object.partition(b"\n\n")
         if not separator:
             raise GitError("commit object has no header terminator", commit=commit)
+        return header
+
+    def commit_object_parents(self, raw_object: bytes, *, commit: str) -> tuple[str, ...]:
+        """The parents a raw commit object names in its header, in order."""
+
         parents: list[str] = []
-        for line in header.splitlines():
+        for line in self._commit_header(raw_object, commit=commit).splitlines():
             if not line.startswith(b"parent "):
                 continue
             try:
@@ -1661,6 +1679,29 @@ class Repository:
                 raise GitError("commit parent is not ASCII", commit=commit) from error
             parents.append(self.validate_oid(parent, label="commit parent"))
         return tuple(parents)
+
+    def commit_object_tree(self, raw_object: bytes, *, commit: str) -> str:
+        """The tree a raw commit object names; Git writes it as the first header line.
+
+        Git admits an uppercase hexadecimal tree ID in a commit it writes with
+        ``hash-object`` and passes ``fsck --strict``, and ``show --format=%T``
+        reports it lowercase. The value is normalized the same way here so a
+        Git-admitted commit keeps its admission; the parent lines are not, so a
+        commit that ``commit_parents`` refused stays refused.
+        """
+
+        first = self._commit_header(raw_object, commit=commit).split(b"\n", 1)[0]
+        if not first.startswith(b"tree "):
+            raise GitError("commit object has no tree header", commit=commit)
+        try:
+            tree = first.removeprefix(b"tree ").decode("ascii", errors="strict").lower()
+        except UnicodeDecodeError as error:
+            raise GitError("commit tree is not ASCII", commit=commit) from error
+        return self.validate_oid(tree, label="commit tree")
+
+    def commit_parents(self, commit: str) -> tuple[str, ...]:
+        content = self.git("cat-file", "commit", commit).stdout
+        return self.commit_object_parents(content, commit=commit)
 
     def ref_lock_path(self, reference: str) -> Path:
         if self.ref_format == "reftable":
@@ -2027,7 +2068,91 @@ class Repository:
                 for recorded_commit, operations in recorded_values.items()
             }
             pending_queries = _landing_queries(pending)
-        requests = b"".join(commit.encode("ascii") + b"\n" for commit in commits)
+        found: list[MarkedCommit] = []
+        for commit, kind, raw_object in self._cat_file_batch(commits, reference=reference):
+            if kind != "commit":
+                # These names came from Git's own listing, so anything but a
+                # commit is the stream disagreeing with itself.
+                raise GitError(
+                    "malformed cat-file batch header",
+                    reference=reference,
+                    commit=commit,
+                )
+            raw_message = self._commit_message(raw_object, commit=commit)
+            operations = (
+                landing_ids(raw_message)
+                if recorded_queries is None
+                else _reduce_landing_ids(
+                    raw_message,
+                    recorded=recorded_queries.get(commit, _EMPTY_LANDING_QUERIES),
+                    pending=pending_queries,
+                )
+            )
+            found.append(MarkedCommit(commit, operations))
+        return found
+
+    def landed_evidence(
+        self, requests: Mapping[str, Collection[str]], *, reference: str
+    ) -> dict[str, LandedEvidence]:
+        """What one batch read establishes about each requested commit.
+
+        ``requests`` maps a commit name to the landing operations whose
+        presence in its message is in question (empty for a plain landing).
+        Only well-formed object IDs are sent, each once, in the mapping's
+        order, and only an answer Git types as ``commit`` yields evidence:
+        its parents and tree from the raw header, and the subset of the
+        requested operations the message carries, judged one operation at a
+        time by the same reducer the single-object reader uses. Everything
+        else is absent from the result: a name that is not an object ID, an
+        object Git reports missing (which is also how it reports a loose
+        object it cannot inflate), a blob, a tree, a tag. The caller asks Git
+        about those one at a time with the ordinary probes, whose answers
+        separate "not a commit I have" from the plumbing failing.
+
+        Each raw body is reduced as soon as it is read and never retained, so
+        the memory held is the evidence, not the history. Nothing is retained
+        across calls: the object store is re-read every time, so availability
+        that changes between two calls is seen by the second one.
+        """
+
+        pattern = re.compile(rf"[0-9a-f]{{{self.oid_length}}}")
+        wanted = {
+            commit: frozenset(operations)
+            for commit, operations in requests.items()
+            if pattern.fullmatch(commit) is not None
+        }
+        evidence: dict[str, LandedEvidence] = {}
+        for oid, kind, raw_object in self._cat_file_batch(tuple(wanted), reference=reference):
+            if kind != "commit":
+                continue
+            evidence[oid] = LandedEvidence(
+                parents=self.commit_object_parents(raw_object, commit=oid),
+                tree=self.commit_object_tree(raw_object, commit=oid),
+                operations=frozenset(
+                    operation
+                    for operation in wanted[oid]
+                    if self.commit_object_has_landing_operation(
+                        raw_object, commit=oid, operation=operation
+                    )
+                ),
+            )
+        return evidence
+
+    def _cat_file_batch(
+        self, oids: Sequence[str], *, reference: str
+    ) -> Iterator[tuple[str, str | None, bytes]]:
+        """One ``cat-file --batch`` over ``oids``, yielding (oid, type, body) in turn.
+
+        ``type`` is None when Git answers ``missing``. Bodies are yielded one
+        at a time and not kept, so a consumer that reduces each body as it
+        arrives holds one object, not the history. A stream that does not
+        frame the way Git promises is a plumbing failure, not a statement about
+        any object, and is raised as such.
+        """
+
+        if not oids:
+            return
+        requests = b"".join(oid.encode("ascii") + b"\n" for oid in oids)
         with tempfile.TemporaryFile() as output_file, tempfile.TemporaryFile() as stderr_file:
             try:
                 if _GIT_EXECUTABLE is None:
@@ -2066,21 +2191,23 @@ class Repository:
                 )
 
             output_file.seek(0)
-            found: list[MarkedCommit] = []
-            for commit in commits:
+            for oid in oids:
                 header = output_file.readline().removesuffix(b"\n")
                 fields = header.split(b" ")
-                expected_oid = commit.encode("ascii")
+                expected_oid = oid.encode("ascii")
+                if len(fields) == 2 and fields[0] == expected_oid and fields[1] == b"missing":
+                    yield (oid, None, b"")
+                    continue
                 if (
                     len(fields) != 3
                     or fields[0] != expected_oid
-                    or fields[1] != b"commit"
+                    or not fields[1].isalpha()
                     or not fields[2].isdigit()
                 ):
                     raise GitError(
                         "malformed cat-file batch header",
                         reference=reference,
-                        commit=commit,
+                        commit=oid,
                     )
                 size = int(fields[2])
                 raw_object = output_file.read(size)
@@ -2088,24 +2215,11 @@ class Repository:
                     raise GitError(
                         "truncated cat-file batch object",
                         reference=reference,
-                        commit=commit,
-                )
-                raw_message = self._commit_message(raw_object, commit=commit)
-                operations = (
-                    landing_ids(raw_message)
-                    if recorded_queries is None
-                    else _reduce_landing_ids(
-                        raw_message,
-                        recorded=recorded_queries.get(
-                            commit, _EMPTY_LANDING_QUERIES
-                        ),
-                        pending=pending_queries,
+                        commit=oid,
                     )
-                )
-                found.append(MarkedCommit(commit, operations))
+                yield (oid, fields[1].decode("ascii"), raw_object)
             if output_file.read(1):
                 raise GitError("unexpected cat-file batch output", reference=reference)
-        return found
 
     @staticmethod
     def _commit_message(raw_object: bytes, *, commit: str) -> bytes:
@@ -2121,13 +2235,20 @@ class Repository:
         raw_message = self._commit_message(raw_object, commit=commit)
         return landing_ids(raw_message)
 
-    def commit_has_landing_operation(self, commit: str, operation: str) -> bool:
+    def commit_object_has_landing_operation(
+        self, raw_object: bytes, *, commit: str, operation: str
+    ) -> bool:
         """Test exact identity membership without retaining unrelated prefixes."""
 
-        raw_object = self.git("cat-file", "commit", commit).stdout
         raw_message = self._commit_message(raw_object, commit=commit)
         return _reduce_landing_ids(
             raw_message,
             recorded=_landing_queries({operation}),
             pending=_EMPTY_LANDING_QUERIES,
         ) == frozenset({operation})
+
+    def commit_has_landing_operation(self, commit: str, operation: str) -> bool:
+        raw_object = self.git("cat-file", "commit", commit).stdout
+        return self.commit_object_has_landing_operation(
+            raw_object, commit=commit, operation=operation
+        )
