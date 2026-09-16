@@ -26,6 +26,11 @@ here. `Onetree-Operation` was already what made broker commits self-identifying;
 this is the first code that depends on it for correctness rather than for
 reporting.
 
+This was an intermediate status-loss repair. [AF5](ROUND-AF5.md#mechanisms-and-boundaries)
+records the remaining case: another hand commit could advance the observed tip
+past the successful candidate before the read. AF5 extended equality to
+containment; the closure below describes AF4's tested immediate-tip case.
+
 **The reftable absent-arm is taken from storage, not from the tables.**
 `show-ref --exists` returning 2 means "no table names this ref," which is an
 answer *about the tables* and is therefore worth exactly what they are worth.

@@ -43,6 +43,14 @@ the old format requested. A test places an exact-looking operation line in an
 earlier paragraph and proves it is ordinary prose. The existing control-byte
 fixtures prove record and unit separators remain value bytes, not framing.
 
+The final-block restriction and comma-joined identity are historical AF8D
+semantics. [AF10](ROUND-AF10.md#the-predicate-and-its-measured-boundary) later
+rejected the final-block predicate after a folded-squash landing escaped it,
+and replaced it with a line-union predicate and exact commit/operation pairs.
+The earlier-paragraph negative control above must not be read as the later
+identity contract. Compatibility of already-written adopted records is a
+separate question; this correction does not establish it.
+
 ## What “bounded” means here
 
 The bounded surface is the set of non-racing local inputs that Git 2.53.0 can

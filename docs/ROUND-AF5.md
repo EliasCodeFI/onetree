@@ -58,6 +58,13 @@ The branch-side audit remains scoped to `_divergences`, reached by
 record delimiter incrementally; it does not use `--skip`, `--max-count`,
 `TrailerScan`, or `DIVERGENCE_SCAN_LIMIT`.
 
+[AF6](ROUND-AF6.md#disposition) supersedes both the origin-dependent clone
+preflight and this audit-scope description. It records a repository-property
+check independent of remote names, with the complete audit on mutation paths
+and read-only `check` remaining free of that walk. AF6 also records that AF5's
+separate marker walk did run on `check`; this paragraph was not evidence that
+the entire AF5 read path avoided history work.
+
 Gate 1's one-working-tree scope is now an executable precondition:
 `Repository.__init__` compares `--absolute-git-dir` with `--git-common-dir`
 and raises the typed `unsupported_worktree` error when they differ. That stops
@@ -72,6 +79,11 @@ the 1- and 3-hand-commit depths across both backends; depth 0 stayed green,
 which is exactly the fixture-sized hole. The other failures were the two
 reftable transient shapes, `--skip` pagination, clone silence, and linked
 worktree silence.
+
+[AF6's record-accuracy correction](ROUND-AF6.md#disposition) reports **76
+deselected**, not 74, and discloses a coverage decline from 92.26% to 91.78%
+that AF5 omitted. The original selection figure above is retained as the
+claim being corrected, not as a second valid result.
 
 The WAL-ref fixture is a guard for already-correct AF4 behavior, so its
 red-first evidence is the known-bad WAL-only mutation rather than base behavior:
