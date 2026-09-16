@@ -71,7 +71,11 @@ The referee timeout's process-group kill
 (`tests/test_referee.py::test_referee_timeout_kills_the_whole_process_group`)
 is a different path from submitter death and is not exercised here.
 
-## Observation for disposition: the referee outlives its broker
+## Historical observation: the referee outlived its broker
+
+The following describes the accepted r3 predecessor. Task171 supersedes its
+orphan assertions with production cleanup assertions; see `ROUND-G2-LIFETIME.md`.
+The earlier freezes and their observed results remain unchanged.
 
 When the broker dies during the referee, the referee process survives it and
 its scratch clone is never removed. The cause is structural: the referee is
