@@ -57,6 +57,11 @@ stays inside the walk. `DIVERGENCE_SCAN_LIMIT` bounds one Git result; the audit
 continues from the same resolved head until it reaches the floor. This corrects
 AF2's permanent `scan_truncated` refusal.
 
+That AF3 floor was subsequently refuted and removed by
+[AF4](ROUND-AF4.md#corrections-to-earlier-round-records): more than one hand
+commit could still hide a crash-left landing. This paragraph records the
+intermediate repair, not a complete-history guarantee.
+
 **Recovery reports what it found.** `RecoveryResult` carries measured
 `repaired`, `refused`, `pending` and `locks`; the `diverged` field, which was
 the constant `0`, is gone. `onetree wal` leads its human line with the verdict

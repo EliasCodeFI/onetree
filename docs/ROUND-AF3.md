@@ -29,8 +29,10 @@ floor is reached. Each Git result remains bounded by
 `DIVERGENCE_SCAN_LIMIT`; crossing one page is no longer a `scan_truncated`
 divergence. The floor retains the first observed position and its immediate
 parents, closing the measured one-hand-commit mask. Missing parents in a
-shallow clone still degrade to no exclusion, so all locally visible history is
-audited.
+shallow clone still degrade to no exclusion. The original conclusion that this
+audited all locally visible history was false: AF4 recorded that multiple hand
+commits could still mask a crash-left landing and removed the floor. See
+[AF4's correction](ROUND-AF4.md#corrections-to-earlier-round-records).
 
 **Audit and liveness are independent.** Recovery still leaves a live lander's
 intent untouched, but it verifies recorded landings and computes divergences
@@ -58,7 +60,7 @@ modes surface that warning.
 | Lead | Outcome |
 | --- | --- |
 | (a) ref created between probes and `lstat` | **Confirmed and closed.** The deterministic fixture creates the ref at the storage-observation seam; AF2 raises `RefCorruptError`, AF3's fresh probes return the commit. Guard: `test_a_ref_created_after_both_probes_is_retried_not_called_corrupt`. |
-| (b) lander birth tick unpinned; degradation silent | **Confirmed and closed.** `test_lander_birth_tick_is_part_of_the_in_flight_bar` contains a bare-PID counterfactual that changes the measured recovery result. `test_a_degraded_lander_surfaces_the_same_warning_as_a_degraded_session` pins persistence and surfacing. |
+| (b) lander birth tick unpinned; degradation silent | **Partially covered in AF3; reopened in AF4.** These fixtures cover recovery's read-side birth-tick judgment and warning surfacing. They did not hold the write-side requirement that a healthy `land()` records a real tick. [AF4's correction](ROUND-AF4.md#corrections-to-earlier-round-records) retracts the earlier closure and records the added write-side guard. |
 | (c) immediate parent excluded by the floor | **Confirmed and closed.** One permitted hand commit no longer masks the crash-left broker commit. Guard: `test_the_commit_immediately_below_first_sight_stays_inside_the_audit`. |
 | (d) four `GitError` append-refusal holes | **Confirmed and closed.** `_try_append` translates validation failures from target, expected head, candidate, and tree into `WalAppendRefusedError`; it still writes nothing. Guard: `test_all_four_git_validators_refuse_an_unreplayable_append_at_the_wal_door`. |
 | (e) pruned landed commit has no recovery path | **Confirmed, with the recoverable boundary made explicit.** The WAL does not contain the missing commit object and cannot reconstruct it. The typed error now names restore/fetch and includes the commit OID; the fixture restores the exact object and proves the normal divergence audit resumes. Guard: `test_a_pruned_landed_object_names_the_restore_path_before_recovery_can_audit`. |

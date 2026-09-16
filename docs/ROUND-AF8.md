@@ -43,6 +43,12 @@ result, drains stderr through the existing temporary file, and retains the
 existing object-ID and UTF-8 validation. This changes framing only; it does not
 change the AF9 operation-identity skip set or audit-target selection.
 
+This historical framing was superseded by [AF8D](ROUND-AF8D.md): its NUL-bearing
+commit exposed the unsafe assumption that message bytes could not contain the
+delimiter. AF8D moved message reads to size-framed raw objects and left only
+OID and empty fields in the history stream. The AF8 separator controls above
+do not establish safety for every message byte.
+
 `Repository.is_shallow()` reads the repository's own shallow marker. For each
 listed object it verifies that the object is a commit and reads its raw parent
 headers with replacement refs and grafts disabled. A valid listed commit with

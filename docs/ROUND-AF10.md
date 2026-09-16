@@ -101,6 +101,11 @@ distinct pair without cancelling that live intent; its later `landed` or
   after the listing, so a warningless dangling symref or a non-UTF-8 broken ref
   cannot disappear behind a malformed warning. Every emitted name, oid, and
   object type is still validated by Git-backed checks.
+- That inventory closure was incomplete. [AF11](ROUND-AF11.md#red-first-defects)
+  records dangling aliases that still prevented adoption from restoring access,
+  unrelated successful-command stderr that caused refusal, and a resolving
+  namespace symlink that could hide a corrupt child. AF11 records the subsequent
+  repairs; AF10's inventory paragraph describes an intermediate implementation.
 - The WAL/head snapshot rechecks retained by mutation paths, inspection, and
   recovery each have a deterministic peer or branch interleave. The two
   adoption rechecks were removed because the WAL CAS and repository-wide final
