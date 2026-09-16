@@ -282,6 +282,9 @@ class _FoldedState:
     event_ids: set[str] = field(default_factory=set)
     session_generations: set[str] = field(default_factory=set)
     claim_generations: set[str] = field(default_factory=set)
+    session_payloads: dict[tuple[str, str, str], dict[str, TreeEntry | None]] = field(
+        default_factory=dict
+    )
     workspace_epoch: Mapping[str, Any] | None = None
     workspace_epoch_id: str | None = None
     workspace_transitions: list[tuple[str, str]] = field(default_factory=list)
@@ -316,6 +319,7 @@ class _FoldedState:
             event_ids=set(self.event_ids),
             session_generations=set(self.session_generations),
             claim_generations=set(self.claim_generations),
+            session_payloads={key: dict(value) for key, value in self.session_payloads.items()},
             workspace_epoch=self.workspace_epoch,
             workspace_epoch_id=self.workspace_epoch_id,
             workspace_transitions=list(self.workspace_transitions),
@@ -944,6 +948,14 @@ class Coordinator:
             state.pending.pop(operation)
             state.landed_operations[operation] = event
             state.landed.append(event)
+            progress = state.session_payloads.setdefault(
+                (intent.actor, str(intent.data["session_generation"]), landed_target), {}
+            )
+            for change in intent.data["payload"]:
+                entry = change["new"]
+                progress[change["path"]] = (
+                    None if entry is None else TreeEntry(entry["mode"], entry["oid"])
+                )
         elif event.kind == "workspace_protect":
             try:
                 workspace.validate(data, self.repo)
@@ -1097,7 +1109,7 @@ class Coordinator:
                     and existing.pid_start == process_start
                     and existing.target == target_ref
                 ):
-                    self.repo.ensure_index(actor, existing.base)
+                    self.repo.ensure_index(actor, self._session_baseline(state, existing))
                     return existing
                 raise IdentityError(
                     "session id is already registered to a live process",
@@ -1118,6 +1130,15 @@ class Coordinator:
                     warnings=warnings,
                 )
         raise GitError("session registration CAS retry limit exceeded")
+
+    def _session_baseline(self, state: _FoldedState, session: SessionInfo) -> str:
+        """Subtract only this incarnation's terminal payloads from its next submission.
+
+        Peer changes never become private-index edits, and newly staged work must
+        survive a landing. Existing indexes are therefore not refreshed or reset.
+        """
+        progress = state.session_payloads.get((session.actor, session.generation, session.target))
+        return self.repo.overlay_tree(session.base, progress) if progress else session.base
 
     def protect_workspace(self, actor: str) -> Mapping[str, Any]:
         actor = _validate_actor(actor)
@@ -1596,9 +1617,10 @@ class Coordinator:
                     reason="wrong_target",
                     paths=[],
                 )
-            index = self.repo.ensure_index(actor, session.base)
+            baseline = self._session_baseline(state, session)
+            index = self.repo.ensure_index(actor, baseline)
             session_tree = self.repo.write_tree(index)
-            base_entries = self.repo.tree_entries(session.base)
+            base_entries = self.repo.tree_entries(baseline)
             session_entries = self.repo.tree_entries(session_tree)
             changes = self._changes(base_entries, session_entries)
             if not changes:
