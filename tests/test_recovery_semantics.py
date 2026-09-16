@@ -339,33 +339,38 @@ def test_recovery_run_during_a_live_landing_leaves_it_alone(
     operator.register_session("beta", pid=os.getpid(), ttl=300)
 
 
-def test_a_recovery_that_ignores_liveness_is_stopped_at_the_wal_door(
+def test_a_persisted_refusal_stops_a_landed_mark_at_the_wal_door(
     git_repo: GitFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED control for the pair: with the first guard removed, the second holds.
-
-    Mutation M15 disables the in-flight bar, so the same interleave refuses a
-    live landing's intent mid-flight. The lander then wins its branch CAS and
-    goes to record the landing -- the exact write that used to brick the WAL.
-    It is refused at the door and typed, and the resulting state is a named
-    divergence rather than a WAL that raises from every read path forever.
-    """
-
     lander = Coordinator(git_repo.root)
     operator = Coordinator(git_repo.root)
     session = _register(lander, git_repo, "alpha", "a.txt")
     _stage(git_repo, session, "a.txt", "racing\n")
-    monkeypatch.setattr(Coordinator, "_landing_in_flight", staticmethod(lambda *_: False))
+    refused_head: list[str | None] = []
 
-    def recover_at_the_window(point: str, _context: Mapping[str, Any]) -> None:
+    def persist_refusal_at_the_window(point: str, context: Mapping[str, Any]) -> None:
         if point == "after_intent":
-            assert operator.recover().refused == 1
+            recovery = operator.recover()
+            assert recovery.pending == 1
+            assert recovery.refused == 0
+            snapshot = operator.wal.read()
+            intent = next(
+                event for event in snapshot.events
+                if event.kind == "land_intent" and event.data["operation"] == context["operation"]
+            )
+            refused = operator.wal.document("refused", "alpha", {
+                "action": "land", "reason": "incomplete_intent", "paths": [],
+                "operation": intent.data["operation"], "intent": intent.event_id,
+            })
+            assert operator.wal.try_append((refused,), snapshot.head) is not None
+            refused_head.append(operator.wal.read().head)
 
     with pytest.raises(WalAppendRefusedError, match="refused its landed mark"):
-        lander.land("alpha", message="racing land", checkpoint=recover_at_the_window)
+        lander.land("alpha", message="racing land", checkpoint=persist_refusal_at_the_window)
 
     report = operator.inspect_wal()
+    assert [operator.wal.read().head] == refused_head
+    assert not any(event.kind == "landed" for event in report.events)
     assert [item.kind for item in report.divergences] == ["refused_candidate_on_target"]
     assert report.pending_intents == 0
     with pytest.raises(WalDivergedError):
@@ -2763,7 +2768,6 @@ def test_probing_a_diverged_repository_records_one_refusal_per_divergence(
 
 def test_a_locked_target_branch_closes_the_intent_written_ahead_of_it(
     git_repo: GitFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     session = _register(coordinator, git_repo, "alpha", "a.txt")
@@ -2781,13 +2785,7 @@ def test_a_locked_target_branch_closes_the_intent_written_ahead_of_it(
     # The claim is free again: a stranded intent fences its own session's claims.
     assert coordinator.release("alpha", [str(git_repo.root / "a.txt")]).released == ("a.txt",)
 
-    # RED control (mutation M18): leave the intent open on the way out and the
-    # session is fenced against releasing the claim it holds -- visible, at
-    # least, on the human line the same round taught to name pending intents.
-    coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
-    monkeypatch.setattr(Coordinator, "_close_intent", lambda *args, **kwargs: None)
-    with pytest.raises(RefLockedError):
-        coordinator.land("alpha")
+    _pending_intent(git_repo, coordinator, session)
     assert coordinator.inspect_wal().pending_intents == 1
     with pytest.raises(ReleaseRefusedError) as fenced:
         coordinator.release("alpha", [str(git_repo.root / "a.txt")])
@@ -2796,6 +2794,9 @@ def test_a_locked_target_branch_closes_the_intent_written_ahead_of_it(
     assert code == 1
     assert "1 pending intent(s)" in human
     branch_lock.unlink()
+    assert coordinator.recover().refused == 1
+    assert coordinator.release("alpha", [str(git_repo.root / "a.txt")]).released == ("a.txt",)
+    assert coordinator.inspect_wal().consistent
 
 
 # --------------------------------------------------------------------------
@@ -3216,49 +3217,40 @@ def test_a_git_death_after_the_branch_cas_applied_completes_the_landing(
     assert coordinator.recover().consistent
 
 
-def test_the_shipped_cas_reading_turns_that_death_into_a_false_payload_conflict(
+def test_a_real_competing_commit_causes_a_payload_conflict_without_landing_the_candidate(
     git_repo: GitFixture,
-    kill_git: KillGit,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED control for the pair: restore the conflation, the harm comes back.
-
-    ``update_ref`` classified every failed invocation whose ref had moved as a
-    lost race, without asking whether it had moved to this call's own candidate.
-    """
-
     coordinator = Coordinator(git_repo.root)
     session = _register(coordinator, git_repo, "alpha", "a.txt")
-    _stage(git_repo, session, "a.txt", "killed mid update-ref\n")
-    monkeypatch.setattr(
-        Repository,
-        "_reapplied",
-        lambda _self, _old, _new, _observed: False,
-    )
-    _arm_kill_git(
-        monkeypatch, kill_git, reference="refs/heads/main", nth=1, mode="self_after"
-    )
+    _stage(git_repo, session, "a.txt", "candidate bytes\n")
+    peer_index = coordinator.repo.git_dir / "peer.index"
+    peer_commits: list[str] = []
+
+    def peer_wins(point: str, _context: Mapping[str, Any]) -> None:
+        if point != "after_intent":
+            return
+        git_repo.git("read-tree", git_repo.base, index=peer_index)
+        git_repo.write("a.txt", "competing bytes\n")
+        git_repo.stage(peer_index, "a.txt")
+        peer = git_repo.raw_commit(peer_index, git_repo.base, "ordinary peer commit")
+        git_repo.git("update-ref", "refs/heads/main", peer, git_repo.base)
+        peer_commits.append(peer)
 
     with pytest.raises(LandingRefusedError) as refused:
-        coordinator.land("alpha", message="killed mid update-ref")
+        coordinator.land("alpha", message="competing landing", checkpoint=peer_wins)
 
     assert refused.value.details["reason"] == "payload_conflict"
-    # The landing the caller was told was refused is on the branch, with the
-    # right bytes -- that is what makes the refusal false rather than merely
-    # unlucky.
     intent = next(
         event for event in coordinator.wal.read().events if event.kind == "land_intent"
     )
-    assert git_repo.oid() == intent.data["candidate"]
-    assert git_repo.git("show", "refs/heads/main:a.txt").stdout == "killed mid update-ref\n"
-    assert [item.kind for item in coordinator.inspect_wal().divergences] == [
-        "refused_candidate_on_target"
-    ]
-    # Nothing retires a `refused` event, so this is permanent: recovery raises
-    # on every call, exit 2, over a repository whose data is fine.
-    for _ in range(2):
-        with pytest.raises(WalDivergedError):
-            coordinator.recover()
+    assert [git_repo.oid()] == peer_commits
+    assert git_repo.oid() != intent.data["candidate"]
+    assert git_repo.git("show", "refs/heads/main:a.txt").stdout == "competing bytes\n"
+    report = coordinator.inspect_wal()
+    assert not any(event.kind == "landed" for event in report.events)
+    assert report.pending_intents == 0
+    assert report.consistent
+    assert coordinator.recover().consistent
 
 
 @pytest.mark.parametrize("ref_format", ["files", "reftable"])
