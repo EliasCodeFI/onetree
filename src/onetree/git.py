@@ -1004,6 +1004,19 @@ class Repository:
         if not self._loose_ref_path_is_exact_storage(path, reference):
             return True
 
+        # An ordinary direct ref cannot be a dangling symbolic alias. This is
+        # only a shape shortcut: the inventory still requires Git to resolve
+        # and validate its value. Do not cache mutable ref contents.
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                with path.open("rb") as stream:
+                    raw = stream.read(self.oid_length + 2)
+                if re.fullmatch(rb"[0-9a-f]{" + str(self.oid_length).encode() + rb"}\n?", raw):
+                    return False
+        except OSError:
+            # A racing replacement or unreadable file is still Git's input.
+            pass
+
         symbolic = self.git("symbolic-ref", "--quiet", reference, check=False)
         if symbolic.returncode != 0:
             return False
@@ -1020,8 +1033,8 @@ class Repository:
         """Return valid branch names present in the files ref backend.
 
         Git's ref-filter can omit a dangling symbolic ref without a diagnostic,
-        so stderr cannot prove that the listing is complete. This inventory
-        reads names only; Git still resolves and validates every emitted value.
+        so stderr cannot prove that the listing is complete. Git still
+        resolves and validates every emitted value.
         Invalid loose filenames are deliberately excluded by check-ref-format.
         """
 
