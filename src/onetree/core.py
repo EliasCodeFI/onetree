@@ -533,6 +533,7 @@ class Coordinator:
         for _ in range(MAX_CAS_RETRIES):
             snapshot = self.wal.read()
             state = self._fold(snapshot)
+            self._verify_landed(state)
             heads = self._audit_heads(state, target)
             targets = self._audit_target_names(heads)
             self._refuse_legacy_grafts(targets)
