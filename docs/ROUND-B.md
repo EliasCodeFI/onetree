@@ -207,7 +207,8 @@ by those commands. Production referee dependency provenance remains a cutover
 requirement.
 
 Local evidence is retained in
-`/home/anvil/claude-diag-806b39cf/onetree-gate-evidence/`:
+`/anvil/claude-diag-806b39cf/onetree-gate-evidence/` (the retained directory
+after the home-path migration; historical logs still name their original paths):
 `round-b-live-observation.md`, `round-b-live-*.json`, `referee-red-first.txt`,
 `workspace-red-first.txt`, `referee-receipt-red.txt`, `round-b-focused-v2.txt`,
 `round-b-review-red-confirmation.txt`, `round-b-review-corrections.txt`,
