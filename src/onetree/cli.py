@@ -448,6 +448,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             # carries git's stderr, two lines for an include git cannot expand (Round
             # BF6 DUO), and git passes non-ASCII breaks through (Round BF7 DUO).
             sys.stderr.write(f"onetree: {_one_line(str(error))}{suffix}\n")
+            recording_error = error.details.get("recording_error")
+            if recording_error is not None:
+                sys.stderr.write(
+                    f"  refusal recording failed ({_one_line(str(recording_error['type']))}): "
+                    f"{_one_line(str(recording_error['message']))}\n"
+                )
             # Each divergence names what the operator must reconcile; a second item
             # beside the branch divergence (an unreadable referee setting) was reported
             # in the JSON payload only (Round BF3 DUO). The detail says "this commit";

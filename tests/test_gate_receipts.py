@@ -14,6 +14,7 @@ from test_defensive import _expose_intent
 from test_payload_gate import _register_and_stage, _write_gate
 
 from onetree import git as git_module
+from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import LandingRefusedError, PayloadGateError, WalCorruptError
 from onetree.wal import WAL_REF
@@ -372,6 +373,111 @@ def test_landing_retry_retains_the_successful_candidates_receipt(git_repo: GitFi
     intents = [event for event in coordinator.inspect_wal().events if event.kind == "land_intent"]
     assert len(intents) == 1
     assert intents[0].data["gate_receipt"] == result.gate_receipt
+
+
+@pytest.mark.parametrize("verdict", ["REFUSE", "DEGRADED"])
+@pytest.mark.parametrize("recording", ["contended", "locked"])
+@pytest.mark.parametrize("caller", ["api", "json", "human"])
+def test_gate_refusal_survives_a_real_wal_advance_without_reauditing(
+    git_repo: GitFixture, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    verdict: str, recording: str, caller: str,
+) -> None:
+    calls = tmp_path / "gate-calls.txt"
+    gate = tmp_path / "contending_gate.py"
+    report = {
+        "repository": str(git_repo.root),
+        "staged_files": ["a.txt"],
+        "findings": ["known bad payload"] if verdict == "REFUSE" else [],
+        "degraded": ["census unavailable"] if verdict == "DEGRADED" else [],
+        "advisories": ["retain this evidence"],
+        "hook_suites": [],
+        "hook_suite_state": "not_evaluated",
+        "verdict": verdict,
+    }
+    gate.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(git_module.__file__).parents[1])!r})\n"
+        "from onetree.core import Coordinator\n"
+        f"calls = Path({str(calls)!r})\n"
+        "with calls.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(sys.argv[2] + '\\n')\n"
+        "attempt = len(calls.read_text(encoding='utf-8').splitlines())\n"
+        "peer = Coordinator(sys.argv[4])\n"
+        "peer.register_session(\n"
+        "    f'peer-{attempt}', pid=os.getppid(), ttl=300)\n"
+        + (
+            f"peer.repo.ref_lock_path({WAL_REF!r}).touch()\n"
+            if recording == "locked" else ""
+        )
+        + f"report = {report!r}\n"
+        "report['candidate'] = sys.argv[2]\n"
+        "print(json.dumps(report))\n"
+        f"raise SystemExit({1 if verdict == 'REFUSE' else 2})\n",
+        encoding="utf-8",
+    )
+    coordinator = _register_and_stage(
+        git_repo, "alpha", "contended refusal\n", commit_payload=gate
+    )
+    before = coordinator.wal.read().head
+    arguments = [
+        "land", "--repo", str(git_repo.root), "--session", "alpha",
+        "--commit-payload", str(gate),
+    ]
+    if caller == "api":
+        with pytest.raises(LandingRefusedError) as refused:
+            coordinator.land("alpha")
+        code = refused.value.exit_code
+        error = refused.value.payload()
+    elif caller == "json":
+        code, payload = _json_call(capsys, arguments)
+        error = payload["error"]
+    else:
+        code = main(arguments)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "onetree:" in captured.err
+        if recording == "locked":
+            assert "refusal recording failed (ref_locked)" in captured.err
+            assert WAL_REF in captured.err
+        else:
+            assert "refusal recording failed" not in captured.err
+        error = None
+    candidates = calls.read_text(encoding="utf-8").splitlines()
+    assert len(candidates) == 1
+    assert code == 1
+    if error is not None:
+        assert error["type"] == "land_refused"
+        assert error["reason"] == (
+            "payload_gate_refused" if verdict == "REFUSE" else "payload_gate_degraded"
+        )
+    wal = coordinator.inspect_wal()
+    assert wal.consistent
+    assert wal.head != before
+    assert [event.actor for event in wal.events if event.kind == "session_register"] == [
+        "alpha", "peer-1"
+    ]
+    refusals = [event for event in wal.events if event.kind == "refused"]
+    receipt = {
+        "version": 1,
+        "gate_source_sha256": hashlib.sha256(gate.read_bytes()).hexdigest(),
+        "expected_paths": ["a.txt"],
+        "report": {**report, "candidate": candidates[0]},
+    }
+    if error is not None:
+        assert error["gate_receipt"] == receipt
+    if recording == "contended":
+        assert len(refusals) == 1
+        assert refusals[0].data["gate_receipt"] == receipt
+        if error is not None:
+            assert "recording_error" not in error
+    else:
+        assert not refusals
+        if error is not None:
+            assert error["recording_error"]["type"] == "ref_locked"
+            assert error["recording_error"]["reference"] == WAL_REF
+    assert not any(event.kind in {"land_intent", "landed"} for event in wal.events)
+    assert git_repo.oid() == git_repo.base
 
 
 def test_land_cli_exposes_the_recorded_receipt(
