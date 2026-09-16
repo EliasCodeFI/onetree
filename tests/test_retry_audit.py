@@ -186,6 +186,43 @@ def test_legacy_proof_requires_current_verified_records(
             coordinator._read_wal(retry_audit=proof)
 
 
+def test_readoption_invalidates_legacy_prefix_without_losing_recorded_identity(
+    git_repo: GitFixture, walks: list[tuple[str, tuple[str, ...], set[str]]],
+) -> None:
+    commit, scalar = _adopt_legacy(git_repo, "single")
+    coordinator = Coordinator(git_repo.root)
+    proof = _RetryAudit()
+    coordinator._read_wal(retry_audit=proof)
+    old_recorded = proof.recorded
+    old_legacy = proof.legacy_adopted
+    assert old_recorded == frozenset({(commit, scalar)})
+    assert old_legacy == frozenset({commit})
+
+    walks.clear()
+    coordinator._read_wal(retry_audit=proof)
+    assert walks[-1] == (commit, (commit,), set())
+
+    # A public re-adoption after fixture WAL loss writes the same identity at v2.
+    # No private proof field is edited, and the recorded-identity subset survives.
+    git_repo.git("update-ref", "-d", "refs/onetree/wal")
+    adoption = coordinator.adopt_landings()
+    assert len(adoption.adopted) == 1
+    assert adoption.adopted[0].version == 2
+    assert adoption.adopted[0].data["operation"] == scalar
+    state = coordinator._fold(coordinator.wal.read())
+    coordinator._verify_landed(state)
+    assert old_recorded <= coordinator._audit_records(state)
+    assert not old_legacy <= state.legacy_adopted
+
+    walks.clear()
+    coordinator._read_wal(retry_audit=proof)
+    assert walks[-1][0] == commit
+    assert walks[-1][1] == ()
+    assert {git_repo.base, commit} <= walks[-1][2]
+    assert proof.recorded == old_recorded
+    assert proof.legacy_adopted == frozenset()
+
+
 @pytest.mark.parametrize("boundary", ["shallow", "grafts"])
 def test_cached_prefix_does_not_bypass_history_boundaries(
     git_repo: GitFixture, boundary: str,

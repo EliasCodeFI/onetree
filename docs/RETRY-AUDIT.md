@@ -34,6 +34,16 @@ The tests also exercise independent calls, nested landings, unrecorded suffixes,
 new and rewritten branches, WAL rewind, unstable scans, legacy records, and
 history-visibility boundaries using disposable Git repositories.
 
+The legacy-record test also isolates the legacy subset check: a historical
+single-identity adoption is replaced, after fixture WAL loss, by a current
+adoption through the public API. The recorded commit/identity pair remains,
+but legacy membership disappears. A retry then walks the complete history;
+the unchanged-history control reuses its prefix and walks no commits. This
+tests the conservative reuse contract without changing a private proof or
+removing a guard. It does not establish that a validated transition retaining
+a comma-joined historical identity could conceal an unrecorded commit if only
+the legacy check were absent; that stronger safety claim remains unproved.
+
 Retained local evidence is under
 `/anvil/scratch/onetree-ledger-20260916/task61-baseline-5c24cda/` (before) and
 `/anvil/scratch/onetree-retry-audit-61-20260916/` (after). These are local evidence
