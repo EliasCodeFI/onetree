@@ -73,6 +73,14 @@ acceptance of a broker landing the WAL did not record; every other kind is
 written by the broker itself. The working tree stays pristine — no state files
 in the tree, ever. History cannot be edited without showing in the ref.
 
+WAL inspection reports divergences per audit target. A repository-wide
+condition such as shallow history can therefore produce separate findings for
+`HEAD` and each audited branch, even when they point to the same commit. The
+human summary counts audit-target findings, not distinct repository conditions
+or WAL events. Each JSON divergence retains exactly `kind`, `target`, `detail`,
+`commit`, and `operation`; `target` is a scalar string and is part of the
+finding's identity.
+
 Each document carries `v`, the lowest reader version that understands its
 event kind — not a version of the document shape, which has not changed. A
 reader accepts any version it knows and refuses a higher one by version, so a
