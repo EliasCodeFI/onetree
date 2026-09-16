@@ -52,7 +52,7 @@ _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
 PAYLOAD_GATE_TIMEOUT_SECONDS = 300.0
 PAYLOAD_GATE_SOURCE_SHA256 = (
-    "e20c259cfee795f064eb18fa4208c3d9ef6ea962ecd96cf8efbfe351cce4f669"
+    "d71928779f10f286c7d6f840159783c6b54626a07af72a3762682fdc0e8ed4f8"
 )
 PAYLOAD_GATE_ENVIRONMENT_NAMES = (
     "PATH",
@@ -1346,7 +1346,7 @@ class Repository:
                 directory=str(actor_directory),
             )
         path = actor_directory / "index"
-        if path.exists() and not reset:
+        if (path.exists() or path.is_symlink()) and not reset:
             if not path.is_file() or path.is_symlink() or path.stat().st_nlink != 1:
                 raise GitError("session index is not a regular file", index=str(path))
             return path
