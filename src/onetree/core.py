@@ -1500,9 +1500,6 @@ class Coordinator:
         operation: str,
         reason: str,
         paths: Sequence[str] = (),
-        *,
-        gate_receipt: Mapping[str, Any] | None = None,
-        referee_receipt: Mapping[str, Any] | None = None,
     ) -> bool:
         document = self.wal.document(
             "refused",
@@ -1512,9 +1509,6 @@ class Coordinator:
                 "reason": reason,
                 "operation": operation,
                 "paths": list(paths),
-                **({"gate_receipt": dict(gate_receipt)} if gate_receipt is not None else {}),
-                **({"referee_receipt": dict(referee_receipt)}
-                   if referee_receipt is not None else {}),
             },
         )
         return self._try_append(state, snapshot, (document,)) is not None
@@ -1772,7 +1766,11 @@ class Coordinator:
                     "operation": operation, "paths": list(payload_paths),
                     "referee_receipt": refusal.details["referee_receipt"],
                 })
-                self._append_document(rejected, what="referee refusal")
+                try:
+                    self._append_document(rejected, what="referee refusal")
+                except OnetreeError as recording_error:
+                    refusal.details["recording_error"] = recording_error.payload()
+                    raise refusal from recording_error
                 raise
             if not referee.configuration_matches(self.repo, configured_referee):
                 if not self._record_land_refusal(
