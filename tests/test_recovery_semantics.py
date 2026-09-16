@@ -726,7 +726,6 @@ def test_readable_but_malformed_reftable_storage_is_not_read_as_absent(
 def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
     git_repo: GitFixture,
     order: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Found by both verification seats, in two independent reproductions.
 
@@ -765,13 +764,9 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
         coordinator.recover()
     assert recovery_refused.value.kind == "unrecorded_landing"
 
-    # RED control: deleting the shared predicate both lets the routine write
-    # and turns the exact same branch/WAL mismatch into a clean report.
-    monkeypatch.setattr(
-        Coordinator,
-        "_unrecorded_landings",
-        lambda _self, _state, _targets: (),
-    )
+    adopted = coordinator.adopt_landings()
+    assert [event.data["commit"] for event in adopted.adopted] == [unrecorded]
+    assert adopted.report.consistent
     routine_act()
     assert coordinator.inspect_wal().consistent
 
@@ -3442,7 +3437,6 @@ def test_a_lander_whose_warnings_agree_with_its_birth_tick_is_accepted(
 @pytest.mark.parametrize("empty_table_list", [b"", b"\n", b"\n\n"])
 def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     empty_table_list: bytes,
 ) -> None:
     """A table list naming no table is the reftable state onetree can decide.
@@ -3485,15 +3479,9 @@ def test_a_zero_byte_reftable_table_list_refuses_instead_of_answering_absent(
             with pytest.raises(WalCorruptError, match="cannot be read"):
                 call()
 
-        # RED control (B-F5): gut `_reftable_storage_state` to `return None` --
-        # the shape that left its whole body decision-dead -- and the live WAL
-        # reads as an empty healthy one, at exit 0, with the claim gone.
-        monkeypatch.setattr(Repository, "_reftable_storage_state", lambda _self: None)
-        assert coordinator.repo.resolve_ref(WAL_REF, missing_ok=True) is None
-        assert coordinator.inspect_wal().events == ()
-        assert not coordinator.check("beta", str(git_repo.root / "a.txt")).blocked
     finally:
         table_list.write_bytes(original)
+    assert coordinator.inspect_wal().consistent
     assert coordinator.check("beta", str(git_repo.root / "a.txt")).blocked
 
 
