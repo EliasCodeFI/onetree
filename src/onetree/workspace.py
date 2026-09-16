@@ -11,14 +11,14 @@ from onetree.errors import GitError
 from onetree.git import Repository
 
 
-def _log(repo: Repository, reference: str) -> bytes:
+def _log(repo: Repository, reference: str, *, allow_empty: bool = False) -> bytes:
     path = repo.git_path("logs/" + reference)
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("reflog is not a regular file")
         content = stream.read()
-    if not content or not content.endswith(b"\n"):
+    if (not content and not allow_empty) or (content and not content.endswith(b"\n")):
         raise ValueError("reflog is absent or incomplete")
     return content
 
@@ -28,20 +28,27 @@ def _enabled(repo: Repository) -> bool:
     return repo.ref_format == "files" and setting.returncode == 0 and setting.stdout == b"true\n"
 
 
-def baseline(repo: Repository) -> dict[str, Any]:
+def baseline(repo: Repository, *, allow_empty: bool = False) -> dict[str, Any]:
     if not _enabled(repo):
         raise ValueError("workspace protection requires files refs and explicit reflog enablement")
     target = repo.head_ref()
     tip = repo.require_commit(target)
     logs = {}
     for reference in ("HEAD", target):
-        content = _log(repo, reference)
+        content = _log(repo, reference, allow_empty=allow_empty)
+        if allow_empty and content:
+            for line in content.split(b"\n")[:-1]:
+                fields = line.split(b" ", 2)
+                if len(fields) != 3:
+                    raise ValueError("reflog has a malformed transition")
+                repo.validate_oid(fields[0].decode("ascii"))
+                repo.validate_oid(fields[1].decode("ascii"))
         logs[reference] = {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
     return {"target": target, "tip": tip, "logs": logs,
             "referee": list(referee.configuration(repo))}
 
 
-def validate(value: Any, repo: Repository) -> None:
+def validate(value: Any, repo: Repository, *, allow_empty: bool = False) -> None:
     if not isinstance(value, dict) or set(value) != {"target", "tip", "logs", "referee"}:
         raise ValueError("invalid workspace baseline")
     if not isinstance(value["target"], str) or not isinstance(value["tip"], str):
@@ -60,13 +67,15 @@ def validate(value: Any, repo: Repository) -> None:
     for checkpoint in logs.values():
         if not isinstance(checkpoint, dict) or set(checkpoint) != {"size", "sha256"}:
             raise ValueError("invalid reflog checkpoint")
-        if type(checkpoint["size"]) is not int or checkpoint["size"] <= 0:
+        if type(checkpoint["size"]) is not int or checkpoint["size"] < int(not allow_empty):
             raise ValueError("invalid reflog checkpoint size")
         digest = checkpoint["sha256"]
         if not isinstance(digest, str) or len(digest) != 64 or any(
             char not in "0123456789abcdef" for char in digest
         ):
             raise ValueError("invalid reflog checkpoint digest")
+        if checkpoint["size"] == 0 and digest != hashlib.sha256(b"").hexdigest():
+            raise ValueError("invalid empty reflog checkpoint digest")
 
 
 def violation(
@@ -90,7 +99,7 @@ def violation(
             return "shared HEAD changed branch or became detached"
         observed = repo.require_commit(str(epoch["target"]))
         for reference, checkpoint in epoch["logs"].items():
-            content = _log(repo, reference)
+            content = _log(repo, reference, allow_empty=checkpoint["size"] == 0)
             offset = checkpoint["size"]
             if len(content) < offset or hashlib.sha256(content[:offset]).hexdigest() != checkpoint[
                 "sha256"
