@@ -10,8 +10,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from onetree import __version__
-from onetree.core import Coordinator
-from onetree.errors import IdentityError, OnetreeError, WalDivergedError
+from onetree.core import CheckResult, Coordinator
+from onetree.errors import IdentityError, InvalidPathError, OnetreeError, WalDivergedError
 
 
 def _add_output(parser: argparse.ArgumentParser) -> None:
@@ -69,8 +69,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(release)
     _add_output(release)
 
-    check = subparsers.add_parser("check", help="Check one absolute existing path.")
-    check.add_argument("path")
+    check = subparsers.add_parser("check", help="Check one or more absolute existing paths.")
+    check.add_argument("paths", nargs="+")
     _add_repo(check)
     _add_actor(check)
     _add_output(check)
@@ -154,6 +154,63 @@ def _event_payload(event: Any) -> dict[str, Any]:
     return dict(payload)
 
 
+def _check_payload(result: CheckResult) -> dict[str, Any]:
+    return {
+        "path": result.path,
+        "blocked": result.blocked,
+        "holders": [claim.payload() for claim in result.holders],
+        "owned": [claim.payload() for claim in result.owned],
+    }
+
+
+def _check_human(result: CheckResult) -> str:
+    path = json.dumps(result.path, ensure_ascii=True)[1:-1]
+    if result.blocked:
+        holders = ", ".join(json.dumps(claim.actor) for claim in result.holders)
+        line = f"BLOCKED {path} by {holders}"
+    elif result.owned:
+        line = f"OWNED {path}"
+    else:
+        line = f"CLEAR {path}"
+    if result.owned:
+        owners = ", ".join(json.dumps(claim.actor) for claim in result.owned)
+        line += f"; owned by {owners}"
+    return line
+
+
+def _check_paths(
+    coordinator: Coordinator, actor: str, paths: Sequence[str]
+) -> tuple[int, dict[str, Any], str]:
+    if len(paths) == 1:
+        result = coordinator.check(actor, paths[0])
+        return (
+            int(result.blocked),
+            {"ok": True, "check": _check_payload(result)},
+            _check_human(result),
+        )
+
+    rows: list[dict[str, Any]] = []
+    lines: list[str] = []
+    invalid = False
+    blocked = False
+    for path in paths:
+        try:
+            result = coordinator.check(actor, path)
+        except InvalidPathError as error:
+            invalid = True
+            rows.append({"input": path, "ok": False, "error": error.payload()})
+            lines.append(
+                f"ERROR {json.dumps(path, ensure_ascii=True)}: "
+                f"{error.kind}: {json.dumps(str(error), ensure_ascii=True)}"
+            )
+        else:
+            blocked |= result.blocked
+            rows.append({"input": path, "ok": True, "check": _check_payload(result)})
+            lines.append(_check_human(result))
+    code = 2 if invalid else int(blocked)
+    return code, {"ok": not invalid, "blocked": blocked, "checks": rows}, "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     json_output = bool(args.json)
@@ -209,22 +266,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             human = f"released {len(release_result.released)} path(s)"
         elif args.command == "check":
-            check_result = coordinator.check(_actor(args.actor), args.path)
-            return_code = 1 if check_result.blocked else 0
-            payload = {
-                "ok": True,
-                "check": {
-                    "path": check_result.path,
-                    "blocked": check_result.blocked,
-                    "holders": [claim.payload() for claim in check_result.holders],
-                    "owned": [claim.payload() for claim in check_result.owned],
-                },
-            }
-            human = (
-                f"BLOCKED {check_result.path} by "
-                f"{', '.join(claim.actor for claim in check_result.holders)}"
-                if check_result.blocked
-                else f"CLEAR {check_result.path}"
+            return_code, payload, human = _check_paths(
+                coordinator, _actor(args.actor), args.paths
             )
         elif args.command == "protect":
             epoch = coordinator.protect_workspace(_actor(args.actor))
