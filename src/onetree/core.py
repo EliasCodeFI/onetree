@@ -355,6 +355,20 @@ class _FoldedState:
         return tuple(sorted(active, key=lambda item: (item.path, item.actor, item.generation)))
 
 
+@dataclass
+class _RetryAudit:
+    """Clean ancestry proof owned by one land invocation, never by a session.
+
+    Only a stable, successful audit may establish a prefix. Reuse requires
+    the records that justified it to remain present and the same branch to
+    retain that prefix as an ancestor. Independent calls start with no proof.
+    """
+
+    heads: dict[str, str | None] = field(default_factory=dict)
+    recorded: frozenset[tuple[str, str]] = frozenset()
+    legacy_adopted: frozenset[str] = frozenset()
+
+
 def _validate_actor(actor: str) -> str:
     if _ACTOR_PATTERN.fullmatch(actor) is None or actor in {".", ".."}:
         raise IdentityError(
@@ -478,16 +492,8 @@ class Coordinator:
     def _audit_target_names(heads: _AuditHeads) -> tuple[str, ...]:
         return tuple(reference for reference, _ in heads)
 
-    def _unrecorded_landings(
-        self,
-        state: _FoldedState,
-        heads: _AuditHeads,
-    ) -> tuple[Divergence, ...]:
-        """Broker-marked branch commits for which this WAL has no terminal record."""
-
-        found: list[Divergence] = []
-        seen: set[str] = set()
-        walked_heads: set[str] = set()
+    @staticmethod
+    def _audit_records(state: _FoldedState) -> set[tuple[str, str]]:
         recorded = {
             (str(event.data.get("commit")), str(event.data.get("operation")))
             for event in state.landed
@@ -500,13 +506,36 @@ class Coordinator:
             (str(event.data.get("candidate")), operation)
             for operation, event in state.refused_intents.items()
         )
+        return recorded
+
+    def _unrecorded_landings(
+        self,
+        state: _FoldedState,
+        heads: _AuditHeads,
+        retry_audit: _RetryAudit | None = None,
+    ) -> tuple[Divergence, ...]:
+        """Broker-marked branch commits for which this WAL has no terminal record."""
+
+        found: list[Divergence] = []
+        seen: set[str] = set()
+        walked_heads: set[str] = set()
+        recorded = self._audit_records(state)
+        reusable = (
+            retry_audit is not None
+            and retry_audit.recorded <= recorded
+            and retry_audit.legacy_adopted <= state.legacy_adopted
+        )
         for target, head in heads:
             if head is None or head in walked_heads:
                 continue
             walked_heads.add(head)
+            excludes = self._scan_floor(state, target)
+            previous = retry_audit.heads.get(target) if retry_audit is not None else None
+            if reusable and previous is not None and self.repo.is_ancestor(previous, head):
+                excludes = (previous,)
             for marked in self._audit_marked_commits(
                 head,
-                self._scan_floor(state, target),
+                excludes,
                 recorded,
                 state.pending,
             ):
@@ -539,7 +568,9 @@ class Coordinator:
                 )
         return tuple(found)
 
-    def _read_wal(self, target: str | None = None) -> WalSnapshot:
+    def _read_wal(
+        self, target: str | None = None, *, retry_audit: _RetryAudit | None = None,
+    ) -> WalSnapshot:
         """Read a WAL for mutation only after auditing the histories it would adopt."""
 
         for _ in range(MAX_CAS_RETRIES):
@@ -556,7 +587,11 @@ class Coordinator:
                     targets=list(targets),
                     repair="deepen the repository, then run `onetree wal --adopt` if needed",
                 )
-            unrecorded = self._unrecorded_landings(state, heads)
+            unrecorded = (
+                self._unrecorded_landings(state, heads)
+                if retry_audit is None
+                else self._unrecorded_landings(state, heads, retry_audit)
+            )
             if self.wal.head() != snapshot.head or self._audit_heads(state, target) != heads:
                 continue
             if unrecorded:
@@ -568,6 +603,10 @@ class Coordinator:
                     divergences=[item.payload() for item in unrecorded],
                     repair="onetree wal --adopt",
                 )
+            if retry_audit is not None:
+                retry_audit.heads = dict(heads)
+                retry_audit.recorded = frozenset(self._audit_records(state))
+                retry_audit.legacy_adopted = frozenset(state.legacy_adopted)
             return snapshot
         raise GitError("audit snapshot retry limit exceeded", retries=MAX_CAS_RETRIES)
 
@@ -1600,9 +1639,10 @@ class Coordinator:
             else self.repo.validate_branch_ref(target)
         )
         attempts = 0
+        retry_audit = _RetryAudit()
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
-            snapshot = self._read_wal(target_ref)
+            snapshot = self._read_wal(target_ref, retry_audit=retry_audit)
             state = self._fold(snapshot)
             # A landing operation is one attempt. Retries mint a new id so the
             # WAL keeps every attempt's intent and its terminal event distinct.
@@ -2226,7 +2266,10 @@ class Coordinator:
         )
 
     def _scan_floor(self, state: _FoldedState, target: str) -> tuple[str, ...]:
-        """Git-visible history the branch-side audit may skip: none of it.
+        """History excluded on the authority of the WAL alone: none of it.
+
+        A land invocation may separately retain its own stable audit proof for
+        a retry; neither a WAL position nor a previous public call supplies it.
 
         Every exclusion this walk can express is ``git log ^X``, which drops X
         *and its entire ancestry*. The WAL has audited none of that ancestry, so
