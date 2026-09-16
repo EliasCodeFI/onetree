@@ -58,7 +58,7 @@ under `/usr/lib/python3.14`. The predicate source stayed unchanged and the
 original inputs were restored; fixture verification passed before and after.
 
 The local evidence directory is
-`/home/anvil/claude-diag-806b39cf/onetree-gate-evidence/`:
+`/anvil/claude-diag-806b39cf/onetree-gate-evidence/`:
 
 - `round-b-higher-order-observation.json`: inputs, hashes, exits and timings.
 - `round-b-higher-order-import-trace.txt`: interpreter import trace.
