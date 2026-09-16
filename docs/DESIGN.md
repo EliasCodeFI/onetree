@@ -92,9 +92,11 @@ document whose `v` disagrees with its kind is refused: understating the
 version is how a newer kind would otherwise reach a reader that refuses the
 version but not the kind. `adopted` is the first kind above version 1.
 
-Actor identity is a stable session id recorded on every event. Event signing
-(Ed25519) is a design hook behind an optional extra — the core stays
-zero-dependency.
+Each event records an actor string. Session operations use their session id;
+explicit adoption records the literal `operator`. That adoption actor is a
+local marker, not an authenticated identity of the person or session that
+accepted the landing. Event signing (Ed25519) is a design hook behind an
+optional extra — the core stays zero-dependency.
 
 The broker is a role, not a required daemon: the landing code path itself
 enforces every invariant via WAL/ref CAS, so correctness never depends on a
