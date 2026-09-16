@@ -5,8 +5,13 @@ working in this clone.
 
 ## Build phases
 
-- **Now (pre-broker, Gates 0–2):** work lands through the round pipeline
-  (briefed rounds, adversarial verification, CI). Ordinary git is permitted.
+Gate3 dogfood is active in the designated primary shared clone. All development
+landings to its shared branch go through OneTree with the configured referee
+and admitted payload gate. Stage through your session's private index and claim
+every payload path. Bare Git commits, branch switches and resets in that shared
+clone are outside this workflow. A refusal is evidence to inspect and resolve;
+do not reset or reconcile the protected baseline merely to make it disappear.
+
 - **After Gate 3 (dogfood cutover):** ALL landings go through the onetree
   broker. Bare `git commit` to shared refs is out of contract from that point;
   the broker refuses payloads containing paths your session has not claimed.
