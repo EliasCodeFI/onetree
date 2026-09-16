@@ -279,6 +279,11 @@ class _FoldedState:
     #: Divergence sets recovery has already recorded a refusal for, so probing a
     #: diverged repository does not append one event per probe.
     diverged_refusals: set[tuple[tuple[str, ...], ...]]
+    #: Commits named by ``adopted`` records at the historical v=1 schema. Their
+    #: ``operation`` is the 9d2ef3b writer's comma-joined scalar, not an identity,
+    #: so recorded-ness is by commit; ``_verify_landed`` checks each against its
+    #: commit under that writer's semantics before any audit consults this.
+    legacy_adopted: set[str] = field(default_factory=set)
     event_ids: set[str] = field(default_factory=set)
     session_generations: set[str] = field(default_factory=set)
     claim_generations: set[str] = field(default_factory=set)
@@ -508,7 +513,10 @@ class Coordinator:
                 if not marked.operations or marked.commit in seen:
                     continue
                 seen.add(marked.commit)
-                if any(
+                # A commit a verified legacy record names is recorded, whatever
+                # identities the current parser reads from it; any other commit
+                # carrying those identities is still judged on its own record.
+                if marked.commit in state.legacy_adopted or any(
                     (marked.commit, operation) in recorded
                     for operation in marked.operations
                 ):
@@ -910,6 +918,8 @@ class Coordinator:
             state.observe_position(target, expected_head, commit)
             state.landed_operations.setdefault(operation, event)
             state.landed.append(event)
+            if event.legacy:
+                state.legacy_adopted.add(commit)
         elif event.kind == "landed":
             operation = _string(data, "operation", event)
             intent = state.pending.get(operation)
@@ -2064,7 +2074,7 @@ class Coordinator:
                 continue
             operations = requests.setdefault(named, set())
             recorded_operation = event.data.get("operation")
-            if event.kind == "adopted" and isinstance(recorded_operation, str):
+            if event.kind == "adopted" and not event.legacy and isinstance(recorded_operation, str):
                 operations.add(recorded_operation)
         evidence = self.repo.landed_evidence(requests, reference=WAL_REF)
         for event in state.landed:
@@ -2100,7 +2110,19 @@ class Coordinator:
             )
             if actual_tree != expected_tree:
                 raise WalCorruptError("landed commit tree differs from WAL", oid=event.oid)
-            if event.kind == "adopted":
+            if event.kind == "adopted" and event.legacy:
+                # A v=1 record is verified under the writer that made it: the
+                # commit's trailer block, parsed and comma-joined as 9d2ef3b did,
+                # must equal the stored scalar exactly. The scalar is never split.
+                operation = _string(event.data, "operation", event)
+                if self.repo.legacy_landing_operation(commit) != operation:
+                    raise WalCorruptError(
+                        "legacy adopted commit does not carry the recorded landing trailer "
+                        "under the historical writer's semantics",
+                        oid=event.oid,
+                        commit=commit,
+                    )
+            elif event.kind == "adopted":
                 operation = _string(event.data, "operation", event)
                 carried = (
                     self.repo.commit_has_landing_operation(commit, operation)
@@ -2308,6 +2330,10 @@ class Coordinator:
         for _ in range(MAX_CAS_RETRIES):
             snapshot = self.wal.read()
             state = self._fold(snapshot)
+            # Every recorded landing is verified before the audit may rely on
+            # it; a legacy record in particular counts only once its commit is
+            # shown to carry it.
+            self._verify_landed(state)
             heads = self._audit_heads(state, target_ref)
             targets = self._audit_target_names(heads)
             self._refuse_legacy_grafts(targets)

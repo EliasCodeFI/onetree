@@ -265,8 +265,15 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
     assert Wal._validate_document(dict(protected), oid="fixture") == protected
     assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
 
+    # ``adopted`` v=1 is the one recognised historical version (task 70): readable
+    # as a legacy record, never writable by the current writer.
+    assert Wal._validate_document({**adopted, "v": 1}, oid="fixture") == {**adopted, "v": 1}
     with pytest.raises(WalCorruptError, match="does not match its kind"):
-        Wal._validate_document({**adopted, "v": 1}, oid="fixture")
+        Wal._validate_document({**adopted, "v": 1}, oid="fixture", writing=True)
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**adopted, "v": 3}, oid="fixture")
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**collected, "v": 2}, oid="fixture")
     with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
         Wal._validate_document({**collected, "v": 5}, oid="fixture")
     with pytest.raises(WalCorruptError, match="does not match its kind"):

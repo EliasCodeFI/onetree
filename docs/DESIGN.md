@@ -92,6 +92,20 @@ document whose `v` disagrees with its kind is refused: understating the
 version is how a newer kind would otherwise reach a reader that refuses the
 version but not the kind. `adopted` is the first kind above version 1.
 
+One historical exception is read, never written. The pre-release writer at
+`9d2ef3b` recorded `adopted` at version 1 with a scalar `operation` that
+comma-joined every landing trailer value of the adopted commit, and a value
+containing a literal comma persists identically. A reader accepts `adopted`
+at exactly version 1 as a historical record, verifies it against the commit
+it names under that writer's own trailer semantics (the stored scalar must
+equal the historical parse exactly; it is never split), keeps the parent and
+tree checks, and treats the verified commit as recorded by commit so the
+branch audit neither reports it nor adopts it again. The current writer still
+writes `adopted` at version 2 and refuses to append a version-1 document;
+every other version/kind disagreement, every version above the reader's, and
+every malformed document are refused as above. No other kind has a historical
+version (task 70, `ROUND-LEGACY-ADOPTION.md`).
+
 Each event records an actor string. Session operations use their session id;
 explicit adoption records the literal `operator`. That adoption actor is a
 local marker, not an authenticated identity of the person or session that

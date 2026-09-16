@@ -47,6 +47,12 @@ _GIT_COMMON_OPTIONS = (
 #: detection can tell a broker commit apart from a permitted hand commit.
 LANDING_TRAILER = "Onetree-Operation"
 _LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
+# The 9d2ef3b writer's trailer-block subset, kept verbatim so a legacy adopted
+# record (task 70) is verified under exactly the semantics that wrote it.
+# These feed ``_legacy_landing_operation`` only, never the audit parser.
+_LEGACY_TRAILER_LINE = re.compile(rb"(?P<key>[A-Za-z0-9-]+)[ \t]*:[ \t]*(?P<value>.*)")
+_LEGACY_GENERATED_TRAILER_PREFIXES = (b"Signed-off-by: ", b"(cherry picked from commit ")
+_LEGACY_FIXED_COMMENT_PREFIX = b"#"
 _LANDING_TRAILER_WHITESPACE = b" \t"
 _BROKEN_AUDIT_REF_WARNING = b"warning: ignoring broken ref "
 _TEMP_INDEX_PREFIX = "index-"
@@ -443,6 +449,90 @@ def _reduce_landing_ids(
                     smallest_not_pending = family_not_pending
     witness = smallest_not_pending if smallest_not_pending is not None else smallest
     return frozenset() if witness is None else frozenset({witness})
+
+
+def _legacy_landing_operation(raw_message: bytes, *, commit: str) -> str | None:
+    """The scalar the 9d2ef3b writer recorded for this message, or None if it recorded nothing.
+
+    Verbatim port of that writer's ``_landing_operation_from_message``: Git's
+    all-trailer rule, its 25% generated-trailer rule, its two built-in generated
+    prefixes, ``#`` comments, the ``---`` divider, folded continuation lines, and
+    every ``Onetree-Operation`` value of the final block joined with commas. It
+    exists to verify a stored ``adopted`` v=1 record against its commit and is not
+    an identity parser: a comma in the result may be a join or a literal, and the
+    audit that detects unrecorded landings never consults it.
+    """
+
+    lines = [
+        line[:-1] if line.endswith(b"\r") else line
+        for line in raw_message.split(b"\n")
+    ]
+    for index, line in enumerate(lines):
+        if line.startswith(b"---") and (
+            len(line) == 3 or (len(line) > 3 and line[3] in b" \t\v\f\r")
+        ):
+            lines = lines[:index]
+            break
+    while lines and not lines[-1].strip(b" \t"):
+        lines.pop()
+    if not lines:
+        return None
+
+    block_start: int | None = None
+    for index in range(len(lines) - 1, -1, -1):
+        if not lines[index].strip(b" \t"):
+            block_start = index + 1
+            break
+    if block_start is None:
+        return None
+
+    parsed: list[tuple[bytes, bytes]] = []
+    trailer_lines = 0
+    non_trailer_lines = 0
+    recognized_prefix = False
+    previous_kind: str | None = None
+    for line in lines[block_start:]:
+        if line.startswith(_LEGACY_FIXED_COMMENT_PREFIX):
+            previous_kind = None
+            continue
+        if line.startswith((b" ", b"\t")):
+            if previous_kind == "trailer" and parsed:
+                key, value = parsed[-1]
+                parsed[-1] = (key, value + b" " + line.strip(b" \t"))
+            elif previous_kind not in {"trailer", "generated"}:
+                non_trailer_lines += 1
+            continue
+        if line.startswith(_LEGACY_GENERATED_TRAILER_PREFIXES):
+            trailer_lines += 1
+            recognized_prefix = True
+            previous_kind = "generated"
+            continue
+        match = _LEGACY_TRAILER_LINE.fullmatch(line)
+        if match is None:
+            non_trailer_lines += 1
+            previous_kind = "non_trailer"
+            continue
+        trailer_lines += 1
+        parsed.append((match.group("key"), match.group("value")))
+        previous_kind = "trailer"
+
+    all_trailers = trailer_lines > 0 and non_trailer_lines == 0
+    generated_quorum = recognized_prefix and trailer_lines * 3 >= non_trailer_lines
+    if not all_trailers and not generated_quorum:
+        return None
+
+    values = [
+        value.strip(b" \t")
+        for key, value in parsed
+        if key.lower() == _LANDING_TRAILER_BYTES
+    ]
+    if not values:
+        return None
+    try:
+        operation = b",".join(values).decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise GitError("landing trailer is not UTF-8", commit=commit) from error
+    return operation or None
 
 
 def _audit_landing_ids(
@@ -2317,3 +2407,10 @@ class Repository:
         return self.commit_object_has_landing_operation(
             raw_object, commit=commit, operation=operation
         )
+
+    def legacy_landing_operation(self, commit: str) -> str | None:
+        """Read one commit the way the 9d2ef3b writer did, for legacy record verification only."""
+
+        raw_object = self.git("cat-file", "commit", commit).stdout
+        raw_message = self._commit_message(raw_object, commit=commit)
+        return _legacy_landing_operation(raw_message, commit=commit)

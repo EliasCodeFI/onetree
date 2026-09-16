@@ -37,6 +37,12 @@ _KIND_VERSIONS = {
 }
 WAL_READER_VERSION = max(_KIND_VERSIONS.values())
 EVENT_KINDS = frozenset(_KIND_VERSIONS)
+# Historical versions a reader still accepts for a kind, on read only. The
+# 9d2ef3b writer released ``adopted`` at v=1 with a scalar ``operation`` that
+# comma-joined every landing trailer value of the adopted commit (task 70).
+# Such a record is verified under that writer's semantics by the coordinator
+# and is never written again: the current writer refuses it.
+_LEGACY_KIND_VERSIONS: dict[str, frozenset[int]] = {"adopted": frozenset({1})}
 _DOCUMENT_KEYS = frozenset({"v", "event", "event_id", "actor", "time", "data"})
 
 
@@ -59,6 +65,15 @@ class EventRecord:
     @property
     def event_id(self) -> str:
         return str(self.document["event_id"])
+
+    @property
+    def version(self) -> int:
+        return int(self.document["v"])
+
+    @property
+    def legacy(self) -> bool:
+        """Recorded at a historical version of its kind, verified under that version's semantics."""
+        return self.version != _KIND_VERSIONS[self.kind]
 
     @property
     def data(self) -> Mapping[str, Any]:
@@ -111,7 +126,7 @@ class Wal:
         }
 
     @staticmethod
-    def _validate_document(value: Any, *, oid: str) -> dict[str, Any]:
+    def _validate_document(value: Any, *, oid: str, writing: bool = False) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise WalCorruptError("WAL event document is not an object", oid=oid)
         if frozenset(value) != _DOCUMENT_KEYS:
@@ -127,7 +142,10 @@ class Wal:
         # A document may not understate the reader its kind needs: accepting a
         # downgraded ``v`` would let a writer smuggle a newer kind past a reader
         # that refuses the version but not the kind.
-        if version != _KIND_VERSIONS[kind]:
+        # A historical version of the kind is readable, never writable.
+        if version != _KIND_VERSIONS[kind] and (
+            writing or version not in _LEGACY_KIND_VERSIONS.get(kind, frozenset())
+        ):
             raise WalCorruptError("WAL event version does not match its kind", oid=oid, event=kind)
         actor = value.get("actor")
         if not isinstance(actor, str) or not actor:
@@ -226,7 +244,7 @@ class Wal:
         records: list[EventRecord] = []
         current = parent
         for raw_document in documents:
-            document = self._validate_document(dict(raw_document), oid="uncommitted")
+            document = self._validate_document(dict(raw_document), oid="uncommitted", writing=True)
             encoded = (
                 json.dumps(
                     document,
