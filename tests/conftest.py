@@ -21,13 +21,19 @@ from onetree import referee
 
 
 @pytest.fixture(autouse=True)
-def collect_referee_supervisor() -> Iterator[None]:
-    """Measure the isolated supervisor without widening production child environments.
+def collect_isolated_interpreters() -> Iterator[None]:
+    """Measure test-launched OneTree interpreters without widening production child environments.
 
-    Coverage's subprocess collector needs its configuration passed explicitly.
-    Its package-name filter also misses a package file executed as a script,
-    so include the same source directory. Only the installed supervisor receives
-    this test instrumentation; referee commands keep their production environment.
+    Coverage's subprocess collector needs its configuration passed explicitly, and
+    its package-name filter misses a package file that runs under another module
+    name: the supervisor executes as a script, and a spawned demo worker re-executes
+    demo.py as ``__mp_main__``. Both receive the same source directory. Only the
+    installed supervisor and the demo controller launched by the tests receive this
+    test instrumentation; the controller's workers inherit it, while referee and
+    gate commands keep their production environment. The demo controller terminates
+    any worker still running when it stops, so the configuration it receives also
+    saves on SIGTERM. A worker terminated while its data is being written can still
+    lose that execution; only workers that exit on their own are complete evidence.
     """
     config = os.environ.get("COVERAGE_PROCESS_CONFIG")
     if config is None:
@@ -35,15 +41,16 @@ def collect_referee_supervisor() -> Iterator[None]:
         return
     decoded = Coverage(config_file=f":data:{config}").config
     decoded.source_dirs = [*decoded.source_dirs, str(Path(referee.__file__).parent)]
-    config = decoded.serialize()
     supervisor = str(Path(referee.__file__).with_name("_referee_supervisor.py"))
+    instrumented = {(sys.executable, "-I", supervisor): decoded.serialize()}
+    decoded.sigterm = True
+    instrumented[(sys.executable, "-m", "onetree.demo")] = decoded.serialize()
     original = subprocess.Popen
 
     def measured(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
         arguments = args[0] if args else kwargs.get("args", ())
-        if isinstance(arguments, (list, tuple)) and tuple(arguments[:3]) == (
-            sys.executable, "-I", supervisor,
-        ):
+        if isinstance(arguments, (list, tuple)) and tuple(arguments[:3]) in instrumented:
+            config = instrumented[tuple(arguments[:3])]
             kwargs["env"] = {**kwargs["env"], "COVERAGE_PROCESS_CONFIG": config}
         return original(*args, **kwargs)
 
