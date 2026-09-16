@@ -1667,14 +1667,14 @@ class Repository:
         return header
 
     def commit_object_parents(self, raw_object: bytes, *, commit: str) -> tuple[str, ...]:
-        """The parents a raw commit object names in its header, in order."""
+        """Canonical parent IDs from Git-admitted hexadecimal, preserving header order."""
 
         parents: list[str] = []
         for line in self._commit_header(raw_object, commit=commit).splitlines():
             if not line.startswith(b"parent "):
                 continue
             try:
-                parent = line.removeprefix(b"parent ").decode("ascii", errors="strict")
+                parent = line.removeprefix(b"parent ").decode("ascii", errors="strict").lower()
             except UnicodeDecodeError as error:
                 raise GitError("commit parent is not ASCII", commit=commit) from error
             parents.append(self.validate_oid(parent, label="commit parent"))
@@ -1686,8 +1686,7 @@ class Repository:
         Git admits an uppercase hexadecimal tree ID in a commit it writes with
         ``hash-object`` and passes ``fsck --strict``, and ``show --format=%T``
         reports it lowercase. The value is normalized the same way here so a
-        Git-admitted commit keeps its admission; the parent lines are not, so a
-        commit that ``commit_parents`` refused stays refused.
+        Git-admitted tree ID keeps its admission.
         """
 
         first = self._commit_header(raw_object, commit=commit).split(b"\n", 1)[0]
