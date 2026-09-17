@@ -220,9 +220,14 @@ def tree_bytes(path: Path) -> int:
     if not path.exists():
         return 0
     total = 0
+    seen: set[tuple[int, int]] = set()
     for current, directories, files in os.walk(path):
         for name in (*directories, *files):
-            total += os.lstat(os.path.join(current, name)).st_blocks * 512
+            entry_stat = os.lstat(os.path.join(current, name))
+            identity = (entry_stat.st_dev, entry_stat.st_ino)
+            if identity not in seen:
+                seen.add(identity)
+                total += entry_stat.st_blocks * 512
     return total
 
 
