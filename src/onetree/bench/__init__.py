@@ -21,10 +21,18 @@ referee is not the repository's test suite.
 
 from __future__ import annotations
 
-SCHEMA = "onetree-bench-v2"
-"""Raw-data and receipt schema. Bump when an event field or metric definition changes."""
+SCHEMA = "onetree-bench-v4"
+"""Raw-data and receipt schema every new run writes. Bump when an event field or metric
+definition changes."""
+
+SCHEMA_V2 = "onetree-bench-v2"
+"""The schema of receipts written before v3. They keep the manifest and scoring interpretation
+they were produced under; no v3 evidence or rule applies to them."""
+
+SCHEMA_V3 = "onetree-bench-v3"
+"""Unpublished predecessor receipts require their seed derivation to disambiguate format."""
 
 SYSTEMS = ("onetree", "worktree", "naive")
 """The three systems, in the order the protocol lists them."""
 
-__all__ = ["SCHEMA", "SYSTEMS"]
+__all__ = ["SCHEMA", "SCHEMA_V2", "SCHEMA_V3", "SYSTEMS"]

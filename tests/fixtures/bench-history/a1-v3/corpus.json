@@ -1,0 +1,40 @@
+{
+  "files": [
+    "corpus/f000.txt",
+    "corpus/f001.txt"
+  ],
+  "hot": [
+    "corpus/f000.txt",
+    "corpus/f001.txt"
+  ],
+  "private": {
+    "0": [],
+    "1": []
+  },
+  "tasks": {
+    "0": [
+      {
+        "index": 0,
+        "paths": [
+          "corpus/f000.txt"
+        ],
+        "think_ms": 0,
+        "tokens": [
+          "5a8c67bb65b6"
+        ]
+      }
+    ],
+    "1": [
+      {
+        "index": 0,
+        "paths": [
+          "corpus/f001.txt"
+        ],
+        "think_ms": 0,
+        "tokens": [
+          "7000f236102c"
+        ]
+      }
+    ]
+  }
+}

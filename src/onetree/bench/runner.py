@@ -2,8 +2,9 @@
 
 The output directory must not exist; nothing is written anywhere else. Per system the run
 creates a fresh repository, performs the layer's setup, releases every writer process at once,
-waits for them within the deadline, then records the harness referee verdicts, the target
-branch's final tree and the layer's disk, and merges the per-process logs. ``metrics.json``
+waits for them within the deadline, then reads back every checkout and index the writers used,
+records the harness referee verdicts, the target branch's final tree and the layer's disk, and
+merges the per-process logs. ``metrics.json``
 is computed from the merged logs only, and ``MANIFEST.sha256`` and ``FREEZE.json`` are
 written last, over everything except the repositories and scratch space.
 
@@ -29,7 +30,7 @@ from onetree.bench import corpus as corpus_module
 from onetree.bench import events as events_module
 from onetree.bench import metrics as metrics_module
 from onetree.bench.corpus import Corpus, Grid, Task
-from onetree.bench.seeds import DERIVATION, SeedKey
+from onetree.bench.seeds import DERIVATION
 
 
 @dataclass(frozen=True)
@@ -202,16 +203,27 @@ def conclude(
     referee_script: Path,
     referee_timeout: float,
 ) -> list[dict[str, Any]]:
-    """Harness referee for systems without one, the final tree, the disk sample, the merge."""
+    """Run-end read-backs, harness referee for systems without one, the final tree, the disk
+    sample, the merge."""
 
     parts = out / "events" / "parts"
+    writer_events = [
+        event
+        for part in sorted(parts.glob(f"{arm.system}-w*.jsonl"))
+        for event in events_module.read(part)
+    ]
+    written = [event for event in writer_events if event["kind"] == "write"]
+    sessions = sorted({str(event["index"]) for event in written}) if arm.system == "onetree" else []
+    unrecorded = systems.observe_run_end(
+        arm,
+        sorted(corpus.tasks),
+        corpus.files,
+        sessions,
+        harness,
+        {str(event["commit"]) for event in writer_events if event["kind"] == "commit"},
+    )
     if arm.system != "onetree":
-        landed = [
-            event
-            for part in sorted(parts.glob(f"{arm.system}-w*.jsonl"))
-            for event in events_module.read(part)
-            if event["kind"] == "landed"
-        ]
+        landed = [event for event in writer_events if event["kind"] == "landed"]
         scratch = out / "tmp" / arm.system
         scratch.mkdir(parents=True, exist_ok=True)
         for event in sorted(landed, key=lambda item: (float(item["t"]), str(item["commit"]))):
@@ -232,6 +244,7 @@ def conclude(
         head=systems.git_text(arm.checkout, "rev-parse", systems.TARGET),
         disk_bytes=sum(disk.values()),
         disk_detail=disk,
+        unrecorded_commits=unrecorded,
     )
     return events_module.merge(
         sorted(parts.glob(f"{arm.system}-*.jsonl")), out / "events" / f"{arm.system}.jsonl"
@@ -246,7 +259,7 @@ def run(out: Path, settings: Settings) -> dict[str, Any]:
     harness_dir.mkdir()
     referee_script = harness_dir / "referee_check.py"
     referee_script.write_text(systems.REFEREE_SOURCE, encoding="utf-8")
-    corpus = corpus_module.build(settings.grid, SeedKey(settings.seed))
+    corpus = corpus_module.build(settings.grid, settings.seed)
     receipts.write_json(out / "corpus.json", corpus.payload())
     inputs = _inputs(settings, referee_script)
     receipts.write_json(out / "run.json", inputs)

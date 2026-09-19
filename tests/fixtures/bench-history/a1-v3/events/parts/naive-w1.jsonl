@@ -1,0 +1,2 @@
+{"attempt": 1, "content_sha256": "76e2fd0eb1f4b0d43e209d30762e4b0f6bca434d946ffa7300efe385e0a206c2", "kind": "write", "path": "corpus/f001.txt", "system": "naive", "t": 2.0, "task": 0, "token": "7000f236102c", "write_id": "w1-t0-a1-p0", "writer": 1}
+{"attempt": 1, "commit": "c1", "green": null, "kind": "landed", "payload": [{"blob": "b", "content_sha256": "76e2fd0eb1f4b0d43e209d30762e4b0f6bca434d946ffa7300efe385e0a206c2", "path": "corpus/f001.txt", "tokens": ["7000f236102c"]}], "system": "naive", "t": 6.0, "task": 0, "write_ids": ["w1-t0-a1-p0"], "writer": 1}

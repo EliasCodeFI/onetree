@@ -20,7 +20,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from onetree.bench.seeds import SeedKey
+from onetree.bench.seeds import TaskDraws
 
 HEADER = "onetree-bench corpus file\n"
 TOKEN_PATTERN = re.compile(r"^tok:w(\d+):t(\d+):([0-9a-f]{12})$")
@@ -45,6 +45,8 @@ class Grid:
             raise ValueError("conflict must be within [0, 1]")
         if self.jitter_ms < 0:
             raise ValueError("jitter_ms must be non-negative")
+        if max(self.writers, self.tasks, self.files, self.jitter_ms) >= 1 << 32:
+            raise ValueError("writers, tasks, files and jitter_ms must be below 2**32")
         if self.paths_per_task > self.files:
             raise ValueError("paths_per_task cannot exceed files")
 
@@ -133,8 +135,8 @@ def file_name(index: int) -> str:
     return f"corpus/f{index:03d}.txt"
 
 
-def build(grid: Grid, key: SeedKey) -> Corpus:
-    """Generate the corpus for ``grid`` under ``key``; identical inputs give identical output.
+def build(grid: Grid, seed: int) -> Corpus:
+    """Generate the corpus for ``grid`` under ``seed``; identical inputs give identical output.
 
     Pools: the hot pool takes ``ceil(files * conflict)`` files (at least one when conflict
     is positive); the rest is split round-robin into per-writer private pools. A writer whose
@@ -152,21 +154,20 @@ def build(grid: Grid, key: SeedKey) -> Corpus:
     }
     tasks: dict[int, tuple[Task, ...]] = {}
     for writer in range(grid.writers):
-        writer_key = key.spawn("writer", str(writer))
         generated: list[Task] = []
         for index in range(grid.tasks):
-            rng = writer_key.spawn("task", str(index)).rng()
+            draws = TaskDraws(seed, writer, index)
             chosen: list[str] = []
             pool_private = private[writer]
             while len(chosen) < grid.paths_per_task:
-                use_hot = bool(hot) and (not pool_private or rng.random() < grid.conflict)
+                use_hot = bool(hot) and (not pool_private or draws.hot(len(chosen), grid.conflict))
                 pool = hot if use_hot else pool_private
                 candidates = [path for path in pool if path not in chosen]
                 if not candidates:
                     candidates = [path for path in files if path not in chosen]
-                chosen.append(rng.choice(candidates))
-            tokens = tuple(f"{rng.getrandbits(48):012x}" for _ in chosen)
-            think = rng.randint(0, grid.jitter_ms) if grid.jitter_ms else 0
+                chosen.append(draws.choice(candidates))
+            tokens = tuple(draws.token(slot) for slot in range(len(chosen)))
+            think = draws.think_ms(grid.jitter_ms)
             generated.append(Task(writer, index, tuple(chosen), tokens, think))
         tasks[writer] = tuple(generated)
     return Corpus(files=files, hot=hot, private=private, tasks=tasks)

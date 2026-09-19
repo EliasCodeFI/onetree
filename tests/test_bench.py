@@ -14,23 +14,36 @@ import hashlib
 import json
 import os
 import random
+import stat
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from onetree.bench import SCHEMA, SYSTEMS, metrics, receipts, runner, systems
+from onetree.bench import (
+    SCHEMA,
+    SCHEMA_V2,
+    SYSTEMS,
+    legacy_corpus,
+    metrics,
+    receipts,
+    runner,
+    systems,
+)
 from onetree.bench import __main__ as cli
 from onetree.bench import corpus as corpus_module
 from onetree.bench import events as events_module
 from onetree.bench.corpus import Grid, Task
-from onetree.bench.seeds import DERIVATION, SeedKey
+from onetree.bench.legacy_seeds import DERIVATION as LEGACY_DERIVATION
+from onetree.bench.legacy_seeds import SeedKey
+from onetree.bench.seeds import DERIVATION
 from onetree.core import Coordinator
 
 HOT = "corpus/f000.txt"
@@ -121,9 +134,9 @@ def test_seed_keys_refuse_ambiguous_paths(seed: int, path: tuple[str, ...], mess
 
 def test_corpus_is_fixed_by_seed_and_grid() -> None:
     grid = Grid(writers=2, tasks=2, files=3, conflict=0.5, jitter_ms=10)
-    corpus = corpus_module.build(grid, SeedKey(7))
-    assert corpus.payload() == corpus_module.build(grid, SeedKey(7)).payload()
-    assert corpus.payload() != corpus_module.build(grid, SeedKey(8)).payload()
+    corpus = legacy_corpus.build(grid, SeedKey(7))
+    assert corpus.payload() == legacy_corpus.build(grid, SeedKey(7)).payload()
+    assert corpus.payload() != legacy_corpus.build(grid, SeedKey(8)).payload()
     assert corpus.hot == ("corpus/f000.txt", "corpus/f001.txt")
     assert corpus.tasks[0][0].tokens == ("6e61ea99f3ed",)
     assert corpus.all_tokens()["7307d3955e06"] == (1, 0, "corpus/f001.txt")
@@ -132,17 +145,17 @@ def test_corpus_is_fixed_by_seed_and_grid() -> None:
 
 
 def test_conflict_extremes_partition_the_paths() -> None:
-    disjoint = corpus_module.build(Grid(writers=3, tasks=20, files=9, conflict=0.0), SeedKey(1))
+    disjoint = corpus_module.build(Grid(writers=3, tasks=20, files=9, conflict=0.0), 1)
     pools = [set(disjoint.private[writer]) for writer in range(3)]
     assert disjoint.hot == ()
     assert all(pools[a].isdisjoint(pools[b]) for a in range(3) for b in range(a + 1, 3))
     for writer, tasks in disjoint.tasks.items():
         assert corpus_module.paths_of(tasks) <= pools[writer]
-    shared = corpus_module.build(Grid(writers=3, tasks=20, files=9, conflict=1.0), SeedKey(1))
+    shared = corpus_module.build(Grid(writers=3, tasks=20, files=9, conflict=1.0), 1)
     assert set(shared.hot) == set(shared.files)
     assert all(corpus_module.paths_of(tasks) <= set(shared.hot) for tasks in shared.tasks.values())
     crowded = corpus_module.build(
-        Grid(writers=3, tasks=5, files=3, conflict=0.0, paths_per_task=2), SeedKey(1)
+        Grid(writers=3, tasks=5, files=3, conflict=0.0, paths_per_task=2), 1
     )
     assert all(len(set(task.paths)) == 2 for tasks in crowded.tasks.values() for task in tasks)
 
@@ -368,11 +381,15 @@ def _synthetic_run(
     shift: float = 0.0,
     setup_seconds: float = 0.0,
     lose: bool = False,
+    schema: str = SCHEMA_V2,
 ) -> Path:
     """A small run shaped exactly as ``runner.run`` writes one, with scripted events."""
 
+    v3 = schema == SCHEMA
     grid = Grid(writers=2, tasks=1, files=2, conflict=1.0, jitter_ms=0)
-    corpus = corpus_module.build(grid, SeedKey(seed))
+    corpus = (
+        corpus_module.build(grid, seed) if v3 else legacy_corpus.build(grid, SeedKey(seed))
+    )
     root.mkdir()
     referee = root / "harness" / "referee_check.py"
     referee.parent.mkdir()
@@ -381,10 +398,13 @@ def _synthetic_run(
     parts = root / "events" / "parts"
     harness = events_module.EventWriter(parts / f"{system}-harness.jsonl", system, None)
     harness.emit("setup", t=0.0, duration_s=setup_seconds, disk_bytes=0, disk_detail={}, detail={})
+    held: dict[tuple[str, str], list[str]] = {}
     for writer, tasks in corpus.tasks.items():
         log = events_module.EventWriter(parts / f"{system}-w{writer}.jsonl", system, writer)
         task = tasks[0]
         path = task.paths[0]
+        checkout = systems.checkout_label(system, writer)
+        held.setdefault((checkout, path), []).append(task.token(path))
         content = corpus_module.rewrite(corpus_module.HEADER, task, path)
         write_id = f"w{writer}-t0-a1-p0"
         log.emit(
@@ -396,12 +416,29 @@ def _synthetic_run(
             path=path,
             token=task.token(path),
             content_sha256=_sha(content),
+            **(
+                {"checkout": checkout, "index": systems.index_label(system, task, 1)}
+                if v3
+                else {}
+            ),
         )
         if lose and writer == 1:
             log.emit(
                 "error", t=5.0 + writer + shift, task=0, attempt=1, write_ids=[write_id], detail="x"
             )
             continue
+        payload = [_entry(path, content, [task.token(path)])]
+        if v3:
+            log.emit(
+                "commit",
+                t=5.0 + writer + shift,
+                task=0,
+                attempt=1,
+                write_ids=[write_id],
+                commit=f"c{writer}",
+                scope="target",
+                payload=payload,
+            )
         log.emit(
             "landed",
             t=5.0 + writer + shift,
@@ -410,23 +447,52 @@ def _synthetic_run(
             write_ids=[write_id],
             commit=f"c{writer}",
             green=None,
-            payload=[_entry(path, content, [task.token(path)])],
+            payload=payload,
         )
     harness.emit("run", t=9.0 + shift, started=0.5, ended=9.0 + shift, complete=True, exitcodes=[0])
+    for writer in (sorted(corpus.tasks) if system == "worktree" else [None]) if v3 else []:
+        checkout = systems.checkout_label(system, writer)
+        index = None if system == "onetree" else checkout
+        harness.emit(
+            "observed",
+            t=9.5 + shift,
+            checkout=checkout,
+            index=index,
+            after="run_end",
+            paths={
+                name: {"file": held.get((checkout, name), []), **({"index": []} if index else {})}
+                for name in corpus.files
+            },
+        )
+    for tasks in corpus.tasks.values() if v3 and system == "onetree" else []:
+        harness.emit(
+            "observed",
+            t=9.5 + shift,
+            checkout=None,
+            index=systems.index_label(system, tasks[0], 1),
+            after="run_end",
+            paths={name: {"index": []} for name in corpus.files},
+        )
     harness.emit(
-        "final", t=10.0 + shift, tokens_by_path={}, head="c1", disk_bytes=0, disk_detail={}
+        "final",
+        t=10.0 + shift,
+        tokens_by_path={},
+        head="c1",
+        disk_bytes=0,
+        disk_detail={},
+        **({"unrecorded_commits": []} if v3 else {}),
     )
     merged = events_module.merge(
         sorted(parts.glob(f"{system}-*.jsonl")), root / "events" / f"{system}.jsonl"
     )
-    computed = {system: metrics.compute(merged)}
+    computed = {system: (metrics.compute if v3 else metrics.compute_v2)(merged)}
     receipts.write_json(root / "metrics.json", computed)
     inputs = {
-        "schema": SCHEMA,
+        "schema": schema,
         "seed": seed,
         "grid": grid.payload(),
         "systems": [system],
-        "seed_derivation": DERIVATION,
+        "seed_derivation": DERIVATION if v3 else LEGACY_DERIVATION,
         "clock": events_module.CLOCK,
         "gate": {
             "path": None,
@@ -438,8 +504,25 @@ def _synthetic_run(
         "not_a_result": receipts.NOT_A_RESULT,
     }
     receipts.write_json(root / "run.json", inputs)
-    receipts.freeze(root, receipts.freeze_fields(inputs, computed, True))
+    _freeze(root, receipts.freeze_fields(inputs, computed, True), schema)
     return root
+
+
+def _freeze(run: Path, fields: dict[str, Any], schema: str) -> None:
+    if schema == SCHEMA:
+        receipts.freeze(run, fields)
+        return
+    text = receipts.manifest_text(receipts.manifest_entries(run, schema))
+    (run / receipts.MANIFEST).write_text(text, encoding="utf-8")
+    record = {
+        "schema": schema,
+        "frozen_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "file_count": text.count("\n"),
+        "manifest_sha256": receipts.digest_text(text),
+        "excluded_dirs": list(receipts.EXCLUDED_DIRS),
+        **fields,
+    }
+    receipts.write_json(run / receipts.FREEZE, record)
 
 
 def _edit_json(path: Path, change: Callable[[dict[str, Any]], object]) -> None:
@@ -452,8 +535,10 @@ def _refreeze(run: Path) -> None:
     """Re-freeze the files as they now are, keeping every claim FREEZE.json already makes."""
 
     record = receipts.read_json(run / receipts.FREEZE)
-    receipts.freeze(
-        run, {key: value for key, value in record.items() if key not in _MANIFEST_FIELDS}
+    _freeze(
+        run,
+        {key: value for key, value in record.items() if key not in _MANIFEST_FIELDS},
+        record["schema"],
     )
 
 
@@ -462,11 +547,12 @@ def _rederive(run: Path, system: str = "naive") -> None:
 
     parts = sorted((run / "events" / "parts").glob(f"{system}-*.jsonl"))
     merged = events_module.merge(parts, run / "events" / f"{system}.jsonl")
-    computed = {system: metrics.compute(merged)}
-    receipts.write_json(run / "metrics.json", computed)
     inputs = receipts.read_json(run / "run.json")
+    compute = metrics.compute if inputs["schema"] == SCHEMA else metrics.compute_v2
+    computed = {system: compute(merged)}
+    receipts.write_json(run / "metrics.json", computed)
     complete = bool(receipts.read_json(run / receipts.FREEZE)["complete"])
-    receipts.freeze(run, receipts.freeze_fields(inputs, computed, complete))
+    _freeze(run, receipts.freeze_fields(inputs, computed, complete), inputs["schema"])
 
 
 def _rewrite_events(part: Path, change: Callable[[dict[str, Any]], object]) -> None:
@@ -499,6 +585,56 @@ def test_a_refrozen_metric_forgery_is_still_void(tmp_path: Path) -> None:
     assert _voids(run) == ["manifest_sha256", "file", "metrics"]
     _refreeze(run)
     assert _voids(run) == ["metrics"]
+
+
+@pytest.mark.parametrize("valid", [True, False])
+@pytest.mark.parametrize("operation", ["verify", "compare"])
+@pytest.mark.parametrize("scratch_shape", ["existing", "missing", "read_only", "file", "symlink"])
+def test_verify_preserves_input_files_and_directory_mtimes(
+    tmp_path: Path, valid: bool, operation: str, scratch_shape: str
+) -> None:
+    run = _synthetic_run(tmp_path / "run")
+    scratch = run / "tmp"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside scratch evidence\n", encoding="utf-8")
+    if scratch_shape == "existing":
+        scratch.mkdir()
+        (scratch / "naive.recomputed.jsonl").write_text(
+            "retained scratch evidence\n", encoding="utf-8"
+        )
+    elif scratch_shape == "file":
+        scratch.write_text("retained scratch file\n", encoding="utf-8")
+    elif scratch_shape == "symlink":
+        scratch.mkdir()
+        (scratch / "naive.recomputed.jsonl").symlink_to(outside)
+    if not valid:
+        _edit_json(run / "metrics.json", lambda m: m["naive"]["lost_work"].update(lost=999))
+
+    def snapshot() -> dict[Path, tuple[int, int, bytes | None, str | None]]:
+        entries = {}
+        for path in (run, *run.rglob("*"), outside):
+            info = path.lstat()
+            entries[path] = (
+                info.st_mode,
+                info.st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+                os.readlink(path) if path.is_symlink() else None,
+            )
+        return entries
+
+    mode = stat.S_IMODE(run.stat().st_mode)
+    try:
+        if scratch_shape == "read_only":
+            run.chmod(0o555)
+            if os.access(run, os.W_OK):
+                pytest.skip("requires enforced directory write permissions")
+        before = snapshot()
+        result = receipts.verify(run) if operation == "verify" else receipts.compare(run, run)
+        assert result["ok"] is valid
+        assert snapshot() == before
+    finally:
+        if scratch_shape == "read_only":
+            run.chmod(mode)
 
 
 def test_a_refrozen_corpus_forgery_is_still_void(tmp_path: Path) -> None:
@@ -586,7 +722,7 @@ def test_a_scope_forged_consistently_in_both_records_is_still_void(tmp_path: Pat
             "seed_derivation",
             "numpy SeedSequence",
             False,
-            [("inputs", "seed_derivation"), ("inputs", "seed_derivation")],
+            [("seed_derivation", None)],
         ),
         ("FREEZE.json", "complete", False, False, [("complete", None)]),
         ("FREEZE.json", "file_count", 999, False, [("file_count", None)]),
@@ -780,7 +916,7 @@ class Bench:
         self.referee = self.out / "harness" / "referee_check.py"
         self.referee.write_text(systems.REFEREE_SOURCE, encoding="utf-8")
         self.grid = Grid(writers=writers, tasks=tasks, files=files, conflict=conflict, jitter_ms=0)
-        self.corpus = corpus_module.build(self.grid, SeedKey(5))
+        self.corpus = corpus_module.build(self.grid, 5)
         self.settings = runner.Settings(
             seed=5,
             grid=self.grid,
@@ -808,6 +944,7 @@ class Bench:
         )
         script = self.referee if referee is None else referee
         merged = runner.conclude(self.out, arm, self.corpus, harness, script, 60.0)
+        assert receipts._outside_contract(merged) == []
         return metrics.compute(merged)
 
     def final_tokens(self, system: str) -> dict[str, list[str]]:
@@ -1018,7 +1155,9 @@ def test_worktree_conflict_is_refused_at_merge_and_leaves_the_target_clean(tmp_p
     assert systems.worktree_integrate(arm, second, 1, pending[1], logs[1]) == systems.RETRY
     assert systems.git(arm.checkout, "status", "--porcelain").stdout == b""
     result = bench.finish(arm, harness)
-    assert result["collision"]["collisions"] == 1
+    assert result["collision"]["collisions"] == 0
+    merged = events_module.read(bench.out / "events" / "worktree.jsonl")
+    assert metrics.compute_v2(merged)["collision"]["collisions"] == 1
     assert result["refusal"]["by_reason"] == {"merge_conflict": 1}
     assert result["lost_work"]["lost"] == 0
     assert (result["integrity"]["commits"], result["integrity"]["failed"]) == (1, 0)

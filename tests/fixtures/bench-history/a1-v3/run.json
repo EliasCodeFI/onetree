@@ -1,0 +1,27 @@
+{
+  "clock": "time.monotonic (CLOCK_MONOTONIC, system-wide)",
+  "gate": {
+    "admitted_pin_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "matches_admitted_pin": false,
+    "path": null,
+    "sha256": null
+  },
+  "grid": {
+    "amended": false,
+    "conflict": 1.0,
+    "files": 2,
+    "jitter_ms": 0,
+    "paths_per_task": 1,
+    "status": "PLACEHOLDER: not amended (task 25)",
+    "tasks": 1,
+    "writers": 2
+  },
+  "not_a_result": "hermetic validation leg; grid values are placeholders until task 25",
+  "referee_sha256": "905e1ca83028ba5d42e18593020977d60771c9a55ff8a5267fbee7585897b7e5",
+  "schema": "onetree-bench-v3",
+  "seed": 11,
+  "seed_derivation": "numpy 2.3.1 SeedSequence(entropy=seed, spawn_key=(writer, task, purpose)) uint32 words; purposes pool=0 path=1 token=2 think=3; the hot draw for path slot j is pool word j * d < n * 2**32 for conflict n/d; a draw of k outcomes is word % k for the first word below 2**32 - 2**32 % k, k = candidates for paths in slot order, jitter_ms + 1 for think, no think draw at 0; slot j's token is token word 2j | (token word 2j+1 & 0xffff) << 32 as 12 hex digits",
+  "systems": [
+    "naive"
+  ]
+}

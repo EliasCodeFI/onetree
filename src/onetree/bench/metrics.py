@@ -12,7 +12,29 @@ made here once and named so a reader disputes it against the frozen wording, not
   overlap. A write is uncommitted from its ``write`` event until the first ``landed``,
   ``refusal`` or ``error`` event of its writer that lists its ``write_id``; a write with no
   such outcome stays uncommitted until ``run.ended``. Counted per unordered pair of writes,
-  however the pair was resolved.
+  however the pair was resolved. Published SHA-derived v2 and unpublished SeedSequence
+  A1-v3 receipts keep this historical definition.
+- Collision under SHA-derived policy-v3 and combined SeedSequence v4, the same pair unit
+  (see ``docs/BENCH-RECEIPT-VERSIONS.md``): a write stops being uncommitted
+  when any Git commit the harness finds contains its token at its path, including a
+  worktree-local commit, a peer's commit and a commit a failed operation left behind
+  (decision b62102092057), or when a read-back of its checkout shows its bytes gone after an
+  overwrite, restore or reset (decision d680c759ca85). Its interval ends at the first of
+  these, so bytes that come back later belong to the write that brought them back. A write
+  the run-end read-back still holds stays uncommitted until ``run.ended``. A failure event or
+  a new attempt id ends nothing, so a prior attempt's token carried into a retry keeps its own
+  interval. Bytes still observed in any checkout or index have not disappeared, whatever became
+  of the session that staged them and whether or not that index can feed a later commit
+  (decision 972ef9ae9d34). Any means any: a copy seen in a checkout or index the write never
+  named keeps it present, and the interval ends only once every place observed to carry the
+  bytes is observed without them, so one unrelated empty place ends nothing. A place counts
+  from the moment it is observed holding the bytes, and which read that was carries no weight:
+  a place first seen holding them in the closing census is cleared by a later closing read
+  exactly as the write's own index would be, so the answer never turns on an identity.
+  Bytes first seen gone at the run-end read-back have no observed end,
+  and a commit first found by the run-end census has no observed inclusion. Each pair is scored
+  at both extremes of each unobserved instant; when its outcome differs, ``collisions`` is null
+  and ``undetermined`` names the cause and the pairs.
 - Refusal: one per ``refusal`` event, grouped by its machine-readable reason. Errors are
   reported beside refusals, never among them.
 - Landed-commit integrity: per landed commit, pass iff the set of payload paths equals the
@@ -37,7 +59,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, NamedTuple
 
 from onetree.bench.events import of_kind
 
@@ -132,6 +154,170 @@ def collisions(events: list[dict[str, Any]]) -> dict[str, Any]:
                         }
                     )
     return {"collisions": len(pairs), "pairs": pairs}
+
+
+class _Reading(NamedTuple):
+    late_end: bool
+    late_inclusion: bool
+
+
+_CAUSES = ("unobserved_end", "unobserved_inclusion")
+_READINGS = tuple(
+    _Reading(late_end, late_inclusion)
+    for late_end in (False, True)
+    for late_inclusion in (False, True)
+)
+_Slot = tuple[str, str]
+_Seen = tuple[float, int, bool, tuple[tuple[_Slot, bool | None], ...]]
+_Pair = tuple[str, str, str]
+_PARTS = ("checkout", "index")
+
+
+def _holds(tokens: object, token: str) -> bool:
+    return isinstance(tokens, list) and token in tokens
+
+
+def _presence(states: Iterable[bool | None]) -> bool | None:
+    observed = list(states)
+    if any(observed):
+        return True
+    if not observed or any(state is None for state in observed):
+        return None
+    return False
+
+
+def _end(
+    start: float,
+    included: list[float],
+    seen: list[_Seen],
+    run_end: float,
+    origin: dict[_Slot, bool | None],
+) -> tuple[float, float]:
+    committed = min(included, default=None)
+    state = dict(origin)
+    final: dict[_Slot, bool | None] = {}
+    tracked = set(origin)
+    closed = False
+    last_seen = start
+    for t, _, at_run_end, updates in seen:
+        if committed is not None and committed <= t:
+            return committed, committed
+        applied = [(slot, holds) for slot, holds in updates if slot in tracked or holds]
+        if not applied:
+            continue
+        tracked.update(slot for slot, _ in applied)
+        if at_run_end:
+            closed = True
+            final.update(applied)
+            continue
+        state.update(applied)
+        present = _presence(state.values())
+        if present is False:
+            return t, t
+        if present:
+            last_seen = t
+    if committed is not None:
+        return committed, committed
+    if closed and _presence(final.values()):
+        return run_end, run_end
+    return last_seen, run_end
+
+
+def _flipped(reading: _Reading, position: int) -> _Reading:
+    return _Reading(*(flag != (index == position) for index, flag in enumerate(reading)))
+
+
+def collisions_v3(events: list[dict[str, Any]]) -> dict[str, Any]:
+    bounds = _run_bounds(events)
+    run_end = bounds[1] if bounds else float("inf")
+    included: dict[tuple[str, str], list[float]] = {}
+    unobserved: set[tuple[str, str]] = set()
+    for event in of_kind(events, "commit"):
+        for entry in event["payload"]:
+            for token in entry["tokens"]:
+                held = (str(entry["path"]), str(token))
+                if event["scope"] == "run_end":
+                    unobserved.add(held)
+                else:
+                    included.setdefault(held, []).append(float(event["t"]))
+    readbacks: dict[str, list[tuple[int, dict[str, Any], dict[str, Any]]]] = {}
+    for number, event in enumerate(of_kind(events, "observed")):
+        for path, entry in event["paths"].items():
+            readbacks.setdefault(str(path), []).append((number, event, entry))
+    by_path: dict[str, list[tuple[dict[str, Any], dict[_Reading, float]]]] = {}
+    for write in _writes(events):
+        path, token, start = str(write["path"]), str(write["token"]), float(write["t"])
+        merged: dict[int, _Seen] = {}
+        for number, event, entry in readbacks.get(path, ()):
+            t = float(event["t"])
+            if t < start:
+                continue
+            updates: list[tuple[_Slot, bool | None]] = []
+            for part in _PARTS:
+                if event[part] is None:
+                    continue
+                if part == "checkout":
+                    holds = None if entry.get("unreadable") else _holds(entry["file"], token)
+                else:
+                    holds = _holds(entry["index"], token)
+                updates.append(((part, str(event[part])), holds))
+            merged[number] = (t, number, event["after"] == "run_end", tuple(updates))
+        seen = sorted(merged.values(), key=lambda item: (item[0], item[1]))
+        origin: dict[_Slot, bool | None] = {
+            ("checkout", str(write["checkout"])): True,
+            ("index", str(write["index"])): False,
+        }
+        commits = [t for t in included.get((path, token), ()) if t >= start]
+        extremes = _end(start, commits, seen, run_end, origin)
+        ends = {
+            reading: (
+                start
+                if (path, token) in unobserved and not reading.late_inclusion
+                else extremes[int(reading.late_end)]
+            )
+            for reading in _READINGS
+        }
+        by_path.setdefault(path, []).append((write, ends))
+    keys: list[_Pair] = []
+    records: dict[_Pair, dict[str, Any]] = {}
+    members: dict[_Reading, set[_Pair]] = {reading: set() for reading in _READINGS}
+    for path, group in sorted(by_path.items()):
+        for index, (first, first_ends) in enumerate(group):
+            for second, second_ends in group[index + 1 :]:
+                if int(first["writer"]) == int(second["writer"]):
+                    continue
+                ids = sorted((str(first["write_id"]), str(second["write_id"])))
+                key = (path, ids[0], ids[1])
+                keys.append(key)
+                records[key] = {
+                    "path": path,
+                    "writes": ids,
+                    "writers": sorted((int(first["writer"]), int(second["writer"]))),
+                }
+                for reading, member in members.items():
+                    if (
+                        float(first["t"]) <= second_ends[reading]
+                        and float(second["t"]) <= first_ends[reading]
+                    ):
+                        member.add(key)
+    undetermined: list[dict[str, Any]] = []
+    for position, cause in enumerate(_CAUSES):
+        affected = [
+            records[key]
+            for key in keys
+            if any(
+                (key in members[reading]) != (key in members[_flipped(reading, position)])
+                for reading in _READINGS
+            )
+        ]
+        if affected:
+            undetermined.append({"cause": cause, "pairs": affected})
+    pairs = [records[key] for key in keys if all(key in member for member in members.values())]
+    return {
+        "collisions": None if undetermined else len(pairs),
+        "pairs": pairs,
+        "undetermined": undetermined,
+    }
 
 
 def refusals(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -232,8 +418,8 @@ def overhead(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """All six metrics for one system's events, in the protocol's order."""
+def compute_v2(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """All six metrics for one system's events, in the protocol's order, as v2 defines them."""
 
     listed = list(events)
     return {
@@ -246,4 +432,28 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-__all__ = ["collisions", "compute", "integrity", "lost_work", "overhead", "refusals", "throughput"]
+def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """All six metrics for one system's events, in the protocol's order, as v3 defines them."""
+
+    listed = list(events)
+    return {
+        "lost_work": lost_work(listed),
+        "collision": collisions_v3(listed),
+        "refusal": refusals(listed),
+        "integrity": integrity(listed),
+        "throughput": throughput(listed),
+        "overhead": overhead(listed),
+    }
+
+
+__all__ = [
+    "collisions",
+    "collisions_v3",
+    "compute",
+    "compute_v2",
+    "integrity",
+    "lost_work",
+    "overhead",
+    "refusals",
+    "throughput",
+]
