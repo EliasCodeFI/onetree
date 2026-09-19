@@ -2243,7 +2243,8 @@ class Repository:
                     pending=pending_queries,
                 )
             )
-            found.append(MarkedCommit(commit, operations))
+            if recorded_queries is None or operations:
+                found.append(MarkedCommit(commit, operations))
         return found
 
     def landed_evidence(
