@@ -582,6 +582,12 @@ class MarkedCommit:
 
 
 @dataclass(frozen=True)
+class _CommitAudit:
+    witnesses: list[MarkedCommit]
+    reachable: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LandedEvidence:
     """What one raw commit object establishes for landed-record verification.
 
@@ -2084,15 +2090,35 @@ class Repository:
     ) -> Iterator[MarkedCommit]:
         """Return compact identity witnesses sufficient for repository audit."""
 
-        commits = self._walked_commit_oids(target, excludes)
         return iter(
-            self._marked_commits_from_oids(
-                commits,
-                reference=target,
+            self._audit_commit_walk(
+                target,
+                excludes,
                 recorded=recorded,
                 pending=pending,
-            )
+            ).witnesses
         )
+
+    def _audit_commit_walk(
+        self,
+        target: str,
+        excludes: Sequence[str],
+        *,
+        recorded: Collection[tuple[str, str]],
+        pending: Collection[str],
+        ancestry_queries: Collection[str] = (),
+    ) -> _CommitAudit:
+        """Expose positive query membership only after complete raw-object validation."""
+
+        commits = self._walked_commit_oids(target, excludes)
+        witnesses = self._marked_commits_from_oids(
+            commits, reference=target, recorded=recorded, pending=pending,
+        )
+        queries = frozenset(ancestry_queries)
+        reachable = (
+            frozenset(commit for commit in commits if commit in queries) if queries else frozenset()
+        )
+        return _CommitAudit(witnesses, reachable)
 
     def _walked_commit_oids(
         self,

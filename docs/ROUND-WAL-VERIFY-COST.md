@@ -87,9 +87,45 @@ r2 or r3.
 | 20 | 0.316 s / 145 | 0.152 s / 65 | 0.362 s / 161 | 0.208 s / 81 |
 | 100 | 1.377 s / 625 | 0.533 s / 225 | 1.795 s / 721 | 0.906 s / 321 |
 
-The remaining per-record cost (`cat-file` and `ls-tree` once per landing on
-every call, `merge-base` once per landing on inspection) belongs to the history
-audit, which task 61 tracks; it is unchanged here.
+The remaining costs in that historical table are not all the history audit of
+task 61. WAL event reading pays the per-event `cat-file` and `ls-tree` costs
+(task 194); the per-recorded-landing `merge-base --is-ancestor` calls belong to
+`Coordinator._divergences` (task 195). The table predates both changes and must
+not be read as a current-main timing measurement.
+
+### Task 195: reuse validated positive ancestry within one inspection
+
+Inspection now reuses membership from the complete branch walk it already
+needs. It retains only matches for requested, validated landed commit IDs.
+Membership is available only after every walked raw object has been validated.
+A missing match still calls `is_ancestor`; every refused candidate still calls
+it as well, preserving missing or malformed query-object errors. Branch-audit
+errors retain their position after ancestry-query errors. Results live for one
+inspection, keyed by the captured head and exact exclusions; there is no
+persistent cache. Completed witness batches are reduced to divergence entries
+before another distinct head is audited. The public history API is unchanged.
+
+A retained SHA-1 fixture has ten adopted landings on a twelve-commit linear
+history. Native Git Trace2 start events, calibrated on a named `rev-parse`, show:
+
+| One normal inspection | Base `9e68d93` | Task195 candidate |
+| --- | ---: | ---: |
+| Git processes | 52 | 42 |
+| `merge-base --is-ancestor` calls | 10 | 0 |
+| Complete branch walks | 1 | 1 |
+
+The normal JSON reports are byte-identical. Moving the private branch behind
+the adopted commits produces byte-identical lost-ancestry reports on both trees;
+restoring it reproduces the original clean report. These are bounded call-count
+observations, not latency, universal scaling, or memory guarantees. Evidence is
+under `/anvil/scratch/onetree-task195-ancestry-observation-owner-20260919/`:
+`base196-census.json`, `candidate-census.json`, their native trace files, and
+the paired normal, lost and restored JSON reports.
+
+The regression tests cover linear and merged histories, duplicate heads, both
+object formats, query-error precedence, graph boundaries, excluded queries,
+and failure of raw-object validation. A separate calibrated weak-reference
+control catches accumulation of completed witness batches across distinct heads.
 
 ## Controls
 

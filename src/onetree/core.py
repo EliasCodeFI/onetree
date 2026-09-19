@@ -8,7 +8,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -533,40 +533,44 @@ class Coordinator:
             previous = retry_audit.heads.get(target) if retry_audit is not None else None
             if reusable and previous is not None and self.repo.is_ancestor(previous, head):
                 excludes = (previous,)
-            for marked in self._audit_marked_commits(
-                head,
-                excludes,
-                recorded,
-                state.pending,
-            ):
-                if not marked.operations or marked.commit in seen:
-                    continue
-                seen.add(marked.commit)
-                # A commit a verified legacy record names is recorded, whatever
-                # identities the current parser reads from it; any other commit
-                # carrying those identities is still judged on its own record.
-                if marked.commit in state.legacy_adopted or any(
-                    (marked.commit, operation) in recorded
-                    for operation in marked.operations
-                ):
-                    continue
-                # Divergence and adopted-event schemas are intentionally scalar.
-                # The repository has already reduced this unrecorded identity
-                # stream to the deterministic nonpending witness (or overall
-                # minimum) that the scalar schema can carry.
-                if len(marked.operations) != 1:
-                    raise AssertionError("audit identity reduction returned multiple witnesses")
-                operation = next(iter(marked.operations))
-                found.append(
-                    Divergence(
-                        "unrecorded_landing",
-                        target,
-                        "a broker landing is on the branch with no WAL record of it",
-                        commit=marked.commit,
-                        operation=operation,
-                    )
+            found.extend(
+                self._unrecorded_witnesses(
+                    state, target,
+                    self._audit_marked_commits(head, excludes, recorded, state.pending),
+                    recorded, seen,
                 )
+            )
         return tuple(found)
+
+    @staticmethod
+    def _unrecorded_witnesses(
+        state: _FoldedState,
+        target: str,
+        witnesses: Iterable[MarkedCommit],
+        recorded: set[tuple[str, str]],
+        seen: set[str],
+    ) -> Iterator[Divergence]:
+        """Preserve first-target attribution and scalar unrecorded identity witnesses."""
+
+        for marked in witnesses:
+            if not marked.operations or marked.commit in seen:
+                continue
+            seen.add(marked.commit)
+            # A verified legacy record establishes custody of the commit even
+            # when the current parser reads different identities from its bytes.
+            if marked.commit in state.legacy_adopted or any(
+                (marked.commit, operation) in recorded for operation in marked.operations
+            ):
+                continue
+            if len(marked.operations) != 1:
+                raise AssertionError("audit identity reduction returned multiple witnesses")
+            yield Divergence(
+                "unrecorded_landing",
+                target,
+                "a broker landing is on the branch with no WAL record of it",
+                commit=marked.commit,
+                operation=next(iter(marked.operations)),
+            )
 
     def _read_wal(
         self, target: str | None = None, *, retry_audit: _RetryAudit | None = None,
@@ -2201,6 +2205,13 @@ class Coordinator:
         """
 
         found: list[Divergence] = []
+        recorded = self._audit_records(state)
+        queries = frozenset(str(event.data.get("commit")) for event in state.landed)
+        memberships: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
+        unrecorded: list[Divergence] = []
+        seen: set[str] = set()
+        walked_heads: set[str] = set()
+        audit_error: Exception | None = None
         for target, head in heads:
             landed_here = (
                 []
@@ -2219,9 +2230,31 @@ class Coordinator:
                     for event in landed_here
                 )
                 continue
+            key = (head, tuple(self._scan_floor(state, target)))
+            if head not in walked_heads and audit_error is None:
+                walked_heads.add(head)
+                try:
+                    audit = self.repo._audit_commit_walk(
+                        head,
+                        key[1],
+                        recorded=recorded,
+                        pending=state.pending.keys(),
+                        ancestry_queries=queries,
+                    )
+                    unrecorded.extend(
+                        self._unrecorded_witnesses(state, target, audit.witnesses, recorded, seen)
+                    )
+                    memberships[key] = audit.reachable
+                    del audit
+                except Exception as error:
+                    # Branch errors historically follow every ancestry query.
+                    # Keep the exact error, without collecting partial membership
+                    # or starting later walks once the first audit has failed.
+                    audit_error = error
+            reachable = memberships.get(key, frozenset())
             for event in landed_here:
                 commit = str(event.data.get("commit"))
-                if not self.repo.is_ancestor(commit, head):
+                if commit not in reachable and not self.repo.is_ancestor(commit, head):
                     found.append(
                         Divergence(
                             "landed_not_on_target",
@@ -2246,7 +2279,9 @@ class Coordinator:
                             operation=operation,
                         )
                     )
-        found.extend(self._unrecorded_landings(state, heads))
+        if audit_error is not None:
+            raise audit_error
+        found.extend(unrecorded)
         return tuple(found)
 
     def _audit_marked_commits(
