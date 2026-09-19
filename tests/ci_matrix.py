@@ -10,6 +10,9 @@ Contract (OneTree task97, Owner disposition 82f69cd68e5c):
 - Every declared minor resolves to an existing user-managed interpreter with
   downloads disabled; a missing minor is an error, never a silent download.
   Extra minors are labelled ``extra-<minor>`` and are never part of the declared set.
+- The installed uv release must match the workflow pin at planning and setup.
+  A missing, unreadable or different version is an error; this helper never installs
+  a replacement or changes the workflow pin to fit the local machine (task212).
 - ``plan`` writes exactly the JSON array ``gate_receipt.py run --plan`` accepts to
   stdout. Interpreter and workflow provenance goes only to the ``--provenance`` file.
 - Each leg runs in a fresh private copy with a fresh virtual environment under a
@@ -375,6 +378,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _require_uv_version(output: str, expected: str) -> None:
+    pattern = rf"uv {re.escape(expected)}(?: \([^\r\n]*\))?"
+    if re.fullmatch(pattern, output.strip()) is None:
+        raise ResolutionError(
+            f"uv version must match workflow pin {expected!r}; got {output.strip()!r}"
+        )
+
+
 def build_plan(
     workflow: Workflow,
     *,
@@ -417,7 +428,7 @@ def build_plan(
             if step.kind == "checkout":
                 action = ["checkout", str(source), str(workspace)]
             elif step.kind == "setup-uv":
-                action = [uv, "--version"]
+                action = ["verify-uv", uv, workflow.uv_version]
             elif step.kind == "prepare":
                 action = [BASH, "-e", "-c", _prepare_script(step, uv, exact, interpreter.version)]
             else:
@@ -518,11 +529,21 @@ def run_step(arguments: argparse.Namespace) -> int:
             returncode = 0
         else:
             Path(arguments.cwd).mkdir(parents=True, exist_ok=True)
+            if action[:1] == ["verify-uv"] and len(action) != 3:
+                raise OSError("verify-uv requires executable and workflow version")
+            expected_uv = action[2] if action[:1] == ["verify-uv"] else None
+            command = [action[1], "--version"] if expected_uv is not None else action
             completed = subprocess.run(
-                action, cwd=arguments.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                command, cwd=arguments.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 check=False, env={"HOME": arguments.home, "PATH": arguments.path},
             )
             output, returncode = completed.stdout, completed.returncode
+            if expected_uv is not None and returncode == 0:
+                try:
+                    _require_uv_version(output.decode("utf-8", errors="replace"), expected_uv)
+                except ResolutionError as error:
+                    output += f"\nci_matrix: {error}\n".encode()
+                    returncode = 2
     except OSError as error:
         output, returncode = f"step could not start: {error}\n".encode(), 127
     log.write_bytes(output)
@@ -557,6 +578,7 @@ def _plan_command(arguments: argparse.Namespace, resolve: Resolver | None) -> in
     )
     if uv_version.returncode != 0:
         raise ResolutionError(f"{uv} --version failed: {uv_version.stderr.strip()}")
+    _require_uv_version(uv_version.stdout, workflow.uv_version)
     run_id = secrets.token_hex(16)
     plan, legs = build_plan(
         workflow, source=source, run_root=run_root, run_id=run_id, home=home, uv=uv,
@@ -661,6 +683,20 @@ def selftest() -> int:
         workflow = parse_workflow(text)
         if not workflow.minors or not any(step.kind == "run" for step in workflow.steps):
             raise AssertionError("no minors or gates derived")
+
+    @check("uv version pin admits exact release with optional build metadata")
+    def _uv_matching() -> None:
+        _require_uv_version("uv 0.12.3\n", "0.12.3")
+        _require_uv_version("uv 0.12.3 (fixture build)\n", "0.12.3")
+
+    @check("uv version pin refuses wrong, malformed and ambiguous output")
+    def _uv_wrong() -> None:
+        for output in ("uv 0.12.13", "uv 0.12.30", "bad output", "uv 0.12.3\nuv 0.12.13"):
+            try:
+                _require_uv_version(output, "0.12.3")
+            except ResolutionError:
+                continue
+            raise AssertionError(f"accepted wrong uv version {output!r}")
 
     @check("missing declaration refused")
     def _missing() -> None:

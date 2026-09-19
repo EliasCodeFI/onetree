@@ -130,7 +130,8 @@ def _fake_resolver(minor: str) -> ci_matrix.Interpreter:
 def _fake_uv(tmp_path: Path) -> Path:
     uv = tmp_path / "bin" / "uv"
     uv.parent.mkdir()
-    uv.write_text("#!/bin/sh\necho 'uv 0.0.0-contract'\n")
+    version = ci_matrix.parse_workflow(_WORKFLOW.read_text()).uv_version
+    uv.write_text(f"#!{sys.executable}\nprint({f'uv {version} (contract fixture)'!r})\n")
     uv.chmod(0o755)
     return uv
 
