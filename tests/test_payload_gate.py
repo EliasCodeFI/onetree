@@ -840,7 +840,7 @@ def test_shipped_payload_gate_digest_is_pinned_to_a_literal() -> None:
     """
 
     assert SHIPPED_PAYLOAD_GATE_SOURCE_SHA256 == (
-        "d71928779f10f286c7d6f840159783c6b54626a07af72a3762682fdc0e8ed4f8"
+        "5b5245413b8721764aa095d7fd3ee9ffb8755fee4ce73caf2e138c10a87a1ccc"
     )
 
 

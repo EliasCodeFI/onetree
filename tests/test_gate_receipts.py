@@ -152,8 +152,10 @@ def test_real_hook_gate_evidence(
         "advisories",
         "hook_suites",
         "hook_suite_state",
+        "source_acceptance",
         "verdict",
     }
+    assert report["source_acceptance"] is None
     assert report["hook_suite_state"] == "evaluated"
     assert {row["status"] for row in report["hook_suites"]} == {
         {"no_companion": "NO_COMPANION", "green": "GREEN", "red": "RED"}[case]
