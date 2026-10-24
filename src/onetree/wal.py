@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -44,6 +45,8 @@ EVENT_KINDS = frozenset(_KIND_VERSIONS)
 # and is never written again: the current writer refuses it.
 _LEGACY_KIND_VERSIONS: dict[str, frozenset[int]] = {"adopted": frozenset({1})}
 _DOCUMENT_KEYS = frozenset({"v", "event", "event_id", "actor", "time", "data"})
+# The raw body of the tree ``build_chain`` writes, ahead of the blob's binary object ID.
+_CANONICAL_TREE_PREFIX = b"100644 event.json\0"
 
 
 @dataclass(frozen=True)
@@ -177,9 +180,19 @@ class Wal:
         blob_oid = metadata.split()[2]
         try:
             blob = self.repo.git("cat-file", "blob", blob_oid.decode("ascii")).stdout
-            value = json.loads(blob.decode("utf-8", errors="strict"))
-        except (GitError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            text = blob.decode("utf-8", errors="strict")
+        except (GitError, UnicodeDecodeError) as error:
             raise WalCorruptError("WAL event.json is not valid UTF-8 JSON", oid=oid) from error
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise WalCorruptError("WAL event.json is not valid UTF-8 JSON", oid=oid) from error
+        except (ValueError, RecursionError) as error:
+            raise WalCorruptError(
+                "WAL event.json could not be decoded within the active interpreter limits",
+                oid=oid,
+                reason="json_decode_limit",
+            ) from error
         document = self._validate_document(value, oid=oid)
         return EventRecord(oid=oid, parents=parents, document=document)
 
@@ -207,6 +220,9 @@ class Wal:
         # parent on a merge commit, so the exact-parent check below refuses it
         # without first attempting to parse the unrelated side history as WAL.
         output = self.repo.git("rev-list", "--first-parent", "--reverse", "--parents", head).stdout
+        snapshot = self._read_canonical(head, output)
+        if snapshot is not None:
+            return snapshot
         events: list[EventRecord] = []
         previous: str | None = None
         for raw_line in output.splitlines():
@@ -233,6 +249,80 @@ class Wal:
         if previous != head:
             raise WalCorruptError("WAL traversal did not end at the ref head", head=head)
         return WalSnapshot(head=head, events=tuple(events))
+
+    def _read_canonical(self, head: str, output: bytes) -> WalSnapshot | None:
+        """The snapshot the sequential reader in ``read`` would return, or None.
+
+        A snapshot is returned only for a chain whose every record has the canonical shape
+        the writer produces; anything else is None, and the sequential reader decides it over
+        the same head and history, keeping its per-record commit, exact tree, document, object
+        identity, ordering and typed failure contracts. Nothing is retained across calls.
+        """
+
+        rows: list[tuple[str, tuple[str, ...]]] = []
+        previous: str | None = None
+        for raw_line in output.splitlines():
+            try:
+                fields = raw_line.decode("ascii", errors="strict").split()
+                oid = self.repo.validate_oid(fields[0], label="WAL commit")
+                parents = tuple(
+                    self.repo.validate_oid(parent, label="WAL parent") for parent in fields[1:]
+                )
+            except (UnicodeDecodeError, IndexError, GitError):
+                return None
+            if parents != (() if previous is None else (previous,)):
+                return None
+            rows.append((oid, parents))
+            previous = oid
+        if previous != head:
+            return None
+        width = self.repo.oid_length // 2
+        events: list[EventRecord] = []
+        # `ls-tree` refuses a commit or tree whose bytes do not hash to its name, while
+        # `cat-file --batch` returns them unchecked (task 194 identity probe), so every
+        # certified object's name is recomputed here. The batch also spools to a temporary
+        # file the sequential reader never opens, so an OSError declines the read.
+        try:
+            trees: list[str] = []
+            for oid, kind, body in self.repo.cat_file_batch(
+                [oid for oid, _ in rows], reference=WAL_REF
+            ):
+                if kind != "commit" or not self._hashes_to(kind, body, oid):
+                    return None
+                trees.append(self.repo.commit_object_tree(body, commit=oid))
+            blobs: list[str] = []
+            for tree, kind, body in self.repo.cat_file_batch(trees, reference=WAL_REF):
+                if (
+                    kind != "tree"
+                    or len(body) != len(_CANONICAL_TREE_PREFIX) + width
+                    or not body.startswith(_CANONICAL_TREE_PREFIX)
+                    or not self._hashes_to(kind, body, tree)
+                ):
+                    return None
+                blobs.append(body[len(_CANONICAL_TREE_PREFIX):].hex())
+            for index, (blob, kind, body) in enumerate(
+                self.repo.cat_file_batch(blobs, reference=WAL_REF)
+            ):
+                if kind != "blob" or not self._hashes_to(kind, body, blob):
+                    return None
+                oid, parents = rows[index]
+                # Decoded in this frame, at the call depth `_read_event` decodes at, so the
+                # recursion limit that refuses a nested document refuses it on both paths.
+                try:
+                    value = json.loads(body.decode("utf-8", errors="strict"))
+                    document = self._validate_document(value, oid=oid)
+                except (WalCorruptError, RecursionError, ValueError):
+                    return None
+                events.append(EventRecord(oid=oid, parents=parents, document=document))
+        except (GitError, OSError):
+            return None
+        return WalSnapshot(head=head, events=tuple(events))
+
+    def _hashes_to(self, kind: str, body: bytes, oid: str) -> bool:
+        digest = hashlib.new(self.repo.object_format)
+        digest.update(f"{kind} {len(body)}\0".encode("ascii"))
+        digest.update(body)
+        return digest.hexdigest() == oid
 
     def build_chain(
         self,

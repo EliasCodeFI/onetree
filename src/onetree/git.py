@@ -61,7 +61,7 @@ _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
 PAYLOAD_GATE_TIMEOUT_SECONDS = 3600.0
 PAYLOAD_GATE_SOURCE_SHA256 = (
-    "5b5245413b8721764aa095d7fd3ee9ffb8755fee4ce73caf2e138c10a87a1ccc"
+    "c717c77d21bfe6b6ddb5c92fd8c45a836806c9e2c793237d524971c63815b424"
 )
 PAYLOAD_GATE_ENVIRONMENT_NAMES = (
     "PATH",
@@ -2319,6 +2319,11 @@ class Repository:
                 ),
             )
         return evidence
+
+    def cat_file_batch(
+        self, oids: Sequence[str], *, reference: str
+    ) -> Iterator[tuple[str, str | None, bytes]]:
+        return self._cat_file_batch(oids, reference=reference)
 
     def _cat_file_batch(
         self, oids: Sequence[str], *, reference: str
