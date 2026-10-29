@@ -696,9 +696,10 @@ def test_a_landing_retried_after_wal_contention_leaves_a_candidate_only_the_cens
         def checkpoint(stage: str, context: dict[str, Any]) -> None:
             if stage == "before_intent" and not contended:
                 contended.append(context["candidate"])
-                self.register_session(
-                    "bench-contender", pid=os.getpid(), ttl=arm.ttl, target=systems.TARGET
-                )
+                # Reclaiming the payload paths gives them new claim generations, which the
+                # tested candidate's fences no longer name, so the landing re-audits.
+                self.release(actor)
+                self.claim(actor, [str(arm.checkout / path) for path in context["payload"]])
 
         return land(self, actor, checkpoint=checkpoint, **options)
 

@@ -356,14 +356,11 @@ def test_landing_retry_retains_the_successful_candidates_receipt(git_repo: GitFi
         if point == "before_intent":
             candidates.append(context["candidate"])
             if len(candidates) == 1:
-                Coordinator(git_repo.root).wal.append(
-                    "refused",
-                    "peer",
-                    {
-                        "action": "claim",
-                        "reason": "concurrent event",
-                    },
-                )
+                # A new claim generation on the payload path: an append that changes what
+                # was tested, so the landing re-audits (an unrelated append no longer does).
+                peer = Coordinator(git_repo.root)
+                peer.release("alpha")
+                peer.claim("alpha", [str(git_repo.root / "a.txt")])
 
     result = coordinator.land("alpha", checkpoint=contend)
     assert len(candidates) == 2
@@ -379,8 +376,12 @@ def test_landing_retry_retains_the_successful_candidates_receipt(git_repo: GitFi
 @pytest.mark.parametrize("recording", ["contended", "locked"])
 @pytest.mark.parametrize("caller", ["api", "json", "human"])
 def test_gate_refusal_survives_a_real_wal_advance_without_reauditing(
-    git_repo: GitFixture, tmp_path: Path, capsys: pytest.CaptureFixture[str],
-    verdict: str, recording: str, caller: str,
+    git_repo: GitFixture,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verdict: str,
+    recording: str,
+    caller: str,
 ) -> None:
     calls = tmp_path / "gate-calls.txt"
     gate = tmp_path / "contending_gate.py"
@@ -406,23 +407,23 @@ def test_gate_refusal_survives_a_real_wal_advance_without_reauditing(
         "peer = Coordinator(sys.argv[4])\n"
         "peer.register_session(\n"
         "    f'peer-{attempt}', pid=os.getppid(), ttl=300)\n"
-        + (
-            f"peer.repo.ref_lock_path({WAL_REF!r}).touch()\n"
-            if recording == "locked" else ""
-        )
+        + (f"peer.repo.ref_lock_path({WAL_REF!r}).touch()\n" if recording == "locked" else "")
         + f"report = {report!r}\n"
         "report['candidate'] = sys.argv[2]\n"
         "print(json.dumps(report))\n"
         f"raise SystemExit({1 if verdict == 'REFUSE' else 2})\n",
         encoding="utf-8",
     )
-    coordinator = _register_and_stage(
-        git_repo, "alpha", "contended refusal\n", commit_payload=gate
-    )
+    coordinator = _register_and_stage(git_repo, "alpha", "contended refusal\n", commit_payload=gate)
     before = coordinator.wal.read().head
     arguments = [
-        "land", "--repo", str(git_repo.root), "--session", "alpha",
-        "--commit-payload", str(gate),
+        "land",
+        "--repo",
+        str(git_repo.root),
+        "--session",
+        "alpha",
+        "--commit-payload",
+        str(gate),
     ]
     if caller == "api":
         with pytest.raises(LandingRefusedError) as refused:
@@ -455,7 +456,8 @@ def test_gate_refusal_survives_a_real_wal_advance_without_reauditing(
     assert wal.consistent
     assert wal.head != before
     assert [event.actor for event in wal.events if event.kind == "session_register"] == [
-        "alpha", "peer-1"
+        "alpha",
+        "peer-1",
     ]
     refusals = [event for event in wal.events if event.kind == "refused"]
     receipt = {

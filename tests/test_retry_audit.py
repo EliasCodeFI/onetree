@@ -30,20 +30,24 @@ def walks(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[str, ...], s
 
 
 def test_retry_walk_excludes_verified_prefix(
-    git_repo: GitFixture, walks: list[tuple[str, tuple[str, ...], set[str]]],
+    git_repo: GitFixture,
+    walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     run_race(git_repo)
     assert walks[0][1] == ()
     assert git_repo.base in walks[0][2]
     # The fixture's inner beta landing succeeds; alpha retries and its referee
     # rejects the combined payload. These are the real audit walk's returned OIDs.
-    assert walks[-1][0] == git_repo.oid()
-    assert walks[-1][1] == (git_repo.base,)
-    assert walks[-1][2] == {git_repo.oid()}
+    tip = git_repo.oid()
+    after = [walk for walk in walks if walk[0] == tip]
+    assert after[0][1:] == ((git_repo.base,), {tip})
+    # The landing's later reads reuse that newer proof, so nothing is walked twice.
+    assert after[-1][1:] == ((tip,), set())
 
 
 def test_public_and_nested_landings_do_not_share_proofs(
-    git_repo: GitFixture, walks: list[tuple[str, tuple[str, ...], set[str]]],
+    git_repo: GitFixture,
+    walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     coordinator = staged(git_repo)
     staged(git_repo, "beta", "b.txt")
@@ -75,14 +79,16 @@ def test_public_and_nested_landings_do_not_share_proofs(
 def marked_child(coordinator: Coordinator, parent: str) -> str:
     tree = coordinator.repo.git_text("show", "-s", "--format=%T", parent)
     return coordinator.repo.commit_tree(
-        tree, coordinator.repo.landing_message("unrecorded", "d" * 32, "e" * 32, "ghost"),
+        tree,
+        coordinator.repo.landing_message("unrecorded", "d" * 32, "e" * 32, "ghost"),
         (parent,),
     )
 
 
 @pytest.mark.parametrize("placement", ["suffix", "new_branch", "non_descendant"])
 def test_retry_refuses_unrecorded_history(
-    git_repo: GitFixture, placement: str,
+    git_repo: GitFixture,
+    placement: str,
     walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     coordinator = Coordinator(git_repo.root)
@@ -110,7 +116,8 @@ def test_retry_refuses_unrecorded_history(
 
 
 def test_retry_wal_rewind_invalidates_recorded_prefix(
-    git_repo: GitFixture, walks: list[tuple[str, tuple[str, ...], set[str]]],
+    git_repo: GitFixture,
+    walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     coordinator = staged(git_repo)
     before = coordinator.wal.head()
@@ -130,7 +137,8 @@ def test_retry_wal_rewind_invalidates_recorded_prefix(
 
 
 def test_unstable_scan_never_establishes_a_prefix(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
     walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     coordinator = Coordinator(git_repo.root)
@@ -160,7 +168,8 @@ def test_unstable_scan_never_establishes_a_prefix(
 
 @pytest.mark.parametrize("change", ["removed", "forged"])
 def test_legacy_proof_requires_current_verified_records(
-    git_repo: GitFixture, change: str,
+    git_repo: GitFixture,
+    change: str,
     walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     commit, scalar = _adopt_legacy(git_repo, "repeated")
@@ -187,7 +196,8 @@ def test_legacy_proof_requires_current_verified_records(
 
 
 def test_readoption_invalidates_legacy_prefix_without_losing_recorded_identity(
-    git_repo: GitFixture, walks: list[tuple[str, tuple[str, ...], set[str]]],
+    git_repo: GitFixture,
+    walks: list[tuple[str, tuple[str, ...], set[str]]],
 ) -> None:
     commit, scalar = _adopt_legacy(git_repo, "single")
     coordinator = Coordinator(git_repo.root)
@@ -225,7 +235,8 @@ def test_readoption_invalidates_legacy_prefix_without_losing_recorded_identity(
 
 @pytest.mark.parametrize("boundary", ["shallow", "grafts"])
 def test_cached_prefix_does_not_bypass_history_boundaries(
-    git_repo: GitFixture, boundary: str,
+    git_repo: GitFixture,
+    boundary: str,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     tree = coordinator.repo.git_text("show", "-s", "--format=%T", git_repo.base)

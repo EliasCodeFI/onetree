@@ -1704,6 +1704,7 @@ class Coordinator:
             self.repo.head_ref() if target is None else self.repo.validate_branch_ref(target)
         )
         attempts = 0
+        offers = 0
         retry_audit = _RetryAudit()
         for _ in range(MAX_CAS_RETRIES):
             now = time.time()
@@ -1997,100 +1998,129 @@ class Coordinator:
                 },
                 event_id=intent_id,
             )
-            if checkpoint is not None:
-                checkpoint("before_intent", context)
-            try:
-                violation = self._workspace_violation(state)
-            except LandingRefusedError:
-                # The configuration was readable when the candidate was audited, so an
-                # unreadable one here is a change, the same refusal the unprotected
-                # path records below.
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
-                ):
-                    continue
-                raise LandingRefusedError(
-                    "referee configuration changed before admission",
-                    reason="referee_config_changed",
-                    paths=payload_paths,
-                ) from None
-            if violation is not None:
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "workspace_changed", payload_paths
-                ):
-                    continue
-                raise LandingRefusedError(
-                    violation, reason="workspace_changed", paths=payload_paths
-                )
-            if not referee.configuration_matches(self.repo, configured_referee):
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "referee_config_changed", payload_paths
-                ):
-                    continue
-                raise LandingRefusedError(
-                    "referee configuration changed before admission",
-                    reason="referee_config_changed",
-                    paths=payload_paths,
-                )
-            if not self._gate_admission_matches(configured_gate, gate_receipt):
-                if not self._record_land_refusal(
-                    state,
-                    snapshot,
-                    actor,
-                    operation,
-                    "payload_gate_config_changed",
-                    payload_paths,
-                ):
-                    continue
-                raise LandingRefusedError(
-                    "payload gate admission changed before admission",
-                    reason="payload_gate_config_changed",
-                    paths=payload_paths,
-                )
-
-            # Fence sample. Everything above was audited against a WAL read that
-            # is now old; this is the last look at the session and its claims
-            # before anything becomes visible to peers.
-            landing_time = time.time()
-            fenced_generations = {str(fence["claim_generation"]) for fence in fences}
-            if not _session_alive(session, landing_time):
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "session_died_at_fence", payload_paths
-                ):
-                    continue
-                raise LandingRefusedError(
-                    "landing session died between its audit and the fence",
-                    reason="session_died_at_fence",
-                    paths=list(payload_paths),
-                )
-            expired_generations = {
-                claim.generation
-                for claim in owned
-                if claim.generation in fenced_generations and claim.expires_at <= landing_time
-            }
-            expired = tuple(
-                sorted(
-                    str(fence["path"])
-                    for fence in fences
-                    if fence["claim_generation"] in expired_generations
-                )
-            )
-            if expired:
-                if not self._record_land_refusal(
-                    state, snapshot, actor, operation, "claim_expired_at_fence", expired
-                ):
-                    continue
-                raise LandingRefusedError(
-                    "a fenced claim expired between its audit and the fence",
-                    reason="claim_expired_at_fence",
-                    paths=list(expired),
-                )
-
             attempts += 1
-            # Write-ahead step 1. The WAL CAS is also the fence: any release,
-            # reclamation, registration change, or unrelated append since the
-            # snapshot invalidates this attempt and forces a fresh audit.
-            if self._try_append(state, snapshot, (intent,)) is None:
+            audited = state
+            appended = False
+            for rebase in range(MAX_CAS_RETRIES):
+                if rebase:
+                    # The intent CAS lost to another append. The candidate's gate and
+                    # referee verdicts stay valid while everything they and the audit
+                    # depend on holds in the new WAL; anything else is audited afresh.
+                    snapshot = self._read_wal(target_ref, retry_audit=retry_audit)
+                    fresh = self._fold(snapshot)
+                    if not self._tested_candidate_holds(
+                        fresh,
+                        audited,
+                        session,
+                        baseline,
+                        fences,
+                        target_ref,
+                        current,
+                        configured_referee,
+                        configured_gate,
+                        gate_receipt,
+                    ):
+                        break
+                    # `owned` stays the audit's: a claim generation never changes once
+                    # written, and re-reading it through an expiry filter would hide a
+                    # fenced claim that expired since the check from the fence below.
+                    state = fresh
+                if checkpoint is not None:
+                    checkpoint("before_rebased_intent" if rebase else "before_intent", context)
+                try:
+                    violation = self._workspace_violation(state)
+                except LandingRefusedError:
+                    # The configuration was readable when the candidate was audited, so an
+                    # unreadable one here is a change, the same refusal the unprotected
+                    # path records below.
+                    if not self._record_land_refusal(
+                        state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        "referee configuration changed before admission",
+                        reason="referee_config_changed",
+                        paths=payload_paths,
+                    ) from None
+                if violation is not None:
+                    if not self._record_land_refusal(
+                        state, snapshot, actor, operation, "workspace_changed", payload_paths
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        violation, reason="workspace_changed", paths=payload_paths
+                    )
+                if not referee.configuration_matches(self.repo, configured_referee):
+                    if not self._record_land_refusal(
+                        state, snapshot, actor, operation, "referee_config_changed", payload_paths
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        "referee configuration changed before admission",
+                        reason="referee_config_changed",
+                        paths=payload_paths,
+                    )
+                if not self._gate_admission_matches(configured_gate, gate_receipt):
+                    if not self._record_land_refusal(
+                        state,
+                        snapshot,
+                        actor,
+                        operation,
+                        "payload_gate_config_changed",
+                        payload_paths,
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        "payload gate admission changed before admission",
+                        reason="payload_gate_config_changed",
+                        paths=payload_paths,
+                    )
+
+                # Fence sample. Everything above was audited against a WAL read that
+                # is now old; this is the last look at the session and its claims
+                # before anything becomes visible to peers.
+                landing_time = time.time()
+                fenced_generations = {str(fence["claim_generation"]) for fence in fences}
+                if not _session_alive(session, landing_time):
+                    if not self._record_land_refusal(
+                        state, snapshot, actor, operation, "session_died_at_fence", payload_paths
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        "landing session died between its audit and the fence",
+                        reason="session_died_at_fence",
+                        paths=list(payload_paths),
+                    )
+                expired_generations = {
+                    claim.generation
+                    for claim in owned
+                    if claim.generation in fenced_generations and claim.expires_at <= landing_time
+                }
+                expired = tuple(
+                    sorted(
+                        str(fence["path"])
+                        for fence in fences
+                        if fence["claim_generation"] in expired_generations
+                    )
+                )
+                if expired:
+                    if not self._record_land_refusal(
+                        state, snapshot, actor, operation, "claim_expired_at_fence", expired
+                    ):
+                        continue
+                    raise LandingRefusedError(
+                        "a fenced claim expired between its audit and the fence",
+                        reason="claim_expired_at_fence",
+                        paths=list(expired),
+                    )
+
+                # Write-ahead step 1. The WAL CAS is also the fence: an append since
+                # the snapshot is re-examined above before this intent is offered again.
+                offers += 1
+                if self._try_append(state, snapshot, (intent,)) is not None:
+                    appended = True
+                    break
+            if not appended:
                 continue
             if checkpoint is not None:
                 checkpoint("after_intent", context)
@@ -2148,7 +2178,61 @@ class Coordinator:
                 gate_receipt,
                 referee_receipt,
             )
-        raise GitError("landing CAS retry limit exceeded", retries=MAX_CAS_RETRIES)
+        raise GitError(
+            "landing CAS retry limit exceeded",
+            retries=MAX_CAS_RETRIES,
+            attempts=attempts,
+            offers=offers,
+        )
+
+    def _tested_candidate_holds(
+        self,
+        fresh: _FoldedState,
+        audited: _FoldedState,
+        session: SessionInfo,
+        baseline: str,
+        fences: Sequence[Mapping[str, Any]],
+        target_ref: str,
+        expected_head: str,
+        configured_referee: tuple[str | None, float],
+        configured_gate: PayloadGateAdmission | None,
+        gate_receipt: Mapping[str, Any],
+    ) -> bool:
+        """Whether a WAL append that beat this landing's intent left its tested candidate valid.
+
+        An append unrelated to the landing must not discard its referee run; a change to
+        its session, claims, target tip, workspace epoch, referee configuration or gate
+        admission must still re-test or refuse (onetree #245).
+        """
+
+        now = time.time()
+        current_session = self._active_session(fresh, session.actor, now)
+        if (
+            current_session is None
+            or current_session.generation != session.generation
+            or current_session.target != session.target
+            or current_session.base != session.base
+            or self._session_baseline(fresh, current_session) != baseline
+        ):
+            return False
+        if fresh.workspace_epoch_id != audited.workspace_epoch_id:
+            return False
+        if any(pending.data["target"] == target_ref for pending in fresh.pending.values()):
+            return False
+        active = {claim.generation: claim for claim in fresh.active_claims(now)}
+        for fence in fences:
+            claim = active.get(str(fence["claim_generation"]))
+            if (
+                claim is None
+                or claim.actor != session.actor
+                or not _covers(claim.path, str(fence["path"]))
+            ):
+                return False
+        return (
+            self.repo.resolve_ref(target_ref, missing_ok=True) == expected_head
+            and referee.configuration_matches(self.repo, configured_referee)
+            and self._gate_admission_matches(configured_gate, gate_receipt)
+        )
 
     def _close_intent(
         self,
