@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture, KillGit, install_kill_git
+from conftest import GitFixture, KillGit, admit_gate, install_kill_git
 
 from onetree import core as core_module
 from onetree import git as git_module
@@ -50,6 +50,12 @@ DEAD_LANDER = {"pid": 999_999_999, "start": 1}
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
 
+def _admit_fixture_gate(root: Path) -> None:
+    """Admit the autouse fixture's gate, as `git_repo` does for its own repository."""
+
+    admit_gate(root, Path(os.environ["ONETREE_COMMIT_PAYLOAD"]))
+
+
 def _repository_with_ref_backend(tmp_path: Path, ref_format: str) -> GitFixture:
     """Build the same committed repository over either supported ref backend."""
 
@@ -70,6 +76,7 @@ def _repository_with_ref_backend(tmp_path: Path, ref_format: str) -> GitFixture:
     fixture = GitFixture(root=root, base="")
     fixture.git("config", "user.name", "Round AF3 Tests")
     fixture.git("config", "user.email", "round-af3@example.invalid")
+    _admit_fixture_gate(root)
     fixture.write("a.txt", "a0\n")
     fixture.write("b.txt", "b0\n")
     fixture.git("add", "--", "a.txt", "b.txt")

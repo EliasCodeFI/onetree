@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 from coverage import Coverage
 
-from onetree import git as git_module
 from onetree import referee
 
 
@@ -118,18 +117,29 @@ print(
 """.replace("_GIT_", GATE_GIT_LITERAL)
 
 
-SHIPPED_PAYLOAD_GATE_SOURCE_SHA256 = git_module.PAYLOAD_GATE_SOURCE_SHA256
-"""The digest the package ships, captured before any fixture can rebind it.
+def admit_gate(root: Path, gate: Path) -> str:
+    """Admit ``gate`` in the repository at ``root`` with plain ``git config``, as an operator
+    could, so a fixture's admission never depends on the code under test."""
 
-`clean_commit_payload_gate` is autouse, so inside a test body the module global always
-names that test's throwaway gate. Every assertion about the SHIPPED pin has to read this
-snapshot instead, or it asserts the fixture's own value and passes for any pin at all.
-"""
+    digest = hashlib.sha256(gate.read_bytes()).hexdigest()
+    for key, value in (
+        ("onetree.payloadGateSha256", digest),
+        ("onetree.payloadGate", str(gate.resolve())),
+    ):
+        subprocess.run(
+            [_GIT_EXECUTABLE, "-C", str(root), "config", "--local", "--replace-all", key, value],
+            check=True,
+            capture_output=True,
+        )
+    return digest
 
 
 @pytest.fixture(autouse=True)
-def clean_commit_payload_gate(tmp_path: Path) -> Iterator[None]:
+def clean_commit_payload_gate(tmp_path: Path) -> Iterator[Path | None]:
     """Give every landing test an exact-output gate unless it overrides one.
+
+    `git_repo` admits the gate this yields in its repository; an override that yields
+    ``None`` leaves that repository with no admitted gate.
 
     The patcher is this fixture's own, not the `monkeypatch` fixture. That fixture is one
     instance per test, shared with the test body, and `undo()` on it reverts everything the
@@ -141,13 +151,8 @@ def clean_commit_payload_gate(tmp_path: Path) -> Iterator[None]:
     gate = tmp_path / "clean_commit_payload.py"
     gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
     with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(
-            git_module,
-            "PAYLOAD_GATE_SOURCE_SHA256",
-            hashlib.sha256(gate.read_bytes()).hexdigest(),
-        )
         patcher.setenv("ONETREE_COMMIT_PAYLOAD", str(gate))
-        yield
+        yield gate
 
 
 # A PATH-shim git that SIGKILLs the broker, or itself, from inside a matched
@@ -341,7 +346,7 @@ class GitFixture:
 
 
 @pytest.fixture
-def git_repo(tmp_path: Path) -> GitFixture:
+def git_repo(tmp_path: Path, clean_commit_payload_gate: Path | None) -> GitFixture:
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(
@@ -353,6 +358,8 @@ def git_repo(tmp_path: Path) -> GitFixture:
     fixture = GitFixture(root=root, base="")
     fixture.git("config", "user.name", "Round A Tests")
     fixture.git("config", "user.email", "round-a@example.invalid")
+    if clean_commit_payload_gate is not None:
+        admit_gate(root, clean_commit_payload_gate)
     fixture.write("a.txt", "a0\n")
     fixture.write("b.txt", "b0\n")
     fixture.write("nested/c.txt", "c0\n")

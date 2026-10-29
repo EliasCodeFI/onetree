@@ -11,8 +11,9 @@ what counts as a refusal, is fixed here per system:
   only by registering again: register, claim the task's paths, write in the shared tree, stage
   in the private index, land, release.
   A claim conflict or a landing refusal is a refusal, and the attempt's bytes are restored
-  before it is recorded. The payload gate is the operator's (``--commit-payload``); nothing in
-  this package replaces or re-pins it. The referee is the corpus referee this package ships,
+  before it is recorded. The payload gate is the operator's (``--commit-payload``), admitted
+  at setup in the run's own repository at the digest run.json records; nothing in this package
+  replaces it. The referee is the corpus referee this package ships,
   configured in the run's own repository, and it runs inside every landing.
 - worktree: git itself. Each writer owns a linked worktree and branch created at setup, which is
   the layer's setup time and disk. An attempt resets the branch to the target, writes, commits,
@@ -109,6 +110,7 @@ class Arm:
     backoff_ms: int
     wait_s: float = 600.0
     poll_ms: int = 20
+    gate_sha256: str | None = None
 
     def writer_checkout(self, writer: int) -> Path:
         if self.system == "worktree":
@@ -194,12 +196,17 @@ def setup(arm: Arm, writers: int, referee_script: Path, referee_timeout: float) 
         command = shlex.join([sys.executable, str(referee_script)])
         coordinator.repo.git("config", "onetree.referee", command)
         coordinator.repo.git("config", "onetree.refereeTimeout", str(referee_timeout))
+        if arm.gate is not None:
+            coordinator.repo.admit_payload_gate(arm.gate, expected_sha256=arm.gate_sha256)
         coordinator.register_session(CONTROLLER, pid=os.getpid(), ttl=arm.ttl, target=TARGET)
         epoch = coordinator.protect_workspace(CONTROLLER)
+        # Read back from the repository after protection: what the arm actually lands under.
+        admission = coordinator.repo.payload_gate_admission()
         return {
             "referee": command,
             "referee_timeout": referee_timeout,
             "protected_tip": epoch["tip"],
+            "gate_admission": None if admission is None else admission.payload(),
         }
     if arm.system == "worktree":
         for writer in range(writers):
@@ -658,7 +665,12 @@ def onetree_submit(
         record_found(arm.checkout, before, task, attempt, edits, events, named)
         restore(arm.checkout, edits)
         observe(
-            arm.checkout, task.paths, events, "restore", task, attempt,
+            arm.checkout,
+            task.paths,
+            events,
+            "restore",
+            task,
+            attempt,
             index_file=session.index_path,
         )
         events.emit(
@@ -675,7 +687,12 @@ def onetree_submit(
         record_found(arm.checkout, before, task, attempt, edits, events)
         restore(arm.checkout, edits)
         observe(
-            arm.checkout, task.paths, events, "restore", task, attempt,
+            arm.checkout,
+            task.paths,
+            events,
+            "restore",
+            task,
+            attempt,
             index_file=session.index_path,
         )
         events.emit(

@@ -400,9 +400,7 @@ def _check_corpus(
     return corpus
 
 
-def _merge_parts(
-    run_dir: Path, system: str, kinds: frozenset[str]
-) -> list[dict[str, Any]] | None:
+def _merge_parts(run_dir: Path, system: str, kinds: frozenset[str]) -> list[dict[str, Any]] | None:
     parts = sorted((run_dir / "events" / "parts").glob(f"{system}-*.jsonl"))
     if not parts:
         return None
@@ -744,15 +742,49 @@ def _check_claims(
             )
 
 
+def _check_gate_admission(
+    run_dir: Path, inputs: Mapping[str, Any], scope: Sequence[str], voids: list[dict[str, Any]]
+) -> None:
+    """The admission run.json records must be the one the onetree setup event observed.
+
+    A run whose setup event records no ``gate_admission`` predates admission per repository
+    and has nothing to compare.
+    """
+
+    gate = inputs.get("gate")
+    log = run_dir / "events" / "onetree.jsonl"
+    if "onetree" not in scope or not isinstance(gate, dict) or not log.is_file():
+        return
+    try:
+        setups = [event for event in events_module.read(log) if event["kind"] == "setup"]
+    except (OSError, ValueError):
+        return  # `_check_events` voids an unreadable log
+    details = [event.get("detail") for event in setups]
+    recorded = [detail for detail in details if isinstance(detail, dict)]
+    if len(recorded) != 1 or "gate_admission" not in recorded[0]:
+        return
+    observed = recorded[0]["gate_admission"]
+    observed_sha256 = observed.get("sha256") if isinstance(observed, dict) else None
+    if observed_sha256 != gate.get("admitted_pin_sha256"):
+        voids.append(
+            {
+                "what": "gate",
+                "detail": f"the admission the onetree setup observed differs from {RUN_INPUTS}",
+                "observed": observed_sha256,
+                "recorded": gate.get("admitted_pin_sha256"),
+            }
+        )
+
+
 def _interpretation(
     record: Mapping[str, Any], inputs: Mapping[str, Any], voids: list[dict[str, Any]]
 ) -> str | None:
     """Only a recognized, agreeing format pair may select historical receipt semantics.
 
-The unpublished A1 v3 format kept v2 event/scoring/manifest rules with a new corpus.
-The other v3 candidate kept the SHA corpus and introduced the lifecycle rules. New v4
-combines SeedSequence with those lifecycle rules; a label alone cannot upgrade evidence.
-"""
+    The unpublished A1 v3 format kept v2 event/scoring/manifest rules with a new corpus.
+    The other v3 candidate kept the SHA corpus and introduced the lifecycle rules. New v4
+    combines SeedSequence with those lifecycle rules; a label alone cannot upgrade evidence.
+    """
 
     recorded = record.get("schema")
     if recorded not in SCHEMAS:
@@ -810,6 +842,7 @@ def verify(run_dir: Path) -> dict[str, Any]:
         metrics = _load_object(run_dir, METRICS, voids) or {}
         scope = _check_scope(run_dir, record, inputs, metrics, voids)
         _check_inputs(run_dir, record, inputs, voids)
+        _check_gate_admission(run_dir, inputs, scope, voids)
         corpus = _check_corpus(run_dir, record, voids)
         recomputed, completes = _check_events(run_dir, scope, corpus, metrics, schema, voids)
         _check_claims(record, scope, recomputed, completes, voids)

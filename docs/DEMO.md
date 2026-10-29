@@ -11,9 +11,13 @@ python -m onetree.demo \
 ```
 
 Use an installed OneTree package, Python 3.11 or later, and Git. The demo adds no
-runtime dependencies. The payload gate is an explicit prerequisite: supply the
-gate matching this package's admitted digest. The package does not distribute
-that gate. A missing or mismatched gate cannot produce a successful run.
+runtime dependencies. The payload gate is an explicit prerequisite, and the
+package does not distribute one. The demo admits the gate you supply, at its
+current SHA-256, in the new sample repository it creates, and the report's
+`gate` field names the admitted path and digest. The demo therefore does not
+check which gate you supplied: any gate that reports CLEAN for the workers'
+landings produces a successful run. A missing gate, or one that refuses or
+fails a landing, cannot.
 
 The message file supplies the commit message, including any operator identity
 trailers required by the gate. The demo does not manufacture session identities,

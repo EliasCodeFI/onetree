@@ -24,7 +24,7 @@ from onetree.core import Coordinator
 from onetree.errors import ClaimConflictError, OnetreeError
 from onetree.git import Repository
 
-_SAMPLE_CHECK = '''from pathlib import Path
+_SAMPLE_CHECK = """from pathlib import Path
 import sys
 
 root = Path.cwd()
@@ -33,7 +33,7 @@ for number in range(int(sys.argv[1])):
     content = root.joinpath(f"worker-{number}.txt").read_text()
     valid = valid and content in ("initial\\n", f"worker {number}\\n")
 raise SystemExit(0 if valid else 1)
-'''
+"""
 
 
 class DemoError(RuntimeError):
@@ -50,7 +50,7 @@ def _write(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _setup(output: Path, workers: int, timeout: float) -> Coordinator:
+def _setup(output: Path, gate: Path, workers: int, timeout: float) -> Coordinator:
     repo_path = output / "repo"
     repo_path.mkdir()
     Repository._invoke(repo_path, ["init", "--initial-branch=main"], check=True)
@@ -71,6 +71,7 @@ def _setup(output: Path, workers: int, timeout: float) -> Coordinator:
     command = shlex.join([sys.executable, "check_sample.py", str(workers)])
     repo.git("config", "onetree.referee", command)
     repo.git("config", "onetree.refereeTimeout", str(timeout))
+    repo.admit_payload_gate(gate)
     coordinator = Coordinator(repo_path)
     coordinator.register_session("demo-controller", pid=os.getpid(), ttl=timeout + 60)
     coordinator.protect_workspace("demo-controller")
@@ -78,7 +79,12 @@ def _setup(output: Path, workers: int, timeout: float) -> Coordinator:
 
 
 def _worker(
-    connection: Connection, repo_path: Path, gate: Path, message: str, number: int, ttl: float,
+    connection: Connection,
+    repo_path: Path,
+    gate: Path,
+    message: str,
+    number: int,
+    ttl: float,
 ) -> None:
     actor = f"demo-worker-{number}"
     coordinator = Coordinator(repo_path, commit_payload=gate)
@@ -114,8 +120,11 @@ def _worker(
 
 
 def _collect(
-    connections: list[Connection], records: list[dict[str, Any]], phase: str,
-    deadline: float, progress: TextIO,
+    connections: list[Connection],
+    records: list[dict[str, Any]],
+    phase: str,
+    deadline: float,
+    progress: TextIO,
 ) -> None:
     pending = set(range(len(connections)))
     while pending:
@@ -145,8 +154,10 @@ def _collect(
 def _verify(coordinator: Coordinator, records: list[dict[str, Any]]) -> dict[str, Any]:
     report = coordinator.inspect_wal()
     evidence = {
-        "head": report.head, "consistent": report.consistent,
-        "pending_intents": report.pending_intents, "active_claims": list(report.active_claims),
+        "head": report.head,
+        "consistent": report.consistent,
+        "pending_intents": report.pending_intents,
+        "active_claims": list(report.active_claims),
         "divergences": [item.payload() for item in report.divergences],
         "events": [item.payload() for item in report.events],
     }
@@ -169,11 +180,21 @@ def _verify(coordinator: Coordinator, records: list[dict[str, Any]]) -> dict[str
         if land["payload"] != [path] or land["commit"] in commits:
             raise DemoError(f"worker {number} has inconsistent payload evidence")
         commits.add(land["commit"])
-        landed = [event for event in report.events if event.kind == "landed"
-                  and event.actor == actor and event.data.get("commit") == land["commit"]
-                  and event.data.get("intent") == land["intent"]]
-        intents = [event for event in report.events if event.kind == "land_intent"
-                   and event.actor == actor and event.event_id == land["intent"]]
+        landed = [
+            event
+            for event in report.events
+            if event.kind == "landed"
+            and event.actor == actor
+            and event.data.get("commit") == land["commit"]
+            and event.data.get("intent") == land["intent"]
+        ]
+        intents = [
+            event
+            for event in report.events
+            if event.kind == "land_intent"
+            and event.actor == actor
+            and event.event_id == land["intent"]
+        ]
         if len(landed) != 1 or len(intents) != 1:
             raise DemoError(f"worker {number} lacks paired WAL evidence")
         content = coordinator.repo.git_text("show", f"{land['commit']}:{path}")
@@ -184,7 +205,13 @@ def _verify(coordinator: Coordinator, records: list[dict[str, Any]]) -> dict[str
 
 
 def run(
-    output: Path, gate: Path, message: str, *, workers: int, timeout: float, progress: TextIO,
+    output: Path,
+    gate: Path,
+    message: str,
+    *,
+    workers: int,
+    timeout: float,
+    progress: TextIO,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {"ok": False, "synthetic": True, "workers": []}
     processes: list[BaseProcess] = []
@@ -207,7 +234,9 @@ def run(
         report["output"] = str(output)
         _write(output / "demo.json", {"synthetic": True, "controller_pid": os.getpid()})
         (output / "workers").mkdir()
-        coordinator = _setup(output, workers, timeout)
+        coordinator = _setup(output, gate, workers, timeout)
+        admission = coordinator.repo.payload_gate_admission()
+        report["gate"] = None if admission is None else admission.payload()
         context = multiprocessing.get_context("spawn")
         deadline = time.monotonic() + timeout
         for number in range(workers):
@@ -234,8 +263,9 @@ def run(
         for phase in ("conflict", "land"):
             for connection in connections:
                 connection.send(phase)
-            _collect(connections, records, "landed" if phase == "land" else phase,
-                     deadline, progress)
+            _collect(
+                connections, records, "landed" if phase == "land" else phase, deadline, progress
+            )
         for process in processes:
             process.join(timeout=max(0, deadline - time.monotonic()))
             if process.is_alive():
@@ -264,7 +294,8 @@ def run(
             try:
                 wal = coordinator.inspect_wal()
                 report["wal"] = {
-                    "head": wal.head, "consistent": wal.consistent,
+                    "head": wal.head,
+                    "consistent": wal.consistent,
                     "pending_intents": wal.pending_intents,
                     "events": [event.payload() for event in wal.events],
                     "divergences": [item.payload() for item in wal.divergences],
@@ -296,8 +327,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(arguments)
         report = run(
-            args.output, args.commit_payload, args.message_file.read_text(encoding="utf-8"),
-            workers=args.workers, timeout=args.timeout,
+            args.output,
+            args.commit_payload,
+            args.message_file.read_text(encoding="utf-8"),
+            workers=args.workers,
+            timeout=args.timeout,
             progress=sys.stderr if json_mode else sys.stdout,
         )
     except (Exception, KeyboardInterrupt) as error:

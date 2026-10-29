@@ -13,13 +13,10 @@ import pytest
 from onetree import git as git_module
 from onetree.errors import PayloadGateError
 
-_SOURCE_PIN = git_module.PAYLOAD_GATE_SOURCE_SHA256
-
 
 @pytest.fixture(autouse=True)
 def clean_commit_payload_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ONETREE_COMMIT_PAYLOAD", raising=False)
-    monkeypatch.setattr(git_module, "PAYLOAD_GATE_SOURCE_SHA256", _SOURCE_PIN)
 
 
 def test_complete_published_guard_commit_through_real_consumer(tmp_path: Path) -> None:
@@ -52,6 +49,7 @@ def test_complete_published_guard_commit_through_real_consumer(tmp_path: Path) -
     assert "hooks/guard.js" in paths
     assert "hooks/guard.test.mjs" in paths
     repository = git_module.Repository(snapshot)
+    repository.admit_payload_gate(gate)
     observation: dict[str, object] = {
         "consumer_implementation": str(Path(git_module.__file__).resolve()),
         "consumer_sha256": hashlib.sha256(Path(git_module.__file__).read_bytes()).hexdigest(),

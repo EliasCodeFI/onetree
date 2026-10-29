@@ -11,7 +11,20 @@ from typing import Any
 
 from onetree import __version__
 from onetree.core import CheckResult, Coordinator
-from onetree.errors import IdentityError, InvalidPathError, OnetreeError, WalDivergedError
+from onetree.errors import (
+    IdentityError,
+    InvalidPathError,
+    OnetreeError,
+    PayloadGateError,
+    WalDivergedError,
+)
+from onetree.git import (
+    PAYLOAD_GATE_PATH_KEY,
+    PAYLOAD_GATE_SHA256_KEY,
+    Repository,
+    payload_gate_source,
+    read_payload_gate_source,
+)
 
 
 def _add_output(parser: argparse.ArgumentParser) -> None:
@@ -39,13 +52,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_output(protect)
 
     reconcile = subparsers.add_parser(
-        "reconcile", help="Explicitly accept an inspected workspace baseline.",
+        "reconcile",
+        help="Explicitly accept an inspected workspace baseline.",
     )
     _add_repo(reconcile)
     _add_actor(reconcile)
     reconcile.add_argument("--expected-epoch", required=True, help="Current protection event id.")
     reconcile.add_argument(
-        "--reason", required=True, help="Operator's reason for accepting the state.",
+        "--reason",
+        required=True,
+        help="Operator's reason for accepting the state.",
     )
     _add_output(reconcile)
 
@@ -96,12 +112,36 @@ def _build_parser() -> argparse.ArgumentParser:
     land.add_argument(
         "--commit-payload",
         help=(
-            "Path to commit_payload.py (default: ONETREE_COMMIT_PAYLOAD; "
-            "landing refuses when neither is set)."
+            "Path to commit_payload.py (default: ONETREE_COMMIT_PAYLOAD, then the "
+            "repository's admitted gate). Its bytes must match the admitted SHA-256; "
+            "landing refuses when no gate is admitted."
         ),
     )
     land.add_argument("-m", "--message", help="Commit message.")
     _add_output(land)
+
+    gate = subparsers.add_parser(
+        "gate",
+        help="Inspect or admit the repository's commit payload gate.",
+    )
+    _add_repo(gate)
+    gate.add_argument(
+        "--admit",
+        metavar="PATH",
+        help="Admit this gate file's current bytes as the repository's payload gate.",
+    )
+    gate.add_argument(
+        "--sha256",
+        help="With --admit: the digest the operator reviewed; admission refuses other bytes.",
+    )
+    gate.add_argument(
+        "--commit-payload",
+        help=(
+            "Report the gate `land --commit-payload` would read (default: "
+            "ONETREE_COMMIT_PAYLOAD, then the admitted gate)."
+        ),
+    )
+    _add_output(gate)
 
     wal = subparsers.add_parser("wal", help="Verify and inspect refs/onetree/wal.")
     _add_repo(wal)
@@ -189,6 +229,51 @@ def _check_human(result: CheckResult) -> str:
     return line
 
 
+def _gate_payload(repo: Repository, named: str | None, origin: str | None) -> dict[str, Any]:
+    admission = repo.payload_gate_admission()
+    source = payload_gate_source(named, admission)
+    if source is not None and source != named:
+        origin = "admission"
+    observed: str | None = None
+    resolved: str | None = None
+    error: str | None = None
+    if source is not None:
+        try:
+            gate, observed = read_payload_gate_source(source)
+            resolved = str(gate)
+        except PayloadGateError as failure:
+            error = str(failure)
+    return {
+        "admitted": admission is not None,
+        "path": None if admission is None else admission.path,
+        "sha256": None if admission is None else admission.sha256,
+        "source": {
+            "path": source,
+            "origin": None if source is None else origin,
+            "resolved": resolved,
+            "sha256": observed,
+            "error": error,
+        },
+        "source_sha256": observed,
+        "matches": admission is not None and observed == admission.sha256,
+        "config": {"path": PAYLOAD_GATE_PATH_KEY, "sha256": PAYLOAD_GATE_SHA256_KEY},
+    }
+
+
+def _gate_human(gate: Mapping[str, Any]) -> str:
+    if not gate["admitted"]:
+        return "no payload gate admitted; landing refuses"
+    line = f"payload gate {gate['path']} admitted at sha256 {gate['sha256']}"
+    source = gate["source"]
+    if source["origin"] != "admission":
+        line += f"; landing reads {source['path']} ({source['origin']})"
+    if gate["matches"]:
+        return line + "; source matches"
+    if source["error"] is not None:
+        return line + f"; SOURCE UNREADABLE ({source['error']}), landing refuses"
+    return line + f"; SOURCE DIFFERS (sha256 {source['sha256']}), landing refuses"
+
+
 def _check_paths(
     coordinator: Coordinator, actor: str, paths: Sequence[str]
 ) -> tuple[int, dict[str, Any], str]:
@@ -223,7 +308,10 @@ def _check_paths(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "gate" and args.sha256 is not None and args.admit is None:
+        parser.error("gate: --sha256 requires --admit")
     json_output = bool(args.json)
     return_code = 0
     if args.command == "status":
@@ -277,16 +365,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             human = f"released {len(release_result.released)} path(s)"
         elif args.command == "check":
-            return_code, payload, human = _check_paths(
-                coordinator, _actor(args.actor), args.paths
-            )
+            return_code, payload, human = _check_paths(coordinator, _actor(args.actor), args.paths)
         elif args.command == "protect":
             epoch = coordinator.protect_workspace(_actor(args.actor))
             payload = {"ok": True, "workspace": dict(epoch)}
             human = f"protected {epoch['target']} at {epoch['tip']}"
         elif args.command == "reconcile":
             reconciled = coordinator.reconcile_workspace(
-                _actor(args.actor), expected_epoch=args.expected_epoch, reason=args.reason,
+                _actor(args.actor),
+                expected_epoch=args.expected_epoch,
+                reason=args.reason,
             )
             payload = {"ok": True, "workspace": dict(reconciled)}
             human = f"reconciled workspace; epoch {reconciled['epoch']}"
@@ -403,6 +491,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 human += f"; {len(wal_result.ref_locks)} ref lock(s) held"
             if wal_result.temp_indexes:
                 human += f"; {len(wal_result.temp_indexes)} temp index(es) present"
+        elif args.command == "gate":
+            if args.admit is not None:
+                coordinator.repo.admit_payload_gate(args.admit, expected_sha256=args.sha256)
+            if args.commit_payload is not None:
+                named, origin = args.commit_payload, "commit_payload"
+            else:
+                named, origin = os.environ.get("ONETREE_COMMIT_PAYLOAD"), "environment"
+            gate_payload = _gate_payload(coordinator.repo, named, origin)
+            return_code = 0 if gate_payload["matches"] else 1
+            payload = {"ok": True, "gate": gate_payload}
+            human = _gate_human(gate_payload)
         elif args.command == "gc":
             gc_result = coordinator.gc(_actor(args.actor))
             payload = {
@@ -461,7 +560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # whatever the detail carries (Round BF4 DUO).
             for item in divergences:
                 where = [
-                    f"{name} {item[name]}" for name in ("commit", "operation")
+                    f"{name} {item[name]}"
+                    for name in ("commit", "operation")
                     if item.get(name) is not None
                 ]
                 suffix_text = f" ({', '.join(where)})" if where else ""

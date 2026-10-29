@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import stat
 import subprocess
 import sys
@@ -23,9 +24,11 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from conftest import GitFixture
 
 from onetree.bench import (
     SCHEMA,
@@ -387,9 +390,7 @@ def _synthetic_run(
 
     v3 = schema == SCHEMA
     grid = Grid(writers=2, tasks=1, files=2, conflict=1.0, jitter_ms=0)
-    corpus = (
-        corpus_module.build(grid, seed) if v3 else legacy_corpus.build(grid, SeedKey(seed))
-    )
+    corpus = corpus_module.build(grid, seed) if v3 else legacy_corpus.build(grid, SeedKey(seed))
     root.mkdir()
     referee = root / "harness" / "referee_check.py"
     referee.parent.mkdir()
@@ -416,11 +417,7 @@ def _synthetic_run(
             path=path,
             token=task.token(path),
             content_sha256=_sha(content),
-            **(
-                {"checkout": checkout, "index": systems.index_label(system, task, 1)}
-                if v3
-                else {}
-            ),
+            **({"checkout": checkout, "index": systems.index_label(system, task, 1)} if v3 else {}),
         )
         if lose and writer == 1:
             log.emit(
@@ -1294,18 +1291,77 @@ def test_cli_runs_all_three_systems_and_its_receipts_verify(
     worktree = report["summary"]["worktree"]
     assert (worktree["lost_work.lost"], worktree["integrity.failed"]) == (0, 0)
     inputs = receipts.read_json(out / "run.json")
+    setup = [
+        e for e in events_module.read(out / "events" / "onetree.jsonl") if e["kind"] == "setup"
+    ]
+    observed = setup[0]["detail"]["gate_admission"]["sha256"]
+    assert inputs["gate"]["admitted_pin_sha256"] == observed == _sha256_path(_gate())
     assert inputs["gate"]["matches_admitted_pin"] is True
     assert inputs["grid"]["status"] == "PLACEHOLDER: not amended (task 25)"
     assert cli.main(["verify", "--run", str(out), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["voids"] == []
     assert cli.main(["compare", "--first", str(out), "--second", str(out)]) == 0
     assert capsys.readouterr().out == f"ok: {out}\n"
+
+    # run.json claiming an admission other than the one setup observed is void, even when the
+    # record is self-consistent and freshly frozen.
+    forged = tmp_path / "forged"
+    shutil.copytree(out, forged, symlinks=True)
+    _edit_json(
+        forged / "run.json",
+        lambda r: r["gate"].update(admitted_pin_sha256="f" * 64, matches_admitted_pin=False),
+    )
+    _refreeze(forged)
+    voids = receipts.verify(forged)["voids"]
+    assert voids == [
+        {
+            "what": "gate",
+            "detail": "the admission the onetree setup observed differs from run.json",
+            "observed": observed,
+            "recorded": "f" * 64,
+        }
+    ]
     part = out / "events" / "parts" / "onetree-w0.jsonl"
     part.write_text(part.read_text(encoding="utf-8") * 2, encoding="utf-8")
     assert cli.main(["verify", "--run", str(out)]) == 1
     assert capsys.readouterr().out.startswith("failed: ")
     assert cli.main(["compare", "--first", str(out), "--second", str(out)]) == 1
     assert capsys.readouterr().out.startswith("failed: ")
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_the_recorded_admission_is_read_back_and_can_disagree(
+    tmp_path: Path, git_repo: GitFixture
+) -> None:
+    gate = _gate()
+    out = tmp_path / "out"
+    out.mkdir()
+    arm = SimpleNamespace(checkout=git_repo.root)
+    inputs: dict[str, Any] = {
+        "gate": {
+            "path": str(gate),
+            "sha256": "e" * 64,
+            "admitted_pin_sha256": None,
+            "matches_admitted_pin": False,
+        }
+    }
+    runner._observe_admission(out, arm, inputs)  # type: ignore[arg-type]
+    assert inputs["gate"]["admitted_pin_sha256"] == _sha256_path(gate)
+    assert inputs["gate"]["matches_admitted_pin"] is False
+    assert receipts.read_json(out / "run.json") == inputs
+
+    inputs["gate"]["sha256"] = _sha256_path(gate)
+    runner._observe_admission(out, arm, inputs)  # type: ignore[arg-type]
+    assert inputs["gate"]["matches_admitted_pin"] is True
+
+    for key in ("onetree.payloadGate", "onetree.payloadGateSha256"):
+        git_repo.git("config", "--local", "--unset-all", key)
+    runner._observe_admission(out, arm, inputs)  # type: ignore[arg-type]
+    assert inputs["gate"]["admitted_pin_sha256"] is None
+    assert inputs["gate"]["matches_admitted_pin"] is False
 
 
 def test_cli_refuses_bad_invocations_without_touching_output(

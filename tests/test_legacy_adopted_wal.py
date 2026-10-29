@@ -107,7 +107,8 @@ def _adopt_legacy(git_repo: GitFixture, shape: str) -> tuple[str, str]:
 
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
 def test_legacy_adopted_record_opens_and_verifies_against_its_commit(
-    git_repo: GitFixture, shape: str,
+    git_repo: GitFixture,
+    shape: str,
 ) -> None:
     commit, scalar = _adopt_legacy(git_repo, shape)
     coordinator = Coordinator(git_repo.root)
@@ -151,10 +152,18 @@ _FORGED = [
 
 @pytest.mark.parametrize(("values", "recorded"), _FORGED)
 def test_legacy_record_is_refused_when_the_commit_does_not_carry_it(
-    git_repo: GitFixture, values: list[str], recorded: str,
+    git_repo: GitFixture,
+    values: list[str],
+    recorded: str,
 ) -> None:
-    commit = _legacy_commit(git_repo, values) if values else git_repo.external_commit(
-        "a.txt", "legacy bytes\n", "no trailer here\n",
+    commit = (
+        _legacy_commit(git_repo, values)
+        if values
+        else git_repo.external_commit(
+            "a.txt",
+            "legacy bytes\n",
+            "no trailer here\n",
+        )
     )
     _persist(git_repo, _legacy_document(git_repo, commit, recorded))
     coordinator = Coordinator(git_repo.root)
@@ -195,7 +204,11 @@ def test_ordinary_work_continues_after_legacy_history(git_repo: GitFixture) -> N
     assert git_repo.oid() == landed.commit
     events = coordinator.inspect_wal().events
     assert [event.kind for event in events] == [
-        "adopted", "session_register", "claim", "land_intent", "landed",
+        "adopted",
+        "session_register",
+        "claim",
+        "land_intent",
+        "landed",
     ]
     assert all(event.document["v"] == 1 for event in events[1:] if event.kind != "adopted")
     assert coordinator.inspect_wal().consistent
@@ -203,7 +216,8 @@ def test_ordinary_work_continues_after_legacy_history(git_repo: GitFixture) -> N
     # A broker commit the WAL never recorded is still reported and adoptable:
     # legacy verification conceals nothing new.
     unrecorded = git_repo.external_commit(
-        "a.txt", "unrecorded broker bytes\n",
+        "a.txt",
+        "unrecorded broker bytes\n",
         f"unrecorded landing\n\nOnetree-Operation: {uuid.uuid4().hex}",
     )
     report = coordinator.inspect_wal()
@@ -220,23 +234,35 @@ def test_ordinary_work_continues_after_legacy_history(git_repo: GitFixture) -> N
 def test_current_writer_never_writes_the_legacy_version(git_repo: GitFixture) -> None:
     coordinator = Coordinator(git_repo.root)
     commit = _legacy_commit(git_repo, [_FIRST])
-    current = Wal.document("adopted", "operator", {
-        "commit": commit, "expected_head": git_repo.base, "operation": _FIRST,
-        "target": "refs/heads/main",
-        "tree": git_repo.git("rev-parse", f"{commit}^{{tree}}").stdout.strip(),
-    })
+    current = Wal.document(
+        "adopted",
+        "operator",
+        {
+            "commit": commit,
+            "expected_head": git_repo.base,
+            "operation": _FIRST,
+            "target": "refs/heads/main",
+            "tree": git_repo.git("rev-parse", f"{commit}^{{tree}}").stdout.strip(),
+        },
+    )
     assert current["v"] == 2
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         coordinator.wal.try_append([{**current, "v": 1}], coordinator.wal.head())
     assert coordinator.wal.head() is None
 
 
-@pytest.mark.parametrize(("version", "message"), [
-    (3, "does not match its kind"),
-    (5, "unsupported WAL schema version"),
-])
+@pytest.mark.parametrize(
+    ("version", "message"),
+    [
+        (3, "does not match its kind"),
+        (5, "does not match its kind"),
+        (6, "unsupported WAL schema version"),
+    ],
+)
 def test_other_adopted_versions_stay_refused(
-    git_repo: GitFixture, version: int, message: str,
+    git_repo: GitFixture,
+    version: int,
+    message: str,
 ) -> None:
     commit = _legacy_commit(git_repo, [_FIRST])
     document = _legacy_document(git_repo, commit, _FIRST)
@@ -263,7 +289,8 @@ def test_malformed_legacy_data_stays_refused(git_repo: GitFixture) -> None:
 )
 @pytest.mark.parametrize("shape", sorted(_SHAPES))
 def test_actual_historical_writer_output_opens_with_the_current_reader(
-    git_repo: GitFixture, shape: str,
+    git_repo: GitFixture,
+    shape: str,
 ) -> None:
     """Provenance: the record the real 9d2ef3b CLI persists, not a hand-built one."""
     values, scalar = _SHAPES[shape]
@@ -277,7 +304,10 @@ def test_actual_historical_writer_output_opens_with_the_current_reader(
     environment.pop("COVERAGE_PROCESS_START", None)
     argv = [sys.executable, "-B", "-m", "onetree.cli", "wal", "--repo", str(git_repo.root)]
     adopted = subprocess.run(
-        [*argv, "--adopt", "--json"], env=environment, capture_output=True, text=True,
+        [*argv, "--adopt", "--json"],
+        env=environment,
+        capture_output=True,
+        text=True,
         check=False,
     )
     assert adopted.returncode == 0, (adopted.stdout, adopted.stderr)
@@ -296,31 +326,47 @@ def test_actual_historical_writer_output_opens_with_the_current_reader(
 _LEGACY_MESSAGES = [
     pytest.param(b"subject\n\nOnetree-Operation: " + _FIRST.encode(), _FIRST, id="single"),
     pytest.param(
-        b"subject\n\nOnetree-Operation: " + _FIRST.encode() + b"\nOnetree-Operation: "
-        + _SECOND.encode(), f"{_FIRST},{_SECOND}", id="repeated-joined",
+        b"subject\n\nOnetree-Operation: "
+        + _FIRST.encode()
+        + b"\nOnetree-Operation: "
+        + _SECOND.encode(),
+        f"{_FIRST},{_SECOND}",
+        id="repeated-joined",
     ),
     pytest.param(
         b"subject\n\nOnetree-Operation: " + f"{_FIRST},{_SECOND}".encode(),
-        f"{_FIRST},{_SECOND}", id="literal-comma-kept",
+        f"{_FIRST},{_SECOND}",
+        id="literal-comma-kept",
     ),
     pytest.param(
         b"subject\n\n# comment\nOnetree-Operation: " + _FIRST.encode() + b"\r\n",
-        _FIRST, id="comment-and-crlf",
+        _FIRST,
+        id="comment-and-crlf",
     ),
     pytest.param(
         b"subject\n\nOnetree-Operation: " + _FIRST.encode() + b"\n  " + _SECOND.encode(),
-        f"{_FIRST} {_SECOND}", id="folded-continuation",
+        f"{_FIRST} {_SECOND}",
+        id="folded-continuation",
     ),
     pytest.param(
         b"subject\n\nprose line\nSigned-off-by: x <x@example.invalid>\nOnetree-Operation: "
-        + _FIRST.encode(), _FIRST, id="generated-prefix-quorum",
+        + _FIRST.encode(),
+        _FIRST,
+        id="generated-prefix-quorum",
     ),
     pytest.param(
-        b"subject\n\nOnetree-Operation: " + _FIRST.encode() + b"\n--- \nOnetree-Operation: "
-        + _SECOND.encode(), _FIRST, id="divider-ends-message",
+        b"subject\n\nOnetree-Operation: "
+        + _FIRST.encode()
+        + b"\n--- \nOnetree-Operation: "
+        + _SECOND.encode(),
+        _FIRST,
+        id="divider-ends-message",
     ),
-    pytest.param(b"subject\n\nprose only\nOnetree-Operation: " + _FIRST.encode(), None,
-                 id="prose-block-is-not-trailers"),
+    pytest.param(
+        b"subject\n\nprose only\nOnetree-Operation: " + _FIRST.encode(),
+        None,
+        id="prose-block-is-not-trailers",
+    ),
     pytest.param(b"subject\n\nOther-Key: value", None, id="no-landing-key"),
     pytest.param(b"subject only", None, id="no-block"),
     pytest.param(b"", None, id="empty"),
@@ -330,7 +376,8 @@ _LEGACY_MESSAGES = [
 
 @pytest.mark.parametrize(("raw_message", "expected"), _LEGACY_MESSAGES)
 def test_legacy_parser_keeps_the_historical_writer_rules(
-    raw_message: bytes, expected: str | None,
+    raw_message: bytes,
+    expected: str | None,
 ) -> None:
     assert _legacy_landing_operation(raw_message, commit="fixture") == expected
 

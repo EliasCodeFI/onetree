@@ -10,7 +10,6 @@ asserts the shape of the gap rather than pretending it is closed.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import signal
 import subprocess
@@ -19,7 +18,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import GitFixture
+from conftest import GitFixture, admit_gate
 
 from onetree import git as git_module
 from onetree.core import Coordinator
@@ -99,7 +98,7 @@ def _write_forking_gate(
 
 
 def _stage(git_repo: GitFixture, gate: Path) -> Coordinator:
-    git_module.PAYLOAD_GATE_SOURCE_SHA256 = hashlib.sha256(gate.read_bytes()).hexdigest()
+    admit_gate(git_repo.root, gate)
     coordinator = Coordinator(git_repo.root, commit_payload=gate)
     session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     coordinator.claim("alpha", [str(git_repo.root / "a.txt")])

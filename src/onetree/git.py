@@ -60,9 +60,12 @@ _TEMP_INDEX_NAME = re.compile(r"index-(?P<pid>\d+)-(?P<start>\d+)-[0-9a-f]{12}\Z
 _LOCK_ATTEMPTS = 4
 _LOCK_BACKOFF_SECONDS = 0.02
 PAYLOAD_GATE_TIMEOUT_SECONDS = 3600.0
-PAYLOAD_GATE_SOURCE_SHA256 = (
-    "c717c77d21bfe6b6ddb5c92fd8c45a836806c9e2c793237d524971c63815b424"
-)
+PAYLOAD_GATE_PATH_KEY = "onetree.payloadGate"
+PAYLOAD_GATE_SHA256_KEY = "onetree.payloadGateSha256"
+"""Repository configuration naming the operator's admitted gate and its SHA-256."""
+
+_REPOSITORY_CONFIG_SCOPES = frozenset({"local", "worktree"})
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 PAYLOAD_GATE_ENVIRONMENT_NAMES = (
     "PATH",
     "LC_ALL",
@@ -243,10 +246,7 @@ def _landing_marker_positions(line: bytes) -> tuple[int, ...]:
 
     positions = [token_length]
     separator = token_length
-    while (
-        separator < len(line)
-        and line[separator : separator + 1] in (b" ", b"\t")
-    ):
+    while separator < len(line) and line[separator : separator + 1] in (b" ", b"\t"):
         separator += 1
     if separator < len(line) and separator != token_length:
         positions.append(separator)
@@ -327,10 +327,7 @@ def _landing_line_views(
 
     raw_lines = tuple(raw_message.split(b"\n"))
     if b"\r" in raw_message:
-        normalized_lines = tuple(
-            line[:-1] if line.endswith(b"\r") else line
-            for line in raw_lines
-        )
+        normalized_lines = tuple(line[:-1] if line.endswith(b"\r") else line for line in raw_lines)
         return ((normalized_lines, False), (raw_lines, True))
     return ((raw_lines, False),)
 
@@ -419,9 +416,7 @@ def _reduce_landing_ids(
                         operation = _decode_landing_slice(candidate, start, end)
                     if length in recorded.byte_lengths:
                         if operation is None:  # pragma: no cover - condition decodes
-                            raise AssertionError(
-                                "recorded-length candidate was not decoded"
-                            )
+                            raise AssertionError("recorded-length candidate was not decoded")
                         if operation in recorded.values:
                             return frozenset({operation})
                     if family_smallest is None:
@@ -433,18 +428,12 @@ def _reduce_landing_ids(
                             raise AssertionError("pending candidate was not decoded")
                         if operation not in pending.values:
                             family_not_pending = operation
-                    if (
-                        family_not_pending is not None
-                        and length >= recorded.max_byte_length
-                    ):
+                    if family_not_pending is not None and length >= recorded.max_byte_length:
                         break
-                if family_smallest is not None and (
-                    smallest is None or family_smallest < smallest
-                ):
+                if family_smallest is not None and (smallest is None or family_smallest < smallest):
                     smallest = family_smallest
                 if family_not_pending is not None and (
-                    smallest_not_pending is None
-                    or family_not_pending < smallest_not_pending
+                    smallest_not_pending is None or family_not_pending < smallest_not_pending
                 ):
                     smallest_not_pending = family_not_pending
     witness = smallest_not_pending if smallest_not_pending is not None else smallest
@@ -463,10 +452,7 @@ def _legacy_landing_operation(raw_message: bytes, *, commit: str) -> str | None:
     audit that detects unrecorded landings never consults it.
     """
 
-    lines = [
-        line[:-1] if line.endswith(b"\r") else line
-        for line in raw_message.split(b"\n")
-    ]
+    lines = [line[:-1] if line.endswith(b"\r") else line for line in raw_message.split(b"\n")]
     for index, line in enumerate(lines):
         if line.startswith(b"---") and (
             len(line) == 3 or (len(line) > 3 and line[3] in b" \t\v\f\r")
@@ -521,11 +507,7 @@ def _legacy_landing_operation(raw_message: bytes, *, commit: str) -> str | None:
     if not all_trailers and not generated_quorum:
         return None
 
-    values = [
-        value.strip(b" \t")
-        for key, value in parsed
-        if key.lower() == _LANDING_TRAILER_BYTES
-    ]
+    values = [value.strip(b" \t") for key, value in parsed if key.lower() == _LANDING_TRAILER_BYTES]
     if not values:
         return None
     try:
@@ -598,6 +580,72 @@ class LandedEvidence:
     parents: tuple[str, ...]
     tree: str
     operations: frozenset[str]
+
+
+@dataclass(frozen=True)
+class PayloadGateAdmission:
+    """The payload gate one repository's operator admitted, by path and SHA-256."""
+
+    path: str
+    sha256: str
+
+    def payload(self) -> dict[str, str]:
+        return {"path": self.path, "sha256": self.sha256}
+
+
+def _read_regular_file(path: Path, *, what: str) -> bytes:
+    """Read ``path`` only if the opened file is regular; a FIFO or device never blocks."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        raise PayloadGateError(
+            f"commit payload gate source could not be {what}: {error}", gate=str(path)
+        ) from error
+    try:
+        regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except OSError:
+        os.close(descriptor)
+        raise
+    if not regular:
+        os.close(descriptor)
+        raise PayloadGateError("commit payload gate is not a regular file", gate=str(path))
+    with os.fdopen(descriptor, "rb") as stream:
+        try:
+            return stream.read()
+        except OSError as error:
+            raise PayloadGateError(
+                f"commit payload gate source could not be {what}: {error}", gate=str(path)
+            ) from error
+
+
+def _read_gate_source(gate_source: Path | str) -> tuple[Path, bytes, str]:
+    try:
+        gate = Path(gate_source).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise PayloadGateError(
+            f"commit payload gate cannot be resolved: {error}",
+            gate=str(gate_source),
+        ) from error
+    gate_bytes = _read_regular_file(gate, what="read")
+    return gate, gate_bytes, hashlib.sha256(gate_bytes).hexdigest()
+
+
+def payload_gate_source(
+    gate_source: Path | str | None, admission: PayloadGateAdmission | None
+) -> str | None:
+    """The gate landing reads: the named one when one is named, else the admitted path."""
+
+    if gate_source is not None and str(gate_source).strip():
+        return str(gate_source)
+    return None if admission is None else admission.path
+
+
+def read_payload_gate_source(gate_source: Path | str) -> tuple[Path, str]:
+    """Resolve and hash a gate under landing's file rules; failures are `PayloadGateError`."""
+
+    gate, _, digest = _read_gate_source(gate_source)
+    return gate, digest
 
 
 @dataclass(frozen=True)
@@ -688,8 +736,7 @@ class Repository:
         ):
             environment.pop(name, None)
         for name in [
-            key for key in environment
-            if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            key for key in environment if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
         ]:
             environment.pop(name, None)
         environment.setdefault("GIT_AUTHOR_NAME", "onetree session")
@@ -757,9 +804,7 @@ class Repository:
         """
         source = cls._environment()
         environment: dict[str, str] = {
-            "PATH": os.pathsep.join(
-                entry for entry in os.defpath.split(os.pathsep) if entry
-            ),
+            "PATH": os.pathsep.join(entry for entry in os.defpath.split(os.pathsep) if entry),
             "GIT_AUTHOR_NAME": "onetree session",
             "GIT_AUTHOR_EMAIL": "onetree@localhost",
             "GIT_COMMITTER_NAME": "onetree broker",
@@ -1131,9 +1176,10 @@ class Repository:
     ) -> bool:
         """Whether the files backend stores this exact name in loose or packed form."""
 
-        return self._loose_ref_path_is_exact_storage(
-            self.git_path(reference), reference
-        ) or os.fsencode(reference) in packed_names
+        return (
+            self._loose_ref_path_is_exact_storage(self.git_path(reference), reference)
+            or os.fsencode(reference) in packed_names
+        )
 
     def _loose_branch_alias_is_dangling(
         self,
@@ -1264,8 +1310,7 @@ class Repository:
             if walk_errors:
                 walk_error = walk_errors[0]
                 raise GitError(
-                    "cannot inspect loose branch refs: "
-                    f"{walk_error.strerror or walk_error}",
+                    f"cannot inspect loose branch refs: {walk_error.strerror or walk_error}",
                     operation="audit-ref-storage",
                 )
 
@@ -1291,11 +1336,8 @@ class Repository:
             status = self._check_ref_format(reference)
             if status == 0:
                 loose = loose_candidates.get(reference)
-                if (
-                    loose is not None
-                    and self._loose_branch_alias_is_dangling(
-                        loose, reference, packed_names
-                    )
+                if loose is not None and self._loose_branch_alias_is_dangling(
+                    loose, reference, packed_names
                 ):
                     continue
                 valid.add(reference)
@@ -1584,6 +1626,99 @@ class Repository:
         oid = self.git_text(*arguments, input_bytes=(message.rstrip("\n") + "\n").encode())
         return self.validate_oid(oid, label="commit")
 
+    def _repository_config_value(self, key: str) -> str | None:
+        """The single value this repository's own scopes give ``key``, or ``None``.
+
+        Only the scopes `referee.configuration` admits count, for the same reason: an
+        operator's global, system or command-line value is not the repository's.
+        """
+
+        result = self.git("config", "--null", "--show-scope", "--get-all", key, check=False)
+        if result.returncode == 1:
+            return None
+        if result.returncode != 0 or not result.stdout.endswith(b"\0"):
+            raise PayloadGateError(
+                "cannot read payload gate admission", key=key, returncode=result.returncode
+            )
+        try:
+            fields = result.stdout[:-1].decode("utf-8", errors="strict").split("\0")
+        except UnicodeError as error:
+            raise PayloadGateError("payload gate admission is not UTF-8", key=key) from error
+        if len(fields) % 2:
+            raise PayloadGateError("cannot read payload gate admission", key=key)
+        values = [
+            value
+            for scope, value in zip(fields[::2], fields[1::2], strict=True)
+            if scope in _REPOSITORY_CONFIG_SCOPES
+        ]
+        if not values:
+            return None
+        if len(values) != 1:
+            raise PayloadGateError(
+                "payload gate admission must have one value", key=key, values=len(values)
+            )
+        return values[0]
+
+    def payload_gate_admission(self) -> PayloadGateAdmission | None:
+        """The repository's admitted gate, or ``None`` when its operator admitted none."""
+
+        path = self._repository_config_value(PAYLOAD_GATE_PATH_KEY)
+        digest = self._repository_config_value(PAYLOAD_GATE_SHA256_KEY)
+        if path is None and digest is None:
+            return None
+        if path is None or digest is None or not path.strip():
+            raise PayloadGateError(
+                "payload gate admission is incomplete",
+                path_key=PAYLOAD_GATE_PATH_KEY,
+                sha256_key=PAYLOAD_GATE_SHA256_KEY,
+                path=path,
+                sha256=digest,
+            )
+        if _SHA256_HEX.fullmatch(digest) is None:
+            raise PayloadGateError(
+                "payload gate admission is not a lowercase hex SHA-256",
+                sha256_key=PAYLOAD_GATE_SHA256_KEY,
+                sha256=digest,
+            )
+        return PayloadGateAdmission(path, digest)
+
+    def admit_payload_gate(
+        self, gate_source: Path | str, *, expected_sha256: str | None = None
+    ) -> PayloadGateAdmission:
+        """Admit the gate file's current bytes as this repository's payload gate.
+
+        With ``expected_sha256`` the operator names the digest they reviewed, and admission
+        refuses bytes that differ from it.
+        """
+
+        if expected_sha256 is not None and _SHA256_HEX.fullmatch(expected_sha256) is None:
+            raise PayloadGateError(
+                "expected payload gate digest is not a lowercase hex SHA-256",
+                expected_sha256=expected_sha256,
+            )
+        gate, _, digest = _read_gate_source(gate_source)
+        # The path is kept as named, not resolved: a symlink repointed later must make the
+        # bytes landing reads differ from the admitted digest.
+        named = os.path.abspath(Path(gate_source).expanduser())
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise PayloadGateError(
+                "commit payload gate source does not match the digest named for admission",
+                gate=str(gate),
+                expected_sha256=expected_sha256,
+                observed_sha256=digest,
+            )
+        self.git("config", "--local", "--replace-all", PAYLOAD_GATE_SHA256_KEY, digest)
+        self.git("config", "--local", "--replace-all", PAYLOAD_GATE_PATH_KEY, named)
+        admission = PayloadGateAdmission(named, digest)
+        recorded = self.payload_gate_admission()
+        if recorded != admission:
+            raise PayloadGateError(
+                "payload gate admission did not read back as written",
+                written=admission.payload(),
+                recorded=None if recorded is None else recorded.payload(),
+            )
+        return admission
+
     def _run_payload_gate(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Run the pinned gate as the leader of its own process group.
 
@@ -1629,36 +1764,28 @@ class Repository:
         """Require an exact CLEAN verdict over one immutable candidate commit."""
 
         commit = self.validate_oid(commit, label="candidate commit")
-        if gate_source is None or not str(gate_source).strip():
+        admission = self.payload_gate_admission()
+        source = payload_gate_source(gate_source, admission)
+        if source is None:
             raise PayloadGateError(
                 "commit payload gate is not configured",
                 environment="ONETREE_COMMIT_PAYLOAD",
+                config=PAYLOAD_GATE_PATH_KEY,
             )
-        try:
-            gate = Path(gate_source).expanduser().resolve(strict=True)
-        except OSError as error:
+        gate, gate_bytes, gate_source_sha256 = _read_gate_source(source)
+        if admission is None:
             raise PayloadGateError(
-                f"commit payload gate cannot be resolved: {error}",
-                gate=str(gate_source),
-            ) from error
-        if not gate.is_file():
-            raise PayloadGateError(
-                "commit payload gate is not a regular file",
+                "commit payload gate is not admitted for this repository",
                 gate=str(gate),
+                config=PAYLOAD_GATE_SHA256_KEY,
+                observed_sha256=gate_source_sha256,
             )
-        try:
-            gate_bytes = gate.read_bytes()
-            gate_source_sha256 = hashlib.sha256(gate_bytes).hexdigest()
-        except OSError as error:
-            raise PayloadGateError(
-                f"commit payload gate source could not be read: {error}",
-                gate=str(gate),
-            ) from error
-        if gate_source_sha256 != PAYLOAD_GATE_SOURCE_SHA256:
+        if gate_source_sha256 != admission.sha256:
             raise PayloadGateError(
                 "commit payload gate source does not match admitted SHA-256",
                 gate=str(gate),
-                expected_sha256=PAYLOAD_GATE_SOURCE_SHA256,
+                admitted_gate=admission.path,
+                expected_sha256=admission.sha256,
                 observed_sha256=gate_source_sha256,
             )
 
@@ -1701,13 +1828,7 @@ class Repository:
                 gate=str(gate),
             ) from error
 
-        try:
-            source_sha256_after = hashlib.sha256(gate.read_bytes()).hexdigest()
-        except OSError as error:
-            raise PayloadGateError(
-                f"commit payload gate source could not be re-read: {error}",
-                gate=str(gate),
-            ) from error
+        source_sha256_after = hashlib.sha256(_read_regular_file(gate, what="re-read")).hexdigest()
         if source_sha256_after != gate_source_sha256:
             raise PayloadGateError(
                 "commit payload gate source changed while executing",
@@ -2051,12 +2172,24 @@ class Repository:
             result = self._invoke(
                 directory,
                 (
-                    "-c", "trailer.separators=:", "-c", "core.commentString=#",
-                    "interpret-trailers", "--no-divider", "--where", "end",
-                    "--if-exists", "add", "--if-missing", "add",
-                    "--trailer", f"{LANDING_TRAILER}: {operation}",
-                    "--trailer", f"Onetree-Intent: {intent}",
-                    "--trailer", f"Onetree-Actor: {actor}",
+                    "-c",
+                    "trailer.separators=:",
+                    "-c",
+                    "core.commentString=#",
+                    "interpret-trailers",
+                    "--no-divider",
+                    "--where",
+                    "end",
+                    "--if-exists",
+                    "add",
+                    "--if-missing",
+                    "add",
+                    "--trailer",
+                    f"{LANDING_TRAILER}: {operation}",
+                    "--trailer",
+                    f"Onetree-Intent: {intent}",
+                    "--trailer",
+                    f"Onetree-Actor: {actor}",
                 ),
                 input_bytes=(body.rstrip("\n") + "\n").encode("utf-8"),
                 environment={
@@ -2112,7 +2245,10 @@ class Repository:
 
         commits = self._walked_commit_oids(target, excludes)
         witnesses = self._marked_commits_from_oids(
-            commits, reference=target, recorded=recorded, pending=pending,
+            commits,
+            reference=target,
+            recorded=recorded,
+            pending=pending,
         )
         queries = frozenset(ancestry_queries)
         reachable = (

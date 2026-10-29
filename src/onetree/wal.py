@@ -33,8 +33,8 @@ _KIND_VERSIONS = {
     "adopted": 2,
     "refused": 1,
     "gc": 1,
-    "workspace_protect": 3,
-    "workspace_reconcile": 4,
+    "workspace_protect": 5,
+    "workspace_reconcile": 5,
 }
 WAL_READER_VERSION = max(_KIND_VERSIONS.values())
 EVENT_KINDS = frozenset(_KIND_VERSIONS)
@@ -43,7 +43,13 @@ EVENT_KINDS = frozenset(_KIND_VERSIONS)
 # comma-joined every landing trailer value of the adopted commit (task 70).
 # Such a record is verified under that writer's semantics by the coordinator
 # and is never written again: the current writer refuses it.
-_LEGACY_KIND_VERSIONS: dict[str, frozenset[int]] = {"adopted": frozenset({1})}
+# ``workspace_protect`` v3 and ``workspace_reconcile`` v4 baselines predate payload gate
+# admission and carry no ``gate`` field; the coordinator reads them as "no gate admitted".
+_LEGACY_KIND_VERSIONS: dict[str, frozenset[int]] = {
+    "adopted": frozenset({1}),
+    "workspace_protect": frozenset({3}),
+    "workspace_reconcile": frozenset({4}),
+}
 _DOCUMENT_KEYS = frozenset({"v", "event", "event_id", "actor", "time", "data"})
 # The raw body of the tree ``build_chain`` writes, ahead of the blob's binary object ID.
 _CANONICAL_TREE_PREFIX = b"100644 event.json\0"
@@ -299,7 +305,7 @@ class Wal:
                     or not self._hashes_to(kind, body, tree)
                 ):
                     return None
-                blobs.append(body[len(_CANONICAL_TREE_PREFIX):].hex())
+                blobs.append(body[len(_CANONICAL_TREE_PREFIX) :].hex())
             for index, (blob, kind, body) in enumerate(
                 self.repo.cat_file_batch(blobs, reference=WAL_REF)
             ):

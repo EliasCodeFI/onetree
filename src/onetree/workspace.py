@@ -7,8 +7,16 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from onetree import referee
-from onetree.errors import GitError
+from onetree.errors import GitError, PayloadGateError
 from onetree.git import Repository
+
+_BASELINE_FIELDS = frozenset({"target", "tip", "logs", "referee"})
+_GATE_FIELDS = frozenset({"path", "sha256"})
+
+
+def _gate(repo: Repository) -> dict[str, str] | None:
+    admission = repo.payload_gate_admission()
+    return None if admission is None else admission.payload()
 
 
 def _log(repo: Repository, reference: str, *, allow_empty: bool = False) -> bytes:
@@ -44,22 +52,48 @@ def baseline(repo: Repository, *, allow_empty: bool = False) -> dict[str, Any]:
                 repo.validate_oid(fields[0].decode("ascii"))
                 repo.validate_oid(fields[1].decode("ascii"))
         logs[reference] = {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-    return {"target": target, "tip": tip, "logs": logs,
-            "referee": list(referee.configuration(repo))}
+    return {
+        "target": target,
+        "tip": tip,
+        "logs": logs,
+        "referee": list(referee.configuration(repo)),
+        "gate": _gate(repo),
+    }
 
 
-def validate(value: Any, repo: Repository, *, allow_empty: bool = False) -> None:
-    if not isinstance(value, dict) or set(value) != {"target", "tip", "logs", "referee"}:
+def validate(
+    value: Any, repo: Repository, *, allow_empty: bool = False, legacy: bool = False
+) -> None:
+    """A legacy baseline predates gate admission and carries no ``gate`` field."""
+
+    fields = _BASELINE_FIELDS if legacy else _BASELINE_FIELDS | {"gate"}
+    if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("invalid workspace baseline")
+    gate = value.get("gate")
+    if gate is not None and (
+        not isinstance(gate, dict)
+        or set(gate) != _GATE_FIELDS
+        or not isinstance(gate["path"], str)
+        or not gate["path"].strip()
+        or not isinstance(gate["sha256"], str)
+        or len(gate["sha256"]) != 64
+        or any(char not in "0123456789abcdef" for char in gate["sha256"])
+    ):
+        raise ValueError("invalid protected payload gate admission")
     if not isinstance(value["target"], str) or not isinstance(value["tip"], str):
         raise ValueError("invalid workspace object identity")
     target = repo.validate_branch_ref(value["target"])
     repo.validate_oid(value["tip"])
     configured = value["referee"]
-    if (not isinstance(configured, list) or len(configured) != 2
-            or (configured[0] is not None and (
-                not isinstance(configured[0], str) or not configured[0].strip()))
-            or not referee.valid_seconds(configured[1])):
+    if (
+        not isinstance(configured, list)
+        or len(configured) != 2
+        or (
+            configured[0] is not None
+            and (not isinstance(configured[0], str) or not configured[0].strip())
+        )
+        or not referee.valid_seconds(configured[1])
+    ):
         raise ValueError("invalid protected referee configuration")
     logs = value["logs"]
     if not isinstance(logs, dict) or set(logs) != {"HEAD", target}:
@@ -70,8 +104,10 @@ def validate(value: Any, repo: Repository, *, allow_empty: bool = False) -> None
         if type(checkpoint["size"]) is not int or checkpoint["size"] < int(not allow_empty):
             raise ValueError("invalid reflog checkpoint size")
         digest = checkpoint["sha256"]
-        if not isinstance(digest, str) or len(digest) != 64 or any(
-            char not in "0123456789abcdef" for char in digest
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
         ):
             raise ValueError("invalid reflog checkpoint digest")
         if checkpoint["size"] == 0 and digest != hashlib.sha256(b"").hexdigest():
@@ -79,7 +115,9 @@ def validate(value: Any, repo: Repository, *, allow_empty: bool = False) -> None
 
 
 def violation(
-    repo: Repository, epoch: Mapping[str, Any], transitions: Sequence[tuple[str, str]],
+    repo: Repository,
+    epoch: Mapping[str, Any],
+    transitions: Sequence[tuple[str, str]],
 ) -> str | None:
     """Name what changed in the protected workspace, or None when nothing did.
 
@@ -95,15 +133,22 @@ def violation(
     if list(referee.configuration(repo)) != epoch["referee"]:
         return "protected referee configuration changed"
     try:
+        admitted = _gate(repo)
+    except PayloadGateError as error:
+        return "protected payload gate admission is unreadable: " + str(error)
+    if admitted != epoch["gate"]:
+        return "protected payload gate admission changed"
+    try:
         if repo.symbolic_head() != epoch["target"]:
             return "shared HEAD changed branch or became detached"
         observed = repo.require_commit(str(epoch["target"]))
         for reference, checkpoint in epoch["logs"].items():
             content = _log(repo, reference, allow_empty=checkpoint["size"] == 0)
             offset = checkpoint["size"]
-            if len(content) < offset or hashlib.sha256(content[:offset]).hexdigest() != checkpoint[
-                "sha256"
-            ]:
+            if (
+                len(content) < offset
+                or hashlib.sha256(content[:offset]).hexdigest() != checkpoint["sha256"]
+            ):
                 return "workspace reflog continuity was lost"
             tip = epoch["tip"]
             cursor = 0

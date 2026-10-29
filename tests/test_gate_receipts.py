@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import SHIPPED_PAYLOAD_GATE_SOURCE_SHA256, GitFixture
+from conftest import GitFixture, admit_gate
 from test_cli import _json_call
 from test_defensive import _expose_intent
 from test_payload_gate import _register_and_stage, _write_gate
@@ -95,9 +95,7 @@ def test_real_hook_gate_evidence(
     if configured is None:
         pytest.skip("requires explicit ONETREE_TEST_ESTATE_GATE")
     gate = Path(configured).resolve(strict=True)
-    monkeypatch.setattr(
-        git_module, "PAYLOAD_GATE_SOURCE_SHA256", SHIPPED_PAYLOAD_GATE_SOURCE_SHA256
-    )
+    admitted = admit_gate(git_repo.root, gate)
     for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID"):
         monkeypatch.delenv(name, raising=False)
     identity = "11111111-1111-4111-8111-111111111111"
@@ -162,7 +160,7 @@ def test_real_hook_gate_evidence(
     }
     assert report["verdict"] == ("REFUSE" if case == "red" else "CLEAN")
     assert report["hook_suites"][0]["runtime"] == "sandboxed"
-    assert receipt["gate_source_sha256"] == SHIPPED_PAYLOAD_GATE_SOURCE_SHA256
+    assert receipt["gate_source_sha256"] == admitted
 
 
 def test_recovery_links_original_receipt_without_reauditing(
@@ -317,7 +315,7 @@ def test_historical_gate_origin_is_not_rebound_to_current_clone(
     git_repo.git("clone", "--quiet", str(git_repo.root), str(clone))
     relocated = GitFixture(root=clone, base=git_repo.base)
     relocated.git("fetch", "--quiet", "origin", f"{WAL_REF}:{WAL_REF}")
-    monkeypatch.setattr(git_module, "PAYLOAD_GATE_SOURCE_SHA256", "0" * 64)
+    assert git_module.Repository(clone).payload_gate_admission() is None
     report = Coordinator(clone).inspect_wal()
     assert report.consistent
     intent = next(event for event in report.events if event.kind == "land_intent")

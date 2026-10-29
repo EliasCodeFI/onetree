@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GATE_GIT_LITERAL, SHIPPED_PAYLOAD_GATE_SOURCE_SHA256, GitFixture
+from conftest import _CLEAN_PAYLOAD_GATE_SOURCE, GATE_GIT_LITERAL, GitFixture, admit_gate
 
 from onetree import git as git_module
 from onetree.cli import main
@@ -90,6 +90,13 @@ print(
 )
 """
 
+_CLEAN_GATE_WITH_MARKER = (
+    "import pathlib\n"
+    "pathlib.Path(__MARKER__).write_text('ran', encoding='utf-8')\n"
+    + _CLEAN_PAYLOAD_GATE_SOURCE
+)
+"""The fixture's exact-output CLEAN gate, leaving a marker file that proves it ran."""
+
 _DUPLICATE_KEY_GATE_SOURCE = """\
 import json
 import sys
@@ -117,7 +124,7 @@ def _register_and_stage(
     if admit_source and commit_payload is not None:
         gate = Path(commit_payload)
         if gate.is_file():
-            git_module.PAYLOAD_GATE_SOURCE_SHA256 = hashlib.sha256(gate.read_bytes()).hexdigest()
+            admit_gate(git_repo.root, gate)
     coordinator = Coordinator(git_repo.root, commit_payload=commit_payload)
     session = coordinator.register_session(actor, pid=os.getpid(), ttl=300)
     coordinator.claim(actor, [str(git_repo.root / relative)])
@@ -136,10 +143,6 @@ def _write_gate(path: Path, payload: dict[str, Any], returncode: int) -> Path:
         encoding="utf-8",
     )
     return path
-
-
-def _admit_gate_source(path: Path) -> None:
-    git_module.PAYLOAD_GATE_SOURCE_SHA256 = hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _assert_unchanged(
@@ -193,7 +196,7 @@ def test_configured_refusing_payload_gate_is_not_ignored(
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
-    _admit_gate_source(gate)
+    admit_gate(git_repo.root, gate)
     monkeypatch.setenv("ONETREE_COMMIT_PAYLOAD", str(gate))
     coordinator = _register_and_stage(git_repo, "alpha", "credential-shaped payload\n")
     branch_before = git_repo.oid()
@@ -334,6 +337,7 @@ def test_missing_payload_gate_fails_closed_before_wal_or_branch_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("ONETREE_COMMIT_PAYLOAD", raising=False)
+    _unadmit(git_repo)
     coordinator = _register_and_stage(git_repo, "alpha", "missing gate\n")
     branch_before = git_repo.oid()
     wal_before = coordinator.wal.read().head
@@ -342,6 +346,110 @@ def test_missing_payload_gate_fails_closed_before_wal_or_branch_mutation(
         coordinator.land("alpha")
 
     _assert_unchanged(git_repo, coordinator, branch_before, wal_before)
+
+
+def _unadmit(git_repo: GitFixture) -> None:
+    for key in ("onetree.payloadGate", "onetree.payloadGateSha256"):
+        git_repo.git("config", "--local", "--unset-all", key)
+
+
+def test_a_named_gate_without_repository_admission_fails_closed(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    """A repository whose operator admitted no gate refuses every landing, even one whose
+    caller names a gate that would report CLEAN."""
+
+    marker = tmp_path / "executed"
+    gate = tmp_path / "unadmitted_clean.py"
+    gate.write_text(
+        _CLEAN_GATE_WITH_MARKER.replace("__MARKER__", repr(str(marker))), encoding="utf-8"
+    )
+    _unadmit(git_repo)
+    coordinator = _register_and_stage(
+        git_repo, "alpha", "no admission\n", commit_payload=gate, admit_source=False
+    )
+    branch_before = git_repo.oid()
+    wal_before = coordinator.wal.read().head
+
+    with pytest.raises(PayloadGateError, match="not admitted for this repository") as failure:
+        coordinator.land("alpha")
+
+    assert failure.value.kind == "payload_gate_error"
+    assert failure.value.details["observed_sha256"] == hashlib.sha256(gate.read_bytes()).hexdigest()
+    assert not marker.exists()
+    _assert_unchanged(git_repo, coordinator, branch_before, wal_before)
+
+
+def test_the_admitted_path_is_the_gate_when_none_is_named(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "executed"
+    gate = tmp_path / "admitted_only.py"
+    gate.write_text(
+        _CLEAN_GATE_WITH_MARKER.replace("__MARKER__", repr(str(marker))), encoding="utf-8"
+    )
+    admitted = admit_gate(git_repo.root, gate)
+    monkeypatch.delenv("ONETREE_COMMIT_PAYLOAD", raising=False)
+    coordinator = _register_and_stage(git_repo, "alpha", "admitted path\n", admit_source=False)
+
+    landed = coordinator.land("alpha")
+
+    assert git_repo.oid() == landed.commit
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert landed.gate_receipt is not None
+    assert landed.gate_receipt["gate_source_sha256"] == admitted
+
+
+def test_one_changed_byte_refuses_and_readmission_restores_landing(
+    git_repo: GitFixture,
+    tmp_path: Path,
+) -> None:
+    """Done item 2: admit, land; change one byte, refuse; re-admit, land again."""
+
+    marker = tmp_path / "executed"
+    gate = tmp_path / "operator_gate.py"
+    gate.write_text(
+        _CLEAN_GATE_WITH_MARKER.replace("__MARKER__", repr(str(marker))), encoding="utf-8"
+    )
+    first_digest = git_module.Repository(git_repo.root).admit_payload_gate(gate).sha256
+    coordinator = _register_and_stage(
+        git_repo, "alpha", "first landing\n", commit_payload=gate, admit_source=False
+    )
+    first = coordinator.land("alpha")
+    assert git_repo.oid() == first.commit
+    assert first.gate_receipt is not None
+    assert first.gate_receipt["gate_source_sha256"] == first_digest
+
+    gate.write_bytes(gate.read_bytes() + b"\n")
+    marker.unlink()
+    changed_digest = hashlib.sha256(gate.read_bytes()).hexdigest()
+    assert changed_digest != first_digest
+    coordinator = _register_and_stage(
+        git_repo, "beta", "second landing\n", commit_payload=gate, admit_source=False,
+        relative="b.txt",
+    )
+    branch_before = git_repo.oid()
+    wal_before = coordinator.wal.read().head
+    with pytest.raises(PayloadGateError, match="does not match admitted") as failure:
+        coordinator.land("beta")
+    assert failure.value.payload()["type"] == "payload_gate_error"
+    assert failure.value.details["expected_sha256"] == first_digest
+    assert failure.value.details["observed_sha256"] == changed_digest
+    assert not marker.exists()
+    _assert_unchanged(git_repo, coordinator, branch_before, wal_before)
+
+    readmitted = git_module.Repository(git_repo.root).admit_payload_gate(
+        gate, expected_sha256=changed_digest
+    )
+    assert readmitted.sha256 == changed_digest
+    second = coordinator.land("beta")
+    assert git_repo.oid() == second.commit
+    assert second.gate_receipt is not None
+    assert second.gate_receipt["gate_source_sha256"] == changed_digest
+    assert marker.read_text(encoding="utf-8") == "ran"
 
 
 @pytest.mark.parametrize(
@@ -742,7 +850,7 @@ def test_exact_path_set_does_not_depend_on_gate_output_order(
         },
         0,
     )
-    _admit_gate_source(gate)
+    admit_gate(git_repo.root, gate)
     coordinator = Coordinator(git_repo.root, commit_payload=gate)
     session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     coordinator.claim(
@@ -827,33 +935,14 @@ def test_cli_explicit_gate_overrides_the_environment_default(
     assert coordinator.wal.read().head is not None
 
 
-def test_shipped_payload_gate_digest_is_pinned_to_a_literal() -> None:
-    """The admitted digest is a two-place constant, and this is the second place.
-
-    No other assertion in the suite can reach it. ``clean_commit_payload_gate`` is autouse
-    and rebinds the module global to each test's throwaway gate before any test body runs,
-    so every other reader sees the fixture's value. Measured: replacing the shipped
-    constant with sixty-four zeroes left the entire suite green while admitting a
-    different estate gate.
-
-    Admitting a different gate is a deliberate act, and a deliberate act edits both places.
-    """
-
-    assert SHIPPED_PAYLOAD_GATE_SOURCE_SHA256 == (
-        "c717c77d21bfe6b6ddb5c92fd8c45a836806c9e2c793237d524971c63815b424"
-    )
-
-
-def test_gate_source_digest_is_compared_against_the_shipped_pin(
+def test_gate_source_digest_is_compared_against_the_repository_admission(
     git_repo: GitFixture,
     tmp_path: Path,
 ) -> None:
-    """The comparison must read the shipped pin, not whatever a caller last stored.
+    """The comparison reads the digest this repository admitted, not the caller's gate.
 
-    The literal above fixes the constant's value; this fixes that the check consults it.
-    A gate whose bytes are honest and whose report would be CLEAN is still refused while
-    the shipped pin is in force, and the refusal names that pin as the expected digest --
-    so a comparison rewired to any other source of truth cannot pass here.
+    A gate whose bytes are honest and whose report would be CLEAN is still refused while the
+    repository admits other bytes, and the refusal names the admitted digest and path.
     """
 
     gate = _write_gate(
@@ -867,21 +956,24 @@ def test_gate_source_digest_is_compared_against_the_shipped_pin(
         },
         0,
     )
+    admitted = tmp_path / "clean_commit_payload.py"
     coordinator = _register_and_stage(
         git_repo,
         "alpha",
-        "shipped pin governs\n",
+        "repository admission governs\n",
         commit_payload=gate,
         admit_source=False,
     )
-    git_module.PAYLOAD_GATE_SOURCE_SHA256 = SHIPPED_PAYLOAD_GATE_SOURCE_SHA256
     branch_before = git_repo.oid()
     wal_before = coordinator.wal.read().head
 
     with pytest.raises(PayloadGateError, match="does not match admitted") as failure:
         coordinator.land("alpha")
 
-    assert failure.value.details["expected_sha256"] == SHIPPED_PAYLOAD_GATE_SOURCE_SHA256
+    assert failure.value.details["expected_sha256"] == (
+        hashlib.sha256(admitted.read_bytes()).hexdigest()
+    )
+    assert failure.value.details["admitted_gate"] == str(admitted.resolve())
     assert failure.value.details["observed_sha256"] == hashlib.sha256(gate.read_bytes()).hexdigest()
     _assert_unchanged(git_repo, coordinator, branch_before, wal_before)
 
@@ -1369,14 +1461,11 @@ def test_payload_gate_child_is_not_reachable_through_the_dynamic_loader(
 
 
 _DEFAULT_SHIPPED_GATE = Path.home() / ".claude" / "tools" / "commit_payload.py"
-"""Where the shipped gate lives when nobody names one.
+"""Where the operator's real gate lives when nobody names one.
 
-The pin describes an artifact this repository does not contain, so the only run that can
-exercise it is a run on a machine that HAS that artifact. Keying the check on an environment
-variable made it conditional on an operator remembering the variable; keying it on the file
-makes it conditional on the artifact, which is what the check is actually about. A checkout
-with no estate beside it skips because the check genuinely cannot run there -- not because
-nobody exported anything.
+That artifact is not in this repository, so the only run that can exercise it is a run on a
+machine that HAS it. A checkout with no estate beside it skips because the check genuinely
+cannot run there -- not because nobody exported anything.
 """
 
 
@@ -1384,23 +1473,17 @@ def test_the_shipped_payload_gate_admits_a_benign_landing(
     git_repo: GitFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pinned digest is exercised against the bytes it was written to admit.
+    """The operator's real gate, admitted in this repository, admits a benign landing.
 
-    Every other test in this module runs a purpose-built gate whose digest the fixture
-    rebinds, so the pin comparison in `audit_commit_payload` has never once been asked about
-    the real artifact. That leaves the shipped SHA-256 an unexercised claim, and it leaves a
-    constructed child environment untested against a gate that actually uses one: an
-    environment that starves the real gate would pass every stub in this file.
+    Every other test in this module runs a purpose-built gate, so a constructed child
+    environment is never tested against a gate that actually uses one: an environment that
+    starves the real gate would pass every stub in this file.
 
     The gate exercised is `_DEFAULT_SHIPPED_GATE`, or whatever ONETREE_TEST_SHIPPED_GATE
-    names instead. The outcomes are deliberately different, and only one of them is a skip:
-    an ABSENT default artifact skips, because the check genuinely cannot run here; a default
-    path that EXISTS but is not a regular file fails, because a malformed estate is not the
-    same condition as no estate and silently skipping would hide it; a variable naming a
-    missing file fails, because someone stated an intent that cannot be met; and a digest
-    that does not match the shipped pin FAILS rather than skips -- a stale pin is the finding
-    this test exists for, and skipping on it would report the absence of the check as the
-    absence of a problem.
+    names instead. An ABSENT default artifact skips, because the check genuinely cannot run
+    here; a default path that EXISTS but is not a regular file fails, because a malformed
+    estate is not the same condition as no estate; and a variable naming a missing file
+    fails, because someone stated an intent that cannot be met.
     """
 
     configured = os.environ.get("ONETREE_TEST_SHIPPED_GATE", "")
@@ -1412,16 +1495,8 @@ def test_the_shipped_payload_gate_admits_a_benign_landing(
             pytest.fail(f"the default gate path exists but is not a regular file: {gate}")
         pytest.skip(f"no shipped gate to exercise at {gate}")
 
-    observed = hashlib.sha256(gate.read_bytes()).hexdigest()
-    assert observed == SHIPPED_PAYLOAD_GATE_SOURCE_SHA256, (
-        "the shipped pin no longer matches the configured gate; the pin is stale or the gate "
-        "was replaced"
-    )
-    monkeypatch.setattr(
-        git_module, "PAYLOAD_GATE_SOURCE_SHA256", SHIPPED_PAYLOAD_GATE_SOURCE_SHA256
-    )
     coordinator = _register_and_stage(
-        git_repo, "alpha", "shipped gate integration\n", commit_payload=gate, admit_source=False
+        git_repo, "alpha", "shipped gate integration\n", commit_payload=gate
     )
     native_id = "11111111-1111-4111-8111-111111111111"
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)

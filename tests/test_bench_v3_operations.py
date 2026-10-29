@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shlex
 import sys
@@ -12,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import _CLEAN_PAYLOAD_GATE_SOURCE
+from conftest import _CLEAN_PAYLOAD_GATE_SOURCE, admit_gate
 from test_bench import HOT, Bench
 
 from onetree import git as git_module
@@ -134,8 +133,15 @@ def test_staged_tokens_refuse_an_index_they_cannot_read(tmp_path: Path) -> None:
     missing, unmerged = tmp_path / "missing-blob-index", tmp_path / "unmerged-index"
     absent = "0" * (len(blob) - 1) + "1"
     systems.subprocess.run(  # noqa: S603 - argv-only git
-        [systems.GIT, "-C", str(arm.checkout), "update-index", "--add", "--cacheinfo",
-         f"100644,{absent},{HOT}"],
+        [
+            systems.GIT,
+            "-C",
+            str(arm.checkout),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{absent},{HOT}",
+        ],
         env={**systems.git_environment(), "GIT_INDEX_FILE": str(missing)},
         check=True,
     )
@@ -289,9 +295,7 @@ def test_a_worktree_reset_ends_the_write_a_failed_local_commit_left(tmp_path: Pa
     unreferenced = sorted(set(_commits_holding(checkout, first[0].token)) - _reachable(checkout))
     later = Task(0, 1, ("corpus/f001.txt",), ("dddddddddddd",), 0)
     assert systems.worktree_attempt(arm, later, 1, log) == systems.LANDED
-    reset = next(
-        event for event in events_module.read(log.path) if event.get("after") == "reset"
-    )
+    reset = next(event for event in events_module.read(log.path) if event.get("after") == "reset")
     assert reset["paths"][HOT] == {"file": [], "index": []}
     _write(arm, SECOND, bench.log("worktree", 1))
     v3, v2, merged = _scored(bench, arm, harness)
@@ -458,15 +462,29 @@ def test_bytes_that_return_after_disappearing_do_not_reopen_the_write(tmp_path: 
 # --- commits that refused, failed and retried operations leave ----------------------------
 
 
-def _refusing_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _refusing_gate(tmp_path: Path, checkout: Path) -> Path:
     source = _CLEAN_PAYLOAD_GATE_SOURCE.replace(
         '"findings": [],', '"findings": ["fixture refusal"],'
     ).replace('"verdict": "CLEAN",', '"verdict": "REFUSE",')
     gate = tmp_path / "refusing_gate.py"
     gate.write_text(source + "raise SystemExit(1)\n", encoding="utf-8")
-    digest = hashlib.sha256(gate.read_bytes()).hexdigest()
-    monkeypatch.setattr(git_module, "PAYLOAD_GATE_SOURCE_SHA256", digest)
+    _readmit(checkout, gate)
     return gate
+
+
+def _readmit(checkout: Path, gate: Path) -> None:
+    """Admit another gate in a protected fixture the way an operator must: then reconcile."""
+
+    admit_gate(checkout, gate)
+    coordinator = Coordinator(checkout)
+    epoch = [
+        event.event_id
+        for event in coordinator.wal.read().events
+        if event.kind in ("workspace_protect", "workspace_reconcile")
+    ][-1]
+    coordinator.reconcile_workspace(
+        "bench-operator", expected_epoch=epoch, reason="fixture admits another gate"
+    )
 
 
 def _named_candidate(
@@ -489,15 +507,14 @@ def _named_candidate(
     return commit
 
 
-def test_a_candidate_the_gate_refuses_is_recorded_as_a_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_candidate_the_gate_refuses_is_recorded_as_a_commit(tmp_path: Path) -> None:
     bench = Bench(tmp_path, writers=2)
     arm, harness = bench.prepare("onetree")
     log = bench.log("onetree", 0)
-    commit = _named_candidate(tmp_path, arm, _refusing_gate(tmp_path, monkeypatch), log)
+    commit = _named_candidate(tmp_path, arm, _refusing_gate(tmp_path, arm.checkout), log)
     assert events_module.read(log.path)[-1]["reason"] == "payload_gate_refused"
-    monkeypatch.undo()
+    assert arm.gate is not None
+    _readmit(arm.checkout, arm.gate)
     _write(arm, SECOND, bench.log("onetree", 1))
     v3, v2, merged = _scored(bench, arm, harness)
     first = next(event for event in merged if event["kind"] == "write" and event["writer"] == 0)

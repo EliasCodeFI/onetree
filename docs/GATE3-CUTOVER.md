@@ -27,7 +27,23 @@ remains contingent on that validation and the reviewed cutover.
    and the exact admitted payload gate. The referee runs in a temporary checkout
    of the candidate with a restricted environment: a relative `.venv` in the
    shared tree and inherited shell variables are not a usable configuration.
-4. Configure the repository-local referee, verify the effective command and
+4. Admit the reviewed payload gate with
+   `onetree gate --repo /absolute/shared/clone --admit "$gate" --sha256 "$reviewed_sha256" --json`
+   and check the reported path and digest. Landing refuses while the gate's bytes
+   differ from that digest; after a reviewed gate change, admit it again.
+   The admission is part of the protection baseline. Once the repository is
+   protected, admitting a different gate, editing either admission key, or
+   removing the admission makes landing refuse with `workspace_changed` until an
+   operator reviews it and runs `onetree reconcile`; re-admitting the identical
+   gate changes nothing. A repository protected before admissions were recorded
+   (`workspace_protect` version 3, `workspace_reconcile` version 4) still
+   verifies, and its epoch reads as having no admission, so its first admission
+   comes under protection through that same reviewed reconcile. Until then, and
+   likewise under an epoch protected while no gate was admitted, every landing
+   refuses with `workspace_gate_unprotected` and writes no intent, whatever the
+   admission reads: admit the reviewed gate, then run `onetree reconcile` to
+   record it in the epoch, before the first landing.
+   Configure the repository-local referee, verify the effective command and
    timeout, then establish the protection baseline. Record the command, runtime
    environment, base commit and returned baseline in the activation receipt.
 5. Land the reviewed `AGENTS.md` phase transition through OneTree itself, using

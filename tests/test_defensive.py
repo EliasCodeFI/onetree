@@ -258,9 +258,9 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
     assert adopted["v"] == 2
     assert collected["v"] == 1
     protected = Wal.document("workspace_protect", "operator", {})
-    assert protected["v"] == 3
+    assert protected["v"] == 5
     reconciled = Wal.document("workspace_reconcile", "operator", {})
-    assert reconciled["v"] == 4
+    assert reconciled["v"] == 5
     assert Wal._validate_document(dict(reconciled), oid="fixture") == reconciled
     assert Wal._validate_document(dict(protected), oid="fixture") == protected
     assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
@@ -270,12 +270,19 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
     assert Wal._validate_document({**adopted, "v": 1}, oid="fixture") == {**adopted, "v": 1}
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**adopted, "v": 1}, oid="fixture", writing=True)
+    # The baselines written before payload gate admission stay readable, never writable.
+    for legacy in ({**protected, "v": 3}, {**reconciled, "v": 4}):
+        assert Wal._validate_document(dict(legacy), oid="fixture") == legacy
+        with pytest.raises(WalCorruptError, match="does not match its kind"):
+            Wal._validate_document(dict(legacy), oid="fixture", writing=True)
+    with pytest.raises(WalCorruptError, match="does not match its kind"):
+        Wal._validate_document({**protected, "v": 4}, oid="fixture")
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**adopted, "v": 3}, oid="fixture")
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**collected, "v": 2}, oid="fixture")
     with pytest.raises(WalCorruptError, match="unsupported WAL schema version"):
-        Wal._validate_document({**collected, "v": 5}, oid="fixture")
+        Wal._validate_document({**collected, "v": 6}, oid="fixture")
     with pytest.raises(WalCorruptError, match="does not match its kind"):
         Wal._validate_document({**protected, "v": 2}, oid="fixture")
     # ``True`` is the one that matters: it compares equal to 1, so a bool would
@@ -615,12 +622,15 @@ def test_git_wrapper_refusals_and_index_type(git_repo: GitFixture, tmp_path: Pat
 
 
 def test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`symbolic-ref --quiet` exits 1 for a detached HEAD; any other exit is git failing."""
     repository = Repository(git_repo.root)
     failed = subprocess.CompletedProcess(
-        ["git", "symbolic-ref"], 128, stdout=b"",
+        ["git", "symbolic-ref"],
+        128,
+        stdout=b"",
         stderr=b"fatal: unable to parse command-line config\n",
     )
     # Control: the real detached exit keeps its diagnosis.

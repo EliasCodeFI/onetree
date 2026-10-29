@@ -24,13 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from onetree import git as onetree_git
 from onetree.bench import SCHEMA, SYSTEMS, receipts, systems
 from onetree.bench import corpus as corpus_module
 from onetree.bench import events as events_module
 from onetree.bench import metrics as metrics_module
 from onetree.bench.corpus import Corpus, Grid, Task
 from onetree.bench.seeds import DERIVATION
+from onetree.git import Repository
 
 
 @dataclass(frozen=True)
@@ -91,8 +91,10 @@ def _inputs(settings: Settings, referee_script: Path) -> dict[str, Any]:
         "gate": {
             "path": str(settings.gate),
             "sha256": gate_sha256,
-            "admitted_pin_sha256": onetree_git.PAYLOAD_GATE_SOURCE_SHA256,
-            "matches_admitted_pin": gate_sha256 == onetree_git.PAYLOAD_GATE_SOURCE_SHA256,
+            # Observed after the onetree arm's setup (`_observe_admission`); until then, and in
+            # a run without that arm, nothing was admitted.
+            "admitted_pin_sha256": None,
+            "matches_admitted_pin": False,
         },
         "referee_sha256": _sha256_file(referee_script),
         "message_sha256": hashlib.sha256(settings.message.encode("utf-8")).hexdigest(),
@@ -164,8 +166,26 @@ def execute(arm: systems.Arm, corpus: Corpus, parts: Path, deadline_s: float) ->
     return {"started": started, "ended": ended, "complete": complete, "exitcodes": exitcodes}
 
 
+def _observe_admission(out: Path, arm: systems.Arm, inputs: dict[str, Any]) -> None:
+    """Record in run.json the admission read back from the arm's own repository."""
+
+    admission = Repository(arm.checkout).payload_gate_admission()
+    gate = inputs["gate"]
+    gate["admitted_pin_sha256"] = None if admission is None else admission.sha256
+    gate["matches_admitted_pin"] = gate["sha256"] is not None and (
+        gate["sha256"] == gate["admitted_pin_sha256"]
+    )
+    receipts.write_json(out / "run.json", inputs)
+
+
 def prepare(
-    out: Path, system: str, corpus: Corpus, settings: Settings, referee_script: Path
+    out: Path,
+    system: str,
+    corpus: Corpus,
+    settings: Settings,
+    referee_script: Path,
+    *,
+    gate_sha256: str | None = None,
 ) -> tuple[systems.Arm, events_module.EventWriter]:
     root = out / "repos" / system
     checkout = root / "main"
@@ -175,6 +195,7 @@ def prepare(
         root=root,
         checkout=checkout,
         gate=settings.gate if system == "onetree" else None,
+        gate_sha256=gate_sha256 if system == "onetree" else None,
         message=settings.message,
         ttl=settings.ttl,
         max_attempts=settings.max_attempts,
@@ -266,7 +287,11 @@ def run(out: Path, settings: Settings) -> dict[str, Any]:
     complete = True
     metrics: dict[str, Any] = {}
     for system in settings.systems:
-        arm, harness = prepare(out, system, corpus, settings, referee_script)
+        arm, harness = prepare(
+            out, system, corpus, settings, referee_script, gate_sha256=inputs["gate"]["sha256"]
+        )
+        if system == "onetree":
+            _observe_admission(out, arm, inputs)
         window = execute(arm, corpus, out / "events" / "parts", settings.deadline_s)
         harness.emit(
             "run",

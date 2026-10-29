@@ -10,14 +10,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import GitFixture, KillGit
+from conftest import GitFixture, KillGit, admit_gate
 
 from onetree import git as git_module
 from onetree import referee
 from onetree.core import Coordinator
 from onetree.errors import LandingRefusedError
 
-_SOURCE_PIN = git_module.PAYLOAD_GATE_SOURCE_SHA256
 _SESSION = "11111111-1111-4111-8111-111111111111"
 _OTHER_SESSION = "22222222-2222-4222-8222-222222222222"
 
@@ -60,7 +59,8 @@ def test_crash_instrument_rejects_partial_fault_configuration(
 
 @pytest.fixture(autouse=True)
 def clean_commit_payload_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Override the parent fixture: admission must exercise the production pin.
+    # Override the parent fixture: no stub gate is admitted, so admission exercises the
+    # explicitly supplied estate gate only.
     for name in (
         "ONETREE_COMMIT_PAYLOAD",
         "CLAUDE_SESSION_ID",
@@ -68,15 +68,15 @@ def clean_commit_payload_gate(monkeypatch: pytest.MonkeyPatch) -> None:
         "CODEX_THREAD_ID",
     ):
         monkeypatch.delenv(name, raising=False)
-    assert git_module.PAYLOAD_GATE_SOURCE_SHA256 == _SOURCE_PIN
 
 
 @pytest.fixture
-def estate_gate(request: pytest.FixtureRequest) -> Path:
+def estate_gate(request: pytest.FixtureRequest, git_repo: GitFixture) -> Path:
     source = os.environ.get("ONETREE_TEST_ESTATE_GATE")
     if source is None:
         pytest.skip("requires explicit ONETREE_TEST_ESTATE_GATE for source admission")
     gate = Path(source).resolve(strict=True)
+    admit_gate(git_repo.root, gate)
     request.node.user_properties.extend(
         [
             ("implementation", str(git_module.__file__)),

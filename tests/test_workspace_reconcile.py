@@ -23,8 +23,11 @@ from onetree.wal import EventRecord, Wal
 
 
 def epoch_id(coordinator: Coordinator) -> str:
-    return next(event.event_id for event in reversed(coordinator.wal.read().events)
-                if event.kind in {"workspace_protect", "workspace_reconcile"})
+    return next(
+        event.event_id
+        for event in reversed(coordinator.wal.read().events)
+        if event.kind in {"workspace_protect", "workspace_reconcile"}
+    )
 
 
 def evidence(git_repo: GitFixture) -> tuple[Any, ...]:
@@ -40,7 +43,8 @@ def evidence(git_repo: GitFixture) -> tuple[Any, ...]:
 
 @pytest.mark.parametrize("change", ["expiry", "routine_expiry", "external", "healthy"])
 def test_explicit_reconciliation_preserves_history_and_allows_fresh_work(
-    git_repo: GitFixture, change: str,
+    git_repo: GitFixture,
+    change: str,
 ) -> None:
     if change == "routine_expiry":
         aged = os.environ.copy()
@@ -48,8 +52,12 @@ def test_explicit_reconciliation_preserves_history_and_allows_fresh_work(
         aged["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z"
         git_repo.write("b.txt", "aged\n")
         for arguments in (["add", "--", "b.txt"], ["commit", "--quiet", "-m", "aged"]):
-            subprocess.run([_GIT_EXECUTABLE, "-C", str(git_repo.root), *arguments],
-                           check=True, capture_output=True, env=aged)
+            subprocess.run(
+                [_GIT_EXECUTABLE, "-C", str(git_repo.root), *arguments],
+                check=True,
+                capture_output=True,
+                env=aged,
+            )
     coordinator = Coordinator(git_repo.root)
     original = dict(coordinator.protect_workspace("operator"))
     prior_id = epoch_id(coordinator)
@@ -68,13 +76,15 @@ def test_explicit_reconciliation_preserves_history_and_allows_fresh_work(
     before = coordinator.wal.read()
     held = evidence(git_repo)
     result = coordinator.reconcile_workspace(
-        "operator", expected_epoch=prior_id, reason="Inspected current shared state",
+        "operator",
+        expected_epoch=prior_id,
+        reason="Inspected current shared state",
     )
     after = coordinator.wal.read()
     assert after.events[:-1] == before.events
     event = after.events[-1]
     assert event.kind == "workspace_reconcile"
-    assert event.document["v"] == 4
+    assert event.document["v"] == 5
     assert event.data["previous_epoch"] == prior_id
     assert event.data["reason"] == "Inspected current shared state"
     assert (event.data["violation"] is None) == (change == "healthy")
@@ -101,8 +111,9 @@ def test_reconciliation_requires_reason_without_writing(git_repo: GitFixture, re
     coordinator.protect_workspace("operator")
     before = coordinator.wal.head()
     with pytest.raises(LandingRefusedError) as caught:
-        coordinator.reconcile_workspace("operator", expected_epoch=epoch_id(coordinator),
-                                        reason=reason)
+        coordinator.reconcile_workspace(
+            "operator", expected_epoch=epoch_id(coordinator), reason=reason
+        )
     assert caught.value.details["reason"] == "reconciliation_reason"
     assert coordinator.wal.head() == before
 
@@ -121,14 +132,16 @@ def test_reconciliation_binds_each_epoch_and_requires_protection(git_repo: GitFi
         coordinator.reconcile_workspace("operator", expected_epoch=old, reason="stale")
     assert caught.value.details["reason"] == "workspace_epoch_changed"
     assert coordinator.wal.head() == head
-    second = coordinator.reconcile_workspace("operator", expected_epoch=first["epoch"],
-                                             reason="second")
+    second = coordinator.reconcile_workspace(
+        "operator", expected_epoch=first["epoch"], reason="second"
+    )
     assert second["previous_epoch"] == first["epoch"]
     assert second["epoch"] != first["epoch"]
 
 
 def test_reconciliation_refuses_active_claim_and_pending_intent(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -179,11 +192,20 @@ def test_reconciliation_refuses_malformed_reflog(git_repo: GitFixture, content: 
 def test_replay_refuses_bad_reconciliation_record(git_repo: GitFixture, field: str) -> None:
     coordinator = Coordinator(git_repo.root)
     baseline = dict(coordinator.protect_workspace("operator"))
-    data: dict[str, Any] = {"previous_epoch": epoch_id(coordinator), "reason": "reviewed",
-                            "violation": None, "baseline": baseline}
+    data: dict[str, Any] = {
+        "previous_epoch": epoch_id(coordinator),
+        "reason": "reviewed",
+        "violation": None,
+        "baseline": baseline,
+    }
     bad = copy.deepcopy(data)
-    bad[field] = {"previous_epoch": "stale", "reason": " ", "violation": 1,
-                  "baseline": {}, "extra": True}[field]
+    bad[field] = {
+        "previous_epoch": "stale",
+        "reason": " ",
+        "violation": 1,
+        "baseline": {},
+        "extra": True,
+    }[field]
     event = EventRecord("bad", (), Wal.document("workspace_reconcile", "operator", bad))
     with pytest.raises(WalCorruptError):
         coordinator._apply(coordinator._fold(coordinator.wal.read()), event)
@@ -194,12 +216,22 @@ def test_replay_refuses_bad_reconciliation_record(git_repo: GitFixture, field: s
 
 
 def test_reconciliation_cli_json_preserves_error_and_result(
-    git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
+    git_repo: GitFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
-    arguments = ["reconcile", "--repo", str(git_repo.root), "--session", "operator",
-                 "--expected-epoch", epoch_id(coordinator), "--reason", "Inspected expiry"]
+    arguments = [
+        "reconcile",
+        "--repo",
+        str(git_repo.root),
+        "--session",
+        "operator",
+        "--expected-epoch",
+        epoch_id(coordinator),
+        "--reason",
+        "Inspected expiry",
+    ]
     git_repo.git("reflog", "expire", "--expire=now", "--all")
     code, payload = _json_call(capsys, arguments)
     assert code == 0
@@ -209,13 +241,28 @@ def test_reconciliation_cli_json_preserves_error_and_result(
     assert code != 0
     assert not payload["ok"]
     assert payload["error"]["reason"] == "workspace_epoch_changed"
-    assert main(["reconcile", "--repo", str(git_repo.root), "--session", "operator",
-                 "--expected-epoch", epoch_id(coordinator), "--reason", "Reviewed again"]) == 0
+    assert (
+        main(
+            [
+                "reconcile",
+                "--repo",
+                str(git_repo.root),
+                "--session",
+                "operator",
+                "--expected-epoch",
+                epoch_id(coordinator),
+                "--reason",
+                "Reviewed again",
+            ]
+        )
+        == 0
+    )
     assert "reconciled" in capsys.readouterr().out
 
 
 def test_reconciliation_records_stale_claim_collection_without_deleting_files(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -230,14 +277,19 @@ def test_reconciliation_records_stale_claim_collection_without_deleting_files(
     after = coordinator.wal.read()
     assert after.events[:-2] == before.events
     assert [event.kind for event in after.events[-2:]] == ["gc", "workspace_reconcile"]
-    assert after.events[-2].data == {"claim_generations": [claimed.generation],
-                                   "session_generations": [], "temp_indexes": []}
+    assert after.events[-2].data == {
+        "claim_generations": [claimed.generation],
+        "session_generations": [],
+        "temp_indexes": [],
+    }
     assert session.index_path.read_bytes() == original_index
 
 
 @pytest.mark.parametrize("race", ["claim", "epoch"])
 def test_reconciliation_cas_rechecks_a_competing_writer(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch, race: str,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -247,8 +299,10 @@ def test_reconciliation_cas_rechecks_a_competing_writer(
     original = coordinator.wal.try_append
     observed = []
 
-    def interleave(documents: Sequence[Mapping[str, Any]], expected: str | None,
-                   ) -> tuple[EventRecord, ...] | None:
+    def interleave(
+        documents: Sequence[Mapping[str, Any]],
+        expected: str | None,
+    ) -> tuple[EventRecord, ...] | None:
         if not observed:
             if race == "claim":
                 peer.claim("peer", [str(git_repo.root / "b.txt")])
@@ -264,13 +318,16 @@ def test_reconciliation_cas_rechecks_a_competing_writer(
         "workspace_busy" if race == "claim" else "workspace_epoch_changed"
     )
     assert coordinator.wal.head() == observed[0]
-    assert all(event.actor != "operator" or event.kind != "workspace_reconcile"
-               for event in coordinator.wal.read().events)
+    assert all(
+        event.actor != "operator" or event.kind != "workspace_reconcile"
+        for event in coordinator.wal.read().events
+    )
 
 
 @pytest.mark.parametrize("shape", ["missing_landing", "unrecorded_landing"])
 def test_reconciliation_does_not_clear_other_branch_divergence(
-    git_repo: GitFixture, shape: str,
+    git_repo: GitFixture,
+    shape: str,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -285,8 +342,9 @@ def test_reconciliation_does_not_clear_other_branch_divergence(
         git_repo.git("update-ref", "refs/heads/main", git_repo.base, git_repo.oid())
         expected_error = WalDivergedError
     else:
-        git_repo.external_commit("b.txt", "unrecorded\n",
-                                 "External\n\nOnetree-Operation: " + "a" * 32)
+        git_repo.external_commit(
+            "b.txt", "unrecorded\n", "External\n\nOnetree-Operation: " + "a" * 32
+        )
         expected_error = UnrecordedLandingError
     before = coordinator.wal.head()
     tip = git_repo.oid()
@@ -300,8 +358,9 @@ def test_new_epoch_does_not_allow_later_unexplained_changes(git_repo: GitFixture
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
     git_repo.git("reflog", "expire", "--expire=now", "--all")
-    coordinator.reconcile_workspace("operator", expected_epoch=epoch_id(coordinator),
-                                    reason="Accepted expired reflogs")
+    coordinator.reconcile_workspace(
+        "operator", expected_epoch=epoch_id(coordinator), reason="Accepted expired reflogs"
+    )
     session = coordinator.register_session("alpha", pid=os.getpid())
     coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
     git_repo.write("a.txt", "alpha\n")
@@ -316,7 +375,8 @@ def test_new_epoch_does_not_allow_later_unexplained_changes(git_repo: GitFixture
 
 @pytest.mark.parametrize("shape", ["missing", "symlink", "disabled", "detached"])
 def test_reconciliation_refuses_unavailable_observation(
-    git_repo: GitFixture, shape: str,
+    git_repo: GitFixture,
+    shape: str,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -342,7 +402,8 @@ def test_reconciliation_refuses_unavailable_observation(
 
 
 def test_reconciliation_refuses_movement_during_observation(
-    git_repo: GitFixture, monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator = Coordinator(git_repo.root)
     coordinator.protect_workspace("operator")
@@ -372,8 +433,12 @@ def test_replay_refuses_reconciliation_while_claims_remain(git_repo: GitFixture)
     prior = epoch_id(coordinator)
     coordinator.register_session("alpha", pid=os.getpid())
     coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
-    data = {"previous_epoch": prior, "reason": "Forged idle state",
-            "violation": None, "baseline": baseline}
+    data = {
+        "previous_epoch": prior,
+        "reason": "Forged idle state",
+        "violation": None,
+        "baseline": baseline,
+    }
     event = EventRecord("bad", (), Wal.document("workspace_reconcile", "operator", data))
     with pytest.raises(WalCorruptError, match="invalid workspace reconciliation"):
         coordinator._apply(coordinator._fold(coordinator.wal.read()), event)

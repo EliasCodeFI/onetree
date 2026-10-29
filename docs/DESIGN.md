@@ -19,7 +19,10 @@ this document is the implementation contract for the first two rounds.
    - build: `git write-tree` against the session index, then `commit-tree` —
      the shared index and working tree are never touched;
    - payload gate: require the configured `commit_payload.py` source to match
-     the independently admitted SHA-256, execute a private snapshot of those
+     the SHA-256 the repository's operator admitted (`onetree gate --admit`,
+     recorded as `onetree.payloadGate` and `onetree.payloadGateSha256` in the
+     repository's own Git configuration; a repository with no admission refuses
+     every landing), execute a private snapshot of those
      bytes, and confirm the configured source remained unchanged; invoke its
      `commit` mode over that immutable candidate, require one internally
      consistent JSON verdict for the exact candidate, repository, and payload
@@ -60,9 +63,15 @@ previous WAL head; CAS on the WAL ref serializes appends. Event kinds:
 `session_register`, `claim`, `release`, `land_intent` (fence), `landed`,
 `adopted`, `refused`, `gc`, `workspace_protect`, `workspace_reconcile`.
 `workspace_protect` records
-the explicitly established shared-branch, reflog and referee baseline; it
-requires reader version 3 and cannot be silently replaced by registration.
-`workspace_reconcile` requires reader version 4. It records an explicit
+the explicitly established shared-branch, reflog, referee and payload-gate
+admission baseline; it requires reader version 5 and cannot be silently replaced
+by registration. Version 3 events, written before the baseline carried the
+admission, remain readable and are read as protecting no admission.
+`workspace_reconcile` requires reader version 5 (version 4 is read the same way
+as a version 3 protection). The broker refuses every landing under an epoch that
+protects no admission, including one protected while no gate was admitted, with
+`workspace_gate_unprotected`, before any gate runs; admitting a gate and
+reconciling records it in a new epoch. A reconciliation records an explicit
 operator reason, the prior epoch id and violation, and a new observed baseline
 after claims and pending intents are clear. Earlier epochs remain in the WAL;
 ordinary protection and recovery cannot perform this operation. Reconciliation
