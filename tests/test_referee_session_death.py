@@ -232,6 +232,9 @@ def test_session_body_death_in_each_window_leaves_a_dead_session_the_broker_name
         _reap_referee(running if running is not None else referee.running())
     if referee_pid is not None:
         assert not _alive(referee_pid)
+        # The dead body's referee is gone; later referee runs (the peer's) must not
+        # block, or the peer landing below waits out the fixture's 60 s sleep.
+        referee.let_pass()
 
     # Reached phase and identity: the session body and the lander are one dead process.
     expected = {
