@@ -112,7 +112,9 @@ def _process_state(pid: int) -> str | None:
 
     try:
         text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # The pid can exit between the open and the read; Linux then fails the read
+        # with ESRCH (ProcessLookupError) instead of the open with ENOENT.
         return None
     return text.rsplit(")", 1)[1].split()[0]
 
@@ -306,7 +308,11 @@ while __WAIT_FOR_RELEASE__ and not pathlib.Path(__RELEASE_PATH__).exists():
 
 
 def _observe_cancellation(
-    root: str, directory: str, gate_exits_first: bool, publication_delay: float
+    root: str,
+    directory: str,
+    gate_exits_first: bool,
+    publication_delay: float,
+    inherited_sigint: str,
 ) -> None:
     """Worker body: run the gate helper, take a real SIGINT, record what killpg saw.
 
@@ -321,6 +327,12 @@ def _observe_cancellation(
     import sys
     import threading
 
+    if inherited_sigint == "ignored":
+        # How a lander started as a background job of a non-interactive shell runs.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # The observation needs a real KeyboardInterrupt whatever SIGINT disposition
+    # the referee inherited from the process that started the landing.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     workdir = Path(directory)
     ready = workdir / "ready"
     release = workdir / "release"
@@ -375,6 +387,7 @@ def _observe_cancellation(
         (workdir / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 
+@pytest.mark.parametrize("inherited_sigint", ["default", "ignored"])
 @pytest.mark.parametrize(
     "publication_delay", [0.0, 0.3], ids=["publication-prompt", "publication-delayed"]
 )
@@ -384,13 +397,17 @@ def test_cancellation_signals_the_group_before_the_leader_is_reaped(
     tmp_path: Path,
     gate_exits_first: bool,
     publication_delay: float,
+    inherited_sigint: str,
 ) -> None:
     import json
     import multiprocessing
 
     worker = multiprocessing.get_context("fork").Process(
         target=_observe_cancellation,
-        args=(str(git_repo.root), str(tmp_path), gate_exits_first, publication_delay),
+        args=(
+            str(git_repo.root), str(tmp_path), gate_exits_first, publication_delay,
+            inherited_sigint,
+        ),
     )
     worker.start()
     descendant: int | None = None
@@ -416,5 +433,29 @@ def test_cancellation_signals_the_group_before_the_leader_is_reaped(
         if worker.is_alive():
             worker.kill()
             worker.join(timeout=5)
+        ready = tmp_path / "ready"
+        if ready.exists():  # a failed run must not leave the gate's group behind
+            with contextlib.suppress(ProcessLookupError, PermissionError, ValueError):
+                os.killpg(int(ready.read_text(encoding="ascii")), signal.SIGKILL)
+        published = tmp_path / "descendant.pid"
+        if descendant is None and published.exists():
+            descendant = int(published.read_text(encoding="ascii"))
         if descendant is not None:
             _kill_quietly(descendant)
+
+
+def test_process_state_reads_a_pid_that_exits_mid_read_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pid can exit between the open and the read of ``/proc/<pid>/stat``.
+
+    Linux then fails the read, not the open, with ESRCH, which Python raises as
+    ProcessLookupError. Observed 2026-11-08 on WSL2 as a red
+    test_timeout_leaves_processes_outside_the_gate_group_alive.
+    """
+
+    def exited_mid_read(self: Path, *args: object, **kwargs: object) -> str:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(Path, "read_text", exited_mid_read)
+    assert _process_state(os.getpid()) is None
