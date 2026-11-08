@@ -9,7 +9,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from onetree import __version__
+from onetree import __version__, autosave
 from onetree.core import CheckResult, Coordinator
 from onetree.errors import (
     IdentityError,
@@ -161,6 +161,30 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_output(wal)
+
+    saves = subparsers.add_parser(
+        "autosave", help="Save, list or restore snapshots of claimed working bytes."
+    )
+    autosave_actions = saves.add_subparsers(dest="autosave_action", required=True)
+    save = autosave_actions.add_parser("save", help="Snapshot the session's claimed paths.")
+    save.add_argument("paths", nargs="*", help="Absolute claimed paths (default: all claims).")
+    listing = autosave_actions.add_parser("list", help="List snapshots, newest first.")
+    listing.add_argument("--limit", type=int, help="Show at most this many snapshots.")
+    restore = autosave_actions.add_parser("restore", help="Restore or print a path's snapshot.")
+    restore.add_argument("path", help="Absolute path to restore.")
+    restore.add_argument("--from", dest="source", help="Read another session's snapshots.")
+    restore.add_argument("--snapshot", help="Snapshot commit (default: newest holding the path).")
+    restore.add_argument("--stdout", action="store_true", help="Print the bytes; write nothing.")
+    restore.add_argument(
+        "--force", action="store_true", help="Overwrite working bytes no snapshot holds."
+    )
+    autosave_status = autosave_actions.add_parser(
+        "status", help="Report claimed paths whose working bytes no snapshot holds."
+    )
+    for action in (save, listing, restore, autosave_status):
+        _add_repo(action)
+        _add_actor(action)
+        _add_output(action)
 
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")
     _add_repo(gc)
@@ -502,6 +526,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             return_code = 0 if gate_payload["matches"] else 1
             payload = {"ok": True, "gate": gate_payload}
             human = _gate_human(gate_payload)
+        elif args.command == "autosave" and args.autosave_action == "save":
+            save_result = autosave.save(coordinator, _actor(args.actor), args.paths)
+            payload = {"ok": True, "autosave": save_result.payload()}
+            human = (
+                f"saved {save_result.files} file(s) as {save_result.snapshot.commit}"
+                if save_result.created and save_result.snapshot is not None
+                else "nothing changed; no snapshot written"
+            )
+        elif args.command == "autosave" and args.autosave_action == "list":
+            listed = autosave.snapshots(coordinator, _actor(args.actor), limit=args.limit)
+            payload = {
+                "ok": True,
+                "autosave": {
+                    "ref": autosave.autosave_ref(_actor(args.actor)),
+                    "snapshots": [item.payload() for item in listed],
+                },
+            }
+            human = "\n".join(
+                f"{item.commit} {item.saved_at:.3f} {', '.join(item.scope)}" for item in listed
+            ) or "no snapshots"
+        elif args.command == "autosave" and args.autosave_action == "status":
+            rows = autosave.status(coordinator, _actor(args.actor))
+            return_code = int(any(row.state != "saved" for row in rows))
+            payload = {"ok": True, "autosave": {"paths": [row.payload() for row in rows]}}
+            human = "\n".join(
+                f"{row.state.upper()} {row.path}" for row in rows if row.state != "saved"
+            ) or f"all {len(rows)} claimed path(s) saved"
+        elif args.command == "autosave":
+            restored = autosave.restore(
+                coordinator,
+                _actor(args.actor),
+                args.path,
+                source=args.source,
+                snapshot=args.snapshot,
+                write=not args.stdout,
+                force=args.force,
+            )
+            if args.stdout and not json_output:
+                sys.stdout.buffer.write(restored.content or b"")
+                sys.stdout.flush()
+                return 0
+            payload = {"ok": True, "autosave": restored.payload()}
+            state = "present" if restored.present else "absent"
+            human = (
+                f"{'restored' if restored.written else 'unchanged'} {restored.path} "
+                f"({state} in {restored.snapshot})"
+            )
         elif args.command == "gc":
             gc_result = coordinator.gc(_actor(args.actor))
             payload = {
