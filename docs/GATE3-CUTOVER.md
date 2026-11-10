@@ -119,9 +119,15 @@ index=$(jq -er '.session.index | select(type == "string" and length > 0)' "$sess
 The JSON field is `.session.index`. Check the command exit status before using
 it; a missing field must not become an index named `null`.
 
-Claim existing absolute paths before editing. For a new file, claim an existing
-parent directory that covers it. Stage only the intended paths in the private
-index and inspect the staged payload before landing:
+Claim existing absolute paths before editing. For a new file, create the file,
+then claim its exact path; do not claim a parent directory. At `0adeed7` an
+untracked file can be claimed by its exact path (measured in estate-v2 on
+2026-11-08), and parent-directory claims made writers wait for each other in the
+2026-11-08 dogfood (one waited 88.7 minutes in all). The estate-v2 clone that
+works this way is recorded in `docs/GATE3-ESTATE-V2-ACTIVATION.md`; that record
+describes the activation and does not itself hold these two measurements. Stage
+only the intended paths in the private index and inspect the staged payload
+before landing:
 
 ```sh
 onetree claim --repo "$repo" --session "$actor" --json "$repo/path/to/file"
