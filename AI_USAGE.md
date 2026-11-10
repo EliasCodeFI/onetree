@@ -32,7 +32,7 @@ merge commit carries a trailer.
 | `Co-Authored-By: Claude Fable 5` | 6 |
 | `Co-Authored-By: Claude` (unversioned) | 4 |
 | Non-merge commits with no vendor trailer | 16 |
-| Commits carrying a broker `Onetree-Actor` trailer | 1 (`882d8c8`, the Gate 3 activation) |
+| Commits carrying a broker `Onetree-Actor` trailer | 25, re-measured at `0adeed7` on 2026-11-10 with `git --no-optional-locks log --grep='^Onetree-Actor: ' --format=%h 0adeed7 \| wc -l` (the first is `882d8c8`, the Gate 3 activation) |
 
 The commit trailer is the attribution the table above measures; round records
 attribute changes separately, as described below. Sixteen
