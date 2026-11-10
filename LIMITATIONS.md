@@ -144,7 +144,17 @@ and execution-failed candidates are refused; a refusal is not a diagnosis.
   rehearsal does not satisfy that exit receipt" and that closure "requires its
   separately tracked concurrent-session dogfood history"
   (`docs/GATE3-CUTOVER.md`). No multi-session landing history is in this
-  repository at `882d8c8`.
+  repository at `882d8c8`. The first such history in this repository is the
+  2026-11-08 WSL dogfood (`docs/GATE3-WSL-ACTIVATION.md`): six landings after
+  `6ef1c14` through `0adeed7`, with four actors in their `Onetree-Actor`
+  trailers:
+  - `da28fdec-2cc5-43a2-80e7-46c4f314a2db`: `43b0527`;
+  - `c7b90657-2a3f-41be-8331-398398c719bd`: `4403284`, `86da416`, `0adeed7`;
+  - `51dfc2c7-bdec-4670-be02-924b65b3026c`: `96a1064`;
+  - `45f50115-23d3-4ac5-8ff1-98b68cf68a5e`: `964c5b6`.
+
+  This history does not itself close Gate 3; the separately tracked
+  concurrent-session exit receipt remains required.
 - **Benchmark numbers.** `docs/PREREGISTRATION.md` freezes metrics and decision
   rules; its amendment log is "(none yet)" and no measured run exists. The
   README carries no claims for that reason.
