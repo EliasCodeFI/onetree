@@ -8,13 +8,11 @@ working in this clone.
 Gate3 dogfood is active in the designated primary shared clone. All development
 landings to its shared branch go through OneTree with the configured referee
 and admitted payload gate. Stage through your session's private index and claim
-every payload path. Bare Git commits, branch switches and resets in that shared
-clone are outside this workflow. A refusal is evidence to inspect and resolve;
-do not reset or reconcile the protected baseline merely to make it disappear.
-
-- **After Gate 3 (dogfood cutover):** ALL landings go through the onetree
-  broker. Bare `git commit` to shared refs is out of contract from that point;
-  the broker refuses payloads containing paths your session has not claimed.
+every payload path: the broker refuses a payload that contains a path your
+session has not claimed. Bare Git commits to shared refs, branch switches and
+resets in that shared clone are out of contract. A refusal is evidence to
+inspect and resolve; do not reset or reconcile the protected baseline merely to
+make it disappear.
 
 ## Non-negotiables
 
