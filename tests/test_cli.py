@@ -74,6 +74,7 @@ def test_repository_boundary_reports_audit_target_findings(
 
 
 def test_status_human_and_json(capsys: pytest.CaptureFixture[str]) -> None:
+    """Known bad: base 0adeed777bc67580ad3b560cad5c966564118b4d reports the old phase."""
     assert main(["status"]) == 0
     out = capsys.readouterr()
     assert __version__ in out.out
@@ -84,7 +85,7 @@ def test_status_human_and_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload == {
         "name": "onetree",
         "ok": True,
-        "phase": "gate-1-round-b",
+        "phase": "gate-3-dogfood",
         "version": __version__,
     }
 

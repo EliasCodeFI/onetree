@@ -343,9 +343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": True,
             "name": "onetree",
             "version": __version__,
-            "phase": "gate-1-round-b",
+            "phase": "gate-3-dogfood",
         }
-        _emit(payload, json_output, f"onetree {__version__} (phase: gate-1-round-b)")
+        _emit(payload, json_output, f"onetree {__version__} (phase: gate-3-dogfood)")
         return 0
 
     try:
