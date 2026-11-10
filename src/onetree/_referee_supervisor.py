@@ -49,6 +49,12 @@ def _check_lifetime(lifetime: _Lifetime, delay: float = 0.0) -> None:
         raise _CancelledError
 
 
+def _default_interrupt() -> None:
+    # An ignored SIGINT survives exec. A lander started with it ignored (a background
+    # job of a non-interactive shell) must not pass that on to the referee command.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 def _command(
     arguments: Sequence[str], cwd: Path, environment: Mapping[str, str],
     lifetime: _Lifetime, timeout: float | None, stdout: BinaryIO, stderr: BinaryIO,
@@ -57,6 +63,7 @@ def _command(
     process = subprocess.Popen(  # noqa: S603 - broker-owned argv, no shell
         arguments, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
         stdout=stdout, stderr=stderr, start_new_session=True,
+        preexec_fn=_default_interrupt,  # the supervisor has one thread
     )
     deadline = None if timeout is None else time.monotonic() + timeout
     try:
