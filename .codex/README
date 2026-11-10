@@ -1,0 +1,2 @@
+This folder exists so that a sandbox finds a real file here instead of creating an empty
+placeholder. It holds no Codex configuration: Codex seats get theirs from their own CODEX_HOME.
