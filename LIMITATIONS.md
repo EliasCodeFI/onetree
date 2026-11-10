@@ -117,11 +117,15 @@ copied" (`docs/ROUND-B.md`).
   specially; descendants may survive it (`docs/ROUND-GATE-GROUP.md`).
 - Deliberately detached children, loss of both lander and supervisor, and host
   failure are outside the referee cleanup contract (`docs/ROUND-B.md`).
-- Bounds: the payload gate's wall-clock limit is 300 s
+- Bounds: the payload gate's wall-clock limit is 3600 s
   (`PAYLOAD_GATE_TIMEOUT_SECONDS` in `src/onetree/git.py`); the referee default
   is 300 s (`DEFAULT_TIMEOUT` in `src/onetree/referee.py`), configurable through
-  `onetree.refereeTimeout`. The 300 s production bound has not been measured
+  `onetree.refereeTimeout`. The 3600 s production bound has not been measured
   end to end; tests pin shorter values (`docs/ROUND-GATE-GROUP.md`).
+- The full suite took 426 s on 2026-11-08 (`docs/GATE3-WSL-ACTIVATION.md`,
+  "Baseline on the base commit"), longer than the referee's 300 s default. The
+  activation set the referee timeout to 1800 s as an operational choice, not a
+  measured bound.
 
 ## 7. What the referee does not decide
 

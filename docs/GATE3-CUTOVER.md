@@ -1,6 +1,11 @@
 # Gate3 cutover preparation
 
-Status: preparation, not activation. Gate2 is closed by task19. The initial
+Status: activated. The Gate3 dogfood workflow was activated on 2026-11-08 on the
+WSL host; `docs/GATE3-WSL-ACTIVATION.md` is the activation record and governs
+where it and this document differ. The rest of this paragraph is the
+preparation history, kept as written before activation.
+
+Gate2 is closed by task19. The initial
 self-hosting rehearsal found task187 (same-session repeat submissions) and
 task188 (environment-dependent test controls). Both require accepted corrections
 and combined validation before this procedure can activate the shared clone.
