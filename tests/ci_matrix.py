@@ -59,7 +59,7 @@ _COPY_EXCLUDE_PATTERNS = ("*.egg-info", ".coverage", ".coverage.*", ".venv*")
 _MINOR = re.compile(r"3\.(0|[1-9][0-9]*)")
 _TOP_KEYS = frozenset({"name", "on", "permissions", "jobs"})
 _JOB_KEYS = frozenset({"runs-on", "strategy", "steps"})
-_STRATEGY_KEYS = frozenset({"fail-fast", "max-parallel", "matrix"})
+_STRATEGY_KEYS = frozenset({"fail-fast", "matrix"})
 _STEP_KEYS = frozenset({"name", "if", "uses", "with", "env", "run"})
 # Step conditions recognized as pull-request-only, compared exactly. No expression is
 # evaluated: any other condition, including one extending this text, is refused.

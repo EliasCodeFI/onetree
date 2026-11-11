@@ -9,7 +9,7 @@ description = "Your agents. One tree. No worktrees."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "onetree contributors"}]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",

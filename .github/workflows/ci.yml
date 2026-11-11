@@ -10,18 +10,14 @@ permissions:
 
 jobs:
   gates:
-    runs-on: [self-hosted, linux, x64, onetree-ci]
+    # A GitHub-hosted runner, fresh for every job: pull requests from forks are accepted, and
+    # their code must never run on a machine that outlives the job.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - name: Require repository-owned pull request
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        run: |
-          echo '::error::This local runner accepts pull requests from this repository only.'
-          exit 1
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:

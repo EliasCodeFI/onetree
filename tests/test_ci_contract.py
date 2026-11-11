@@ -61,6 +61,37 @@ def test_ci_covers_every_supported_python_minor_and_pins_the_admitted_action_rev
     }
 
 
+def test_ci_gates_run_on_a_fresh_github_hosted_runner_and_admit_pull_requests_from_forks() -> None:
+    """A fork's pull request gets the gates, and never on a machine that outlives the job.
+
+    Known-bad: main a768f9a, where the job ran on one self-hosted runner, one leg at a time,
+    and its first step failed every pull request whose head was another repository. Outside
+    pull requests are accepted since publication, so their code runs only on a GitHub-hosted
+    runner, on the `pull_request` event (a read-only token and no secrets for a fork), never
+    on `pull_request_target`.
+    """
+
+    text = _WORKFLOW.read_text()
+    lines = [line.strip() for line in text.splitlines()]
+
+    assert [line for line in lines if line.startswith("runs-on:")] == ["runs-on: ubuntu-24.04"]
+    assert not [line for line in lines if line.startswith("max-parallel:")]
+    assert "github.event.pull_request.head.repo" not in text
+    assert "pull_request:" in lines
+    assert "pull_request_target" not in text
+    assert text.count("permissions:") == 1
+    assert "permissions:\n  contents: read\n" in text
+
+
+def test_notice_names_the_copyright_holder_beside_the_licence() -> None:
+    """Known-bad: main a768f9a, which has a LICENSE and no NOTICE."""
+
+    notice = _ROOT / "NOTICE"
+    assert (_ROOT / "LICENSE").is_file()
+    assert notice.is_file()
+    assert notice.read_text().splitlines()[:2] == ["onetree", "Copyright 2026 Fastnet Oy"]
+
+
 def test_coverage_configuration_measures_python_subprocesses() -> None:
     """pytest-cov 7 delegates child-process startup to coverage.py's patch."""
 
@@ -250,6 +281,19 @@ _PR_GUARD = (
 _ALWAYS_TRUE_TYPES = (
     "        if: github.event_name == 'pull_request' && false || true\n        run: exit 73\n"
 )
+_CHECKOUT_STEP = "      - uses: actions/checkout@v7\n"
+# The first step the workflow carried until publication (main a768f9a): it failed every pull
+# request from a fork. The workflow no longer has it; the derivation still recognizes it.
+_FORK_GUARD_STEP = (
+    "      - name: Require repository-owned pull request\n"
+    f"        {_PR_GUARD}\n"
+    "        run: exit 1\n"
+)
+
+
+def _with_fork_guard(text: str) -> str:
+    assert text.count(_CHECKOUT_STEP) == 1
+    return text.replace(_CHECKOUT_STEP, _FORK_GUARD_STEP + _CHECKOUT_STEP)
 
 
 @pytest.mark.parametrize(("edit", "pattern", "replacement"), [
@@ -276,12 +320,20 @@ _ALWAYS_TRUE_TYPES = (
     ("pull-request condition on an action step", r"(?m)^      - uses: actions/checkout@v7$",
      "      - " + _PR_GUARD + "\n        uses: actions/checkout@v7"),
     ("no push trigger", r"(?m)^  push:\n    branches: \[main\]\n", ""),
+    ("serialized legs", r"(?m)^( +)(fail-fast: false)$", r"\1\2\n\1max-parallel: 1"),
 ])
 def test_workflow_shapes_the_derivation_does_not_recognize_are_refused(
     edit: str, pattern: str, replacement: str,
 ) -> None:
     text = _WORKFLOW.read_text()
     ci_matrix.parse_workflow(text)  # control: the unedited workflow is recognized
+    if pattern == re.escape(_PR_GUARD):
+        # The workflow no longer carries the fork guard: these cases edit it where it is put back.
+        text = _with_fork_guard(text)
+        guarded = ci_matrix.parse_workflow(text)  # control: the exact guard is recognized
+        assert [step.name for step in guarded.steps if step.kind == "not-applicable"] == [
+            "Require repository-owned pull request"
+        ]
     edited = re.sub(pattern, replacement, text, count=1)
     assert edited != text, edit
     with pytest.raises(ci_matrix.WorkflowShapeError):
@@ -298,9 +350,7 @@ def test_the_plan_command_refuses_a_condition_that_is_true_on_every_event(
     assert [(step.name, step.kind) for step in workflow.steps if step.name == "Types"] == [
         ("Types", "run")
     ]
-    assert [step.name for step in workflow.steps if step.kind == "not-applicable"] == [
-        "Require repository-owned pull request"
-    ]
+    assert [step.name for step in workflow.steps if step.kind == "not-applicable"] == []
     edited = text.replace("        run: mypy\n", _ALWAYS_TRUE_TYPES)
     assert edited != text
     bad = tmp_path / "ci.yml"
