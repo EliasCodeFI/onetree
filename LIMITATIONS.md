@@ -157,7 +157,7 @@ and execution-failed candidates are refused; a refusal is not a diagnosis.
   concurrent-session exit receipt remains required.
 - **Benchmark numbers.** `docs/PREREGISTRATION.md` freezes metrics and decision
   rules; its amendment log is "(none yet)" and no measured run exists. The
-  README carries no claims for that reason.
+  README carries no benchmark claims for that reason.
 - **Historical results as current guarantees.** The round records date their
   measurements. `docs/ROUND-AF-CORRECTIONS.md` states that historical test
   results "remain attributed to their original records" and that its audit does

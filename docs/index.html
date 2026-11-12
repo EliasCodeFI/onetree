@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onetree: several coding agents in one git working tree, no worktrees</title>
+<meta name="description" content="onetree lets several coding agents work at the same time in one git clone and one working tree. Private indexes, path claims, a fail-closed commit broker, and your test suite as the merge referee. Pre-release, Python 3.11+, zero dependencies, Apache-2.0.">
+<meta name="keywords" content="onetree, coding agents, AI agents, git, working tree, worktree alternative, multi-agent, path claims, commit broker, compare-and-swap, merge queue, Claude Code, Codex">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<link rel="canonical" href="https://eliascodefi.github.io/onetree/">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="alternate" type="text/markdown" href="index.html.md" title="This page as Markdown">
+<link rel="describedby" type="text/plain" href="llms.txt" title="llms.txt: a summary for language models">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="onetree">
+<meta property="og:title" content="onetree: your agents, one tree, no worktrees">
+<meta property="og:description" content="Several coding agents working at the same time in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.">
+<meta property="og:url" content="https://eliascodefi.github.io/onetree/">
+<meta property="og:image" content="https://eliascodefi.github.io/onetree/assets/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="The onetree logo above the line: Your agents. One tree. No worktrees.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="onetree: your agents, one tree, no worktrees">
+<meta name="twitter:description" content="Several coding agents in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.">
+<meta name="twitter:image" content="https://eliascodefi.github.io/onetree/assets/social-preview.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://github.com/EliasCodeFI/onetree#code",
+      "name": "onetree",
+      "description": "onetree lets several coding agents work at the same time in one git clone and one working tree. Each session stages in a private git index, claims the paths it will write, and lands through a commit broker that audits the claims, runs an operator-admitted payload gate and the repository's test suite, and moves the branch by compare-and-swap.",
+      "codeRepository": "https://github.com/EliasCodeFI/onetree",
+      "url": "https://eliascodefi.github.io/onetree/",
+      "programmingLanguage": {"@type": "ComputerLanguage", "name": "Python"},
+      "runtimePlatform": "Python 3.11 or newer",
+      "version": "0.0.1a0",
+      "creativeWorkStatus": "Pre-release",
+      "license": "https://www.apache.org/licenses/LICENSE-2.0",
+      "copyrightHolder": {"@type": "Organization", "name": "Fastnet Oy"},
+      "copyrightYear": 2026,
+      "keywords": "coding agents, git, working tree, path claims, commit broker, compare-and-swap, test referee"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://eliascodefi.github.io/onetree/#app",
+      "name": "onetree",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux",
+      "softwareVersion": "0.0.1a0",
+      "softwareRequirements": "Python 3.11 or newer, Git",
+      "installUrl": "https://github.com/EliasCodeFI/onetree#install",
+      "downloadUrl": "https://github.com/EliasCodeFI/onetree",
+      "license": "https://www.apache.org/licenses/LICENSE-2.0",
+      "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+      "description": "A command-line tool that lets several coding agents share one git clone and one working tree, with private indexes, path claims, a fail-closed commit broker and the test suite as merge referee."
+    },
+    {
+      "@type": "ImageObject",
+      "@id": "https://eliascodefi.github.io/onetree/#how-it-works-diagram",
+      "name": "How onetree works: several coding agents in one git working tree",
+      "contentUrl": "https://eliascodefi.github.io/onetree/assets/how-onetree-works-light.svg",
+      "encodingFormat": "image/svg+xml",
+      "description": "Animated diagram of onetree. Three coding agents share one git working tree. Each has a private index, claims the files it will write, and lands through a commit broker that audits the claims, runs a payload gate and the test suite, and then moves the branch.",
+      "caption": "Step 1: Sessions: a private index for every agent. Each agent registers a session and gets its own git index. Staging is private; the working tree is shared. Three agent cards (Agent A, Agent B, Agent C) stand on the left. In the middle is a panel titled \"One shared working tree\" with five files. On the right are the commit broker and the branch main. A box labelled \"index\" appears inside each agent card: each session has registered and received its own private git index. Three session_register events appear in the event log at the bottom. Step 2: Claims: exclusive write leases on paths. Before editing, a session claims the exact paths it will write. A claim is an exclusive lease on a path. Agent A claims src/api.py, Agent B claims src/auth.py and Agent C claims tests/test_api.py. An arrow runs from each agent to its file, and the file row shows \"claimed by A\" (or B, or C) with a badge carrying the agent's letter. Three claim events are appended to the log. Step 3: A refusal names the holder. A claim on a held path is refused, and the refusal names the holder. A change to a path you did not claim cannot land. Agent C also asks for src/api.py, which Agent A holds. The request is refused: the row shows \"C refused: held by A\" and a crossed-out badge with the letter C. A refused event is appended to the log. Step 4: Edit in the shared tree, stage privately. Agents edit their claimed files in the one working tree and stage them with ordinary git, each into its own index. Each agent edits its own file in the shared working tree; the rows change to \"edited by A\", \"edited by B\" and \"edited by C\". Each agent then stages its file into its own index: the index box in each agent card now names the staged file. Step 5: Landing: every change goes through the broker. onetree land audits the claims, runs the admitted payload gate and your tests, then moves the branch ref by compare-and-swap. Agent A lands. A chip labelled \"candidate A\" travels from A's index to the commit broker. The broker's four steps turn green one after another: claims audit, payload gate, test referee, compare-and-swap. A new commit marked A appears on the branch main, the file row shows \"landed by A\", and the events land_intent and landed are appended to the log. Step 6: A red candidate stays out. If the tests fail on the candidate, the landing is refused. The branch does not move, and the refusal is recorded. Agent B tries to land. Its candidate passes the claims audit and the payload gate, but the test referee turns red: the tests fail on the candidate. The candidate is marked refused, a crossed-out circle shows that no commit was added to main, and a refused event is appended to the log. Step 7: One tree, one history. One clone, one working tree, one linear history. Every claim, landing and refusal is an event in an append-only log kept in git: refs/onetree/wal. Agent C lands the same way as A: four green steps, and a second new commit, marked C, on main. The final picture: three agents, one working tree, a linear branch carrying the commits of A and C, B's change still waiting in the tree, and an event log with twelve entries."
+    },
+    {
+      "@type": "ImageObject",
+      "@id": "https://eliascodefi.github.io/onetree/#landing-path-diagram",
+      "name": "What onetree land does before a branch moves",
+      "contentUrl": "https://eliascodefi.github.io/onetree/assets/onetree-landing-path-light.svg",
+      "encodingFormat": "image/svg+xml",
+      "description": "Animated diagram of a onetree landing. A candidate commit built from a session's private index passes four steps in order (claims audit, payload gate, test referee, compare-and-swap) before it becomes a commit on the branch main. One candidate with an unclaimed path is refused at the audit, and of two racing candidates one wins and the other is rebuilt and tried again.",
+      "caption": "Step 1: A candidate is built from the private index. onetree land builds a candidate commit from the session's private index. The shared index and the working tree are not touched. A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session's index. Step 2: Four steps before the branch moves. Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A. Step 3: Fail-closed: one unclaimed path refuses it all. The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch. A token marked B starts from the index. The index now lists a second file, src/db.py, marked \"not claimed\". The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged. Step 4: A race has exactly one winner. When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled \"moved head: rebuilt on the new head, tried again\", passes all four steps again and becomes the next commit on main, after C. Step 5: What reaches the branch. Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with."
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://eliascodefi.github.io/onetree/#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is onetree?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A command-line tool that lets several coding agents work at the same time in one git clone and one working tree. Each session stages in a private git index, claims the paths it will write, and lands through a commit broker that audits the claims, runs a payload gate and the test suite, and moves the branch by compare-and-swap."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I install onetree?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is not on PyPI. Install it from its repository, for example with uv tool install git+https://github.com/EliasCodeFI/onetree. It needs Linux, Python 3.11 or newer and Git, and has no other dependencies."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does onetree need a daemon or a server?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The broker is a role, not a daemon: the landing code itself enforces every invariant through compare-and-swap on git refs and an append-only log on refs/onetree/wal."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which coding agents does onetree work with?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Any process that can run a command-line tool can be a session. The session id is given with --session or read from the environment variables ONETREE_SESSION_ID, CODEX_THREAD_ID or CLAUDE_SESSION_ID."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does onetree stop one agent from overwriting another agent's unstaged file?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. onetree guards the git layer: a change to a path a session did not claim cannot land, and unexplained branch movements are detected and block later landings. A working-tree command that moves no ref can still erase another session's unstaged work without being detected."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does onetree work on Windows?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The landing path needs POSIX process groups. onetree is developed and tested on Linux."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is the payload gate?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A Python script, commit_payload.py, that the repository's operator supplies, reviews and admits by its SHA-256 digest with onetree gate --admit. The broker runs a private copy of the admitted bytes on every candidate commit and lands only on a CLEAN verdict. onetree does not ship a gate, and a repository with no admitted gate refuses every landing."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is onetree faster or cheaper than git worktrees?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen, and no measured run exists yet."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+<style>
+:root {
+  --bg: #ffffff; --panel: #f6f8fa; --edge: #d0d7de; --text: #1f2328; --muted: #59636e;
+  --accent: #0969da; --accent-ink: #ffffff; --code: #f6f8fa; --ok: #1a7f37; --warn: #9a6700; --warn-bg: #fff8c5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #30363d; --text: #e6edf3; --muted: #9198a1;
+    --accent: #4493f8; --accent-ink: #0d1117; --code: #161b22; --ok: #3fb950; --warn: #d29922; --warn-bg: #2e2a1f;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, kbd { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+code { font-size: 0.9em; background: var(--code); border: 1px solid var(--edge); border-radius: 6px; padding: 0.1em 0.35em; }
+pre { background: var(--code); border: 1px solid var(--edge); border-radius: 10px; padding: 16px 18px; overflow-x: auto; font-size: 14px; line-height: 1.55; margin: 12px 0 20px; }
+pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+.skip { position: absolute; left: -9999px; }
+.skip:focus { left: 16px; top: 12px; background: var(--bg); padding: 8px 12px; border: 1px solid var(--edge); border-radius: 8px; z-index: 5; }
+
+header.top { border-bottom: 1px solid var(--edge); position: sticky; top: 0; background: var(--bg); z-index: 3; }
+header.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 60px; flex-wrap: wrap; }
+header.top .brand { display: flex; align-items: center; }
+header.top .brand img { height: 30px; width: auto; display: block; }
+nav.main { display: flex; gap: 20px; flex-wrap: wrap; font-size: 15px; }
+nav.main a { color: var(--muted); }
+nav.main a:hover { color: var(--text); text-decoration: none; }
+nav.main a.gh { color: var(--text); font-weight: 600; }
+
+.hero { text-align: center; padding: 72px 0 28px; }
+.hero h1 { margin: 0 0 22px; line-height: 1; }
+.hero h1 img { width: min(430px, 82vw); height: auto; }
+.hero .tag { font-size: clamp(26px, 4.6vw, 42px); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin: 0 0 18px; }
+.hero .lead { font-size: clamp(17px, 2.1vw, 20px); color: var(--muted); max-width: 760px; margin: 0 auto 28px; }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 22px; }
+.btn { display: inline-block; padding: 11px 20px; border-radius: 10px; font-weight: 600; border: 1px solid var(--edge); color: var(--text); background: var(--panel); }
+.btn:hover { text-decoration: none; border-color: var(--muted); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.facts { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; list-style: none; padding: 0; margin: 0; font-size: 14px; color: var(--muted); }
+.facts li { border: 1px solid var(--edge); border-radius: 999px; padding: 4px 12px; background: var(--panel); }
+.install-line { display: inline-block; text-align: left; margin: 0 auto 22px; max-width: 100%; }
+
+section { padding: 56px 0; border-top: 1px solid var(--edge); }
+section.first { border-top: 0; padding-top: 24px; }
+h2 { font-size: clamp(24px, 3.2vw, 32px); letter-spacing: -0.015em; line-height: 1.2; margin: 0 0 12px; }
+h3 { font-size: 19px; margin: 28px 0 8px; }
+.sub { color: var(--muted); max-width: 780px; margin: 0 0 28px; font-size: 17px; }
+figure { margin: 0; }
+figure img { width: 100%; height: auto; display: block; border-radius: 14px; }
+figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; text-align: center; }
+ol.steps { padding-left: 22px; margin: 22px 0 0; display: grid; gap: 12px; }
+ol.steps li { padding-left: 4px; }
+ol.steps .shows { display: block; color: var(--muted); font-size: 14.5px; margin-top: 3px; }
+details.transcript { margin-top: 18px; border: 1px solid var(--edge); border-radius: 12px; padding: 14px 18px; background: var(--panel); }
+details.transcript summary { cursor: pointer; font-weight: 600; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin-top: 8px; }
+.card { border: 1px solid var(--edge); border-radius: 14px; padding: 20px; background: var(--panel); }
+.card h3 { margin: 0 0 8px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+.card .n { display: inline-flex; width: 26px; height: 26px; border-radius: 50%; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 14px; margin-bottom: 12px; }
+.note { border: 1px solid var(--warn); background: var(--warn-bg); border-radius: 12px; padding: 14px 18px; margin: 0 0 28px; font-size: 15px; }
+.note strong { color: var(--warn); }
+.two { display: grid; gap: 28px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+table { border-collapse: collapse; width: 100%; font-size: 15px; display: block; overflow-x: auto; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--edge); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 13.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+td:first-child { white-space: nowrap; }
+ul.limits { padding-left: 20px; display: grid; gap: 10px; max-width: 860px; }
+dl.faq { max-width: 860px; margin: 0; }
+dl.faq dt { font-weight: 700; margin-top: 22px; font-size: 17px; }
+dl.faq dd { margin: 6px 0 0; color: var(--muted); }
+footer { border-top: 1px solid var(--edge); padding: 32px 0 56px; color: var(--muted); font-size: 14.5px; }
+footer .wrap { display: flex; gap: 12px 28px; flex-wrap: wrap; justify-content: space-between; }
+footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
+@media (max-width: 640px) { .hero { padding-top: 44px; } section { padding: 40px 0; } nav.main { gap: 14px; font-size: 14px; } }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to the content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="onetree, to the top of the page">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/onetree-logo-dark.svg">
+        <img src="assets/onetree-logo-light.svg" alt="onetree" width="154" height="30">
+      </picture>
+    </a>
+    <nav class="main" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a href="#quick-start">Quick start</a>
+      <a href="#commands">Commands</a>
+      <a href="#limits">Limits</a>
+      <a href="#faq">FAQ</a>
+      <a class="gh" href="https://github.com/EliasCodeFI/onetree">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap hero" id="top">
+  <h1>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/onetree-logo-dark.svg">
+      <img src="assets/onetree-logo-light.svg" alt="onetree" width="430" height="84">
+    </picture>
+  </h1>
+  <p class="tag">Your agents. One tree. No worktrees.</p>
+  <p class="lead">onetree lets several coding agents work at the same time in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.</p>
+  <div class="cta">
+    <a class="btn primary" href="#install">Install</a>
+    <a class="btn" href="#how">See how it works</a>
+    <a class="btn" href="https://github.com/EliasCodeFI/onetree">View on GitHub</a>
+  </div>
+  <pre class="install-line"><code>uv tool install git+https://github.com/EliasCodeFI/onetree</code></pre>
+  <ul class="facts" aria-label="Facts">
+    <li>Pre-release 0.0.1a0</li>
+    <li>Python 3.11+</li>
+    <li>Linux</li>
+    <li>Zero runtime dependencies</li>
+    <li>No daemon</li>
+    <li>Apache-2.0</li>
+  </ul>
+</div>
+
+<section class="first" id="how" aria-labelledby="how-h">
+  <div class="wrap">
+    <h2 id="how-h">How onetree works</h2>
+    <p class="sub">The usual way to run several coding agents on one repository is one git worktree per agent and a merge at the end. onetree is the other design: all sessions share one checkout, and the coordination a merge would do afterwards happens before the edit and at the commit.</p>
+    <figure>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/how-onetree-works-dark.svg">
+        <img src="assets/how-onetree-works-light.svg" width="960" height="640" alt="Animated diagram of onetree. Three coding agents share one git working tree. Each has a private index, claims the files it will write, and lands through a commit broker that audits the claims, runs a payload gate and the test suite, and then moves the branch.">
+      </picture>
+      <figcaption>A 34-second loop in seven steps. The same steps are written out below.</figcaption>
+    </figure>
+    <h3>What the animation shows</h3>
+    <ol class="steps">
+<li><strong>Sessions: a private index for every agent.</strong> Each agent registers a session and gets its own git index. Staging is private; the working tree is shared. <span class="shows">Three agent cards (Agent A, Agent B, Agent C) stand on the left. In the middle is a panel titled &quot;One shared working tree&quot; with five files. On the right are the commit broker and the branch main. A box labelled &quot;index&quot; appears inside each agent card: each session has registered and received its own private git index. Three session_register events appear in the event log at the bottom.</span></li>
+<li><strong>Claims: exclusive write leases on paths.</strong> Before editing, a session claims the exact paths it will write. A claim is an exclusive lease on a path. <span class="shows">Agent A claims src/api.py, Agent B claims src/auth.py and Agent C claims tests/test_api.py. An arrow runs from each agent to its file, and the file row shows &quot;claimed by A&quot; (or B, or C) with a badge carrying the agent&#x27;s letter. Three claim events are appended to the log.</span></li>
+<li><strong>A refusal names the holder.</strong> A claim on a held path is refused, and the refusal names the holder. A change to a path you did not claim cannot land. <span class="shows">Agent C also asks for src/api.py, which Agent A holds. The request is refused: the row shows &quot;C refused: held by A&quot; and a crossed-out badge with the letter C. A refused event is appended to the log.</span></li>
+<li><strong>Edit in the shared tree, stage privately.</strong> Agents edit their claimed files in the one working tree and stage them with ordinary git, each into its own index. <span class="shows">Each agent edits its own file in the shared working tree; the rows change to &quot;edited by A&quot;, &quot;edited by B&quot; and &quot;edited by C&quot;. Each agent then stages its file into its own index: the index box in each agent card now names the staged file.</span></li>
+<li><strong>Landing: every change goes through the broker.</strong> onetree land audits the claims, runs the admitted payload gate and your tests, then moves the branch ref by compare-and-swap. <span class="shows">Agent A lands. A chip labelled &quot;candidate A&quot; travels from A&#x27;s index to the commit broker. The broker&#x27;s four steps turn green one after another: claims audit, payload gate, test referee, compare-and-swap. A new commit marked A appears on the branch main, the file row shows &quot;landed by A&quot;, and the events land_intent and landed are appended to the log.</span></li>
+<li><strong>A red candidate stays out.</strong> If the tests fail on the candidate, the landing is refused. The branch does not move, and the refusal is recorded. <span class="shows">Agent B tries to land. Its candidate passes the claims audit and the payload gate, but the test referee turns red: the tests fail on the candidate. The candidate is marked refused, a crossed-out circle shows that no commit was added to main, and a refused event is appended to the log.</span></li>
+<li><strong>One tree, one history.</strong> One clone, one working tree, one linear history. Every claim, landing and refusal is an event in an append-only log kept in git: refs/onetree/wal. <span class="shows">Agent C lands the same way as A: four green steps, and a second new commit, marked C, on main. The final picture: three agents, one working tree, a linear branch carrying the commits of A and C, B&#x27;s change still waiting in the tree, and an event log with twelve entries.</span></li>
+</ol>
+  </div>
+</section>
+
+<section id="mechanism" aria-labelledby="mech-h">
+  <div class="wrap">
+    <h2 id="mech-h">Four parts, all in the git layer</h2>
+    <p class="sub">onetree is a command-line tool. Its state lives in the repository's own <code>.git</code> directory; the working tree stays free of state files. The contract is <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>, and every guarantee ships with a test that was seen failing before its guard existed.</p>
+    <div class="grid">
+      <div class="card"><span class="n">1</span><h3>Private index per session</h3><p>Every session stages into its own git index. Staging never collides, because no two sessions share an index. The working tree is shared; the staging layer is not.</p></div>
+      <div class="card"><span class="n">2</span><h3>Path claims</h3><p><code>onetree claim</code> takes an exclusive write claim on each path. A refusal names the current holder in a form a program can read. A relative, missing or out-of-repository path is a typed error, never a silent allow.</p></div>
+      <div class="card"><span class="n">3</span><h3>Commit broker</h3><p><code>onetree land</code> is the only landing path. It audits the claims, builds the commit from the session's index, runs the payload gate the operator admitted, checks the claims are still held, and moves the branch by compare-and-swap.</p></div>
+      <div class="card"><span class="n">4</span><h3>Test referee</h3><p>Before the branch moves, the test command you configure runs on a temporary checkout of the candidate. A red or timed-out candidate is refused.</p></div>
+    </div>
+    <p class="sub" style="margin-top:28px">All coordination state is an append-only event log on a dedicated ref, <code>refs/onetree/wal</code>, written with plain git plumbing. The broker is a role, not a daemon: the landing code itself enforces every invariant, so correctness never depends on a long-lived process.</p>
+  </div>
+</section>
+
+<section id="landing-path" aria-labelledby="land-h">
+  <div class="wrap">
+    <h2 id="land-h">What <code>onetree land</code> does before a branch moves</h2>
+    <p class="sub">A candidate commit passes four steps in order. Each one can refuse, and a refusal leaves the branch where it was.</p>
+    <figure>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/onetree-landing-path-dark.svg">
+        <img src="assets/onetree-landing-path-light.svg" width="960" height="440" alt="Animated diagram of a onetree landing. A candidate commit built from a session&#x27;s private index passes four steps in order (claims audit, payload gate, test referee, compare-and-swap) before it becomes a commit on the branch main. One candidate with an unclaimed path is refused at the audit, and of two racing candidates one wins and the other is rebuilt and tried again.">
+      </picture>
+      <figcaption>A 32-second loop in five steps. The same steps are written out below.</figcaption>
+    </figure>
+    <h3>What the animation shows</h3>
+    <ol class="steps">
+<li><strong>A candidate is built from the private index.</strong> onetree land builds a candidate commit from the session&#x27;s private index. The shared index and the working tree are not touched. <span class="shows">A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session&#x27;s index.</span></li>
+<li><strong>Four steps before the branch moves.</strong> Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. <span class="shows">The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A.</span></li>
+<li><strong>Fail-closed: one unclaimed path refuses it all.</strong> The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch. <span class="shows">A token marked B starts from the index. The index now lists a second file, src/db.py, marked &quot;not claimed&quot;. The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged.</span></li>
+<li><strong>A race has exactly one winner.</strong> When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. <span class="shows">Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled &quot;moved head: rebuilt on the new head, tried again&quot;, passes all four steps again and becomes the next commit on main, after C.</span></li>
+<li><strong>What reaches the branch.</strong> Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. <span class="shows">The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with.</span></li>
+</ol>
+  </div>
+</section>
+
+<section id="install" aria-labelledby="install-h">
+  <div class="wrap">
+    <h2 id="install-h">Install</h2>
+    <p class="sub">onetree is pre-release and <strong>is not on PyPI</strong>, so install it from its repository. <code>pip install onetree</code> does not install this project.</p>
+    <div class="two">
+      <div>
+        <h3>You need</h3>
+        <ul>
+          <li>Linux (Windows is not supported: the landing path needs POSIX process groups)</li>
+          <li>Python 3.11 or newer</li>
+          <li>Git</li>
+        </ul>
+        <p>There are no other dependencies.</p>
+        <h3>Check the installation</h3>
+<pre><code>$ onetree status
+onetree 0.0.1a0 (phase: gate-3-dogfood)</code></pre>
+      </div>
+      <div>
+        <h3>With uv</h3>
+<pre><code>uv tool install git+https://github.com/EliasCodeFI/onetree</code></pre>
+        <h3>With pipx</h3>
+<pre><code>pipx install git+https://github.com/EliasCodeFI/onetree</code></pre>
+        <h3>With pip, inside a virtual environment</h3>
+<pre><code>python3 -m venv .venv &amp;&amp; . .venv/bin/activate
+python -m pip install git+https://github.com/EliasCodeFI/onetree</code></pre>
+      </div>
+    </div>
+    <p>To pin an exact version, add a commit to the address: <code>git+https://github.com/EliasCodeFI/onetree@&lt;commit&gt;</code>.</p>
+  </div>
+</section>
+
+<section id="quick-start" aria-labelledby="qs-h">
+  <div class="wrap">
+    <h2 id="qs-h">Quick start</h2>
+    <h3>1. Once per repository, as its operator</h3>
+    <p>Admit a payload gate, name the referee, and optionally protect the baseline.</p>
+<pre><code>cd /path/to/your/repository
+
+# The payload gate is a Python script you supply and have reviewed. onetree does not ship one.
+onetree gate --admit /absolute/path/to/commit_payload.py
+
+# Your test command is the referee. It is parsed as quoted arguments, without a shell, and runs in
+# a temporary checkout of the candidate with a narrow environment (default time limit: 300 seconds).
+git config onetree.referee "/absolute/path/to/python -m pytest -q"
+
+# Optional: record the branch, the referee and the gate as the protected baseline.
+onetree protect</code></pre>
+    <h3>2. In every agent session</h3>
+    <p>Register, claim, edit, stage into the private index, land.</p>
+<pre><code>export ONETREE_SESSION_ID=agent-a      # or pass --session agent-a to each command
+
+onetree session --json                 # registers the session and prints its private index path
+onetree claim "$PWD/src/api.py"        # claims take absolute, existing paths
+
+# ... edit src/api.py in the shared working tree ...
+
+GIT_INDEX_FILE=&lt;index path printed by `onetree session`&gt; git add src/api.py
+onetree land -m "api: handle empty input"
+onetree release "$PWD/src/api.py"</code></pre>
+    <p>A session lives as long as the process it was registered for, and for at most 24 hours by default (<code>--ttl</code>). That process is the parent of <code>onetree session</code>, normally your shell. A harness that starts a new shell for every command names its own long-lived process instead, with <code>onetree session --pid &lt;pid&gt;</code>.</p>
+    <p>A session that asks for a path another session holds gets an error that names the holder, for example <code>onetree: claim refused; held by agent-a</code>. With <code>--json</code> the error object has the type <code>claim_conflict</code> and lists the paths and the holders.</p>
+    <p>To see it work without your own repository, <code>python -m onetree.demo</code> runs independent worker processes against a new sample repository it creates: a real claim refusal first, then landings through the broker. It needs the payload gate you supply and a new output directory; the options are in <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DEMO.md">docs/DEMO.md</a>.</p>
+  </div>
+</section>
+
+<section id="commands" aria-labelledby="cmd-h">
+  <div class="wrap">
+    <h2 id="cmd-h">Commands</h2>
+    <p class="sub">Every command accepts <code>--json</code> and then writes exactly one JSON object to standard output.</p>
+    <table>
+      <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>onetree status</code></td><td>Report version and build phase.</td></tr>
+        <tr><td><code>onetree session</code></td><td>Register or inspect a session index.</td></tr>
+        <tr><td><code>onetree claim &lt;path&gt;...</code></td><td>Claim one or more absolute existing paths.</td></tr>
+        <tr><td><code>onetree check &lt;path&gt;...</code></td><td>Check one or more absolute existing paths; exit status 1 when another live session holds one.</td></tr>
+        <tr><td><code>onetree narrow &lt;parent&gt; &lt;path&gt;...</code></td><td>Atomically retain descendants of a held path.</td></tr>
+        <tr><td><code>onetree release [&lt;path&gt;...]</code></td><td>Release selected paths or all held paths.</td></tr>
+        <tr><td><code>onetree land -m &lt;message&gt;</code></td><td>Audit and compare-and-swap-land the session index.</td></tr>
+        <tr><td><code>onetree gate [--admit &lt;file&gt;]</code></td><td>Inspect or admit the repository's commit payload gate.</td></tr>
+        <tr><td><code>onetree protect</code></td><td>Protect the current shared branch baseline.</td></tr>
+        <tr><td><code>onetree reconcile</code></td><td>Explicitly accept an inspected workspace baseline.</td></tr>
+        <tr><td><code>onetree wal [--recover]</code></td><td>Verify and inspect <code>refs/onetree/wal</code>; resolve any exposed intent.</td></tr>
+        <tr><td><code>onetree autosave save|list|restore|status</code></td><td>Save, list or restore snapshots of claimed working bytes.</td></tr>
+        <tr><td><code>onetree gc</code></td><td>Append a stale-session and stale-claim collection event.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="limits" aria-labelledby="limits-h">
+  <div class="wrap">
+    <h2 id="limits-h">What onetree does not do</h2>
+    <p class="note"><strong>No performance claims.</strong> onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen in <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/PREREGISTRATION.md">docs/PREREGISTRATION.md</a>, and no measured run exists yet.</p>
+    <ul class="limits">
+      <li><strong>It does not isolate runtime resources.</strong> Claims are write claims on repository paths. Two sessions that bind the same port or change the same database interfere exactly as they would without onetree.</li>
+      <li><strong>It is one host, one clone, no daemon, no network.</strong> Pushes to a remote are outside the broker.</li>
+      <li><strong>It guards the git layer only.</strong> What git does not record, onetree does not see. A working-tree command that moves no ref, such as <code>git checkout -- &lt;path&gt;</code> or <code>git restore</code>, can erase another session's unstaged work without being detected. Protection is detection and refusal of later landings, not prevention.</li>
+      <li><strong>It is not a sandbox.</strong> Sessions, the referee and the payload gate run as the same user.</li>
+      <li><strong>It needs POSIX.</strong> Windows is unsupported for the landing path.</li>
+      <li><strong>The referee refuses; it does not diagnose.</strong> A red result names a conflicting pair only when that pair was shown to fail.</li>
+    </ul>
+    <p>The full list, each statement tied to a record, is <a href="https://github.com/EliasCodeFI/onetree/blob/main/LIMITATIONS.md">LIMITATIONS.md</a>.</p>
+  </div>
+</section>
+
+<section id="faq" aria-labelledby="faq-h">
+  <div class="wrap">
+    <h2 id="faq-h">Questions</h2>
+    <dl class="faq">
+      <dt>What is onetree?</dt>
+      <dd>A command-line tool that lets several coding agents work at the same time in one git clone and one working tree. Each session stages in a private git index, claims the paths it will write, and lands through a commit broker that audits the claims, runs a payload gate and the test suite, and moves the branch by compare-and-swap.</dd>
+      <dt>How do I install onetree?</dt>
+      <dd>It is not on PyPI. Install it from its repository, for example with <code>uv tool install git+https://github.com/EliasCodeFI/onetree</code>. It needs Linux, Python 3.11 or newer and Git, and has no other dependencies.</dd>
+      <dt>Does onetree need a daemon or a server?</dt>
+      <dd>No. The broker is a role, not a daemon: the landing code itself enforces every invariant through compare-and-swap on git refs and an append-only log on <code>refs/onetree/wal</code>.</dd>
+      <dt>Which coding agents does onetree work with?</dt>
+      <dd>Any process that can run a command-line tool can be a session. The session id is given with <code>--session</code> or read from the environment variables <code>ONETREE_SESSION_ID</code>, <code>CODEX_THREAD_ID</code> or <code>CLAUDE_SESSION_ID</code>.</dd>
+      <dt>Does onetree stop one agent from overwriting another agent's unstaged file?</dt>
+      <dd>No. onetree guards the git layer: a change to a path a session did not claim cannot land, and unexplained branch movements are detected and block later landings. A working-tree command that moves no ref can still erase another session's unstaged work without being detected.</dd>
+      <dt>Does onetree work on Windows?</dt>
+      <dd>No. The landing path needs POSIX process groups. onetree is developed and tested on Linux.</dd>
+      <dt>What is the payload gate?</dt>
+      <dd>A Python script, <code>commit_payload.py</code>, that the repository's operator supplies, reviews and admits by its SHA-256 digest with <code>onetree gate --admit</code>. The broker runs a private copy of the admitted bytes on every candidate commit and lands only on a <code>CLEAN</code> verdict. onetree does not ship a gate, and a repository with no admitted gate refuses every landing.</dd>
+      <dt>Is onetree faster or cheaper than git worktrees?</dt>
+      <dd>onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen, and no measured run exists yet.</dd>
+    </dl>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>onetree · Copyright 2026 Fastnet Oy · <a href="https://github.com/EliasCodeFI/onetree/blob/main/LICENSE">Apache License 2.0</a></div>
+    <nav aria-label="Project links">
+      <a href="https://github.com/EliasCodeFI/onetree">GitHub</a>
+      <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md">Design</a>
+      <a href="https://github.com/EliasCodeFI/onetree/blob/main/LIMITATIONS.md">Limitations</a>
+      <a href="https://github.com/EliasCodeFI/onetree/blob/main/CONTRIBUTING.md">Contributing</a>
+      <a href="https://github.com/EliasCodeFI/onetree/blob/main/SECURITY.md">Security</a>
+      <a href="llms.txt">llms.txt</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

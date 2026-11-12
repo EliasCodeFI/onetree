@@ -1,0 +1,6 @@
+# Crawlers read robots.txt only at the root of a host. This file therefore takes effect when the
+# onetree web page has its own domain; under a github.io project address it is not consulted.
+User-agent: *
+Allow: /
+
+Sitemap: https://eliascodefi.github.io/onetree/sitemap.xml
