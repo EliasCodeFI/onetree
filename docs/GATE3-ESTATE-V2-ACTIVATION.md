@@ -34,6 +34,6 @@ each alone under a 1,408 MiB memory cap:
 | 3 | 10:33:30 | 1639 passed, 52 skipped, coverage 91.10% | 371.1 s | 954 MiB |
 
 The setup record attributes these measurements to
-`C:/Users/Spartallan/estate-v2/work/integrate/INTEGRATION-R8.md`, section 2.
+`C:/Users/estateuser/estate-v2/work/integrate/INTEGRATION-R8.md`, section 2.
 Measurements of exact-path claims and session waiting times are unknown from the
 setup record.

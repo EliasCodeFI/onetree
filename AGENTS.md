@@ -54,7 +54,7 @@ These instructions apply only to native Codex pull-request reviews. They do not 
 
 Use current CI results and only affected existing checks when authorized and available in a disposable test environment. These examples do not require all commands on every PR. Missing prerequisites remain unvalidated; do not use live providers, deploy/provision resources, or run mutating snapshot/replay builders as a review.
 
-- `pytest` — The workflow serializes a labeled self-hosted Linux runner; unavailable runner/POSIX capabilities are infrastructure limits, not grounds for automated code fixes.
+- `pytest` — The workflow runs each supported Python on a fresh GitHub-hosted Linux runner; unavailable runner/POSIX capabilities are infrastructure limits, not grounds for automated code fixes.
 - `ruff check src tests` — existing CI.
 - `mypy` — existing strict package CI.
 

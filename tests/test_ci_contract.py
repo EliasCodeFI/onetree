@@ -92,6 +92,13 @@ def test_notice_names_the_copyright_holder_beside_the_licence() -> None:
     assert notice.read_text().splitlines()[:2] == ["onetree", "Copyright 2026 Fastnet Oy"]
 
 
+def test_distributions_carry_the_notice_as_a_licence_file() -> None:
+    """Known-bad: main a768f9a, whose wheel carried LICENSE alone."""
+
+    configuration = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    assert configuration["project"]["license-files"] == ["LICENSE", "NOTICE"]
+
+
 def test_coverage_configuration_measures_python_subprocesses() -> None:
     """pytest-cov 7 delegates child-process startup to coverage.py's patch."""
 
