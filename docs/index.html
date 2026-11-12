@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>onetree: several coding agents in one git working tree, no worktrees</title>
-<meta name="description" content="onetree lets several coding agents work at the same time in one git clone and one working tree. Private indexes, path claims, a fail-closed commit broker, and your test suite as the merge referee. Pre-release, Python 3.11+, zero dependencies, Apache-2.0.">
+<meta name="description" content="onetree lets several coding agents work at the same time in one git clone and one working tree. A private git index for each agent, claims on the files it writes, a broker that checks every commit, and your test suite as the referee. Pre-release, Python 3.11+, zero dependencies, Apache-2.0.">
 <meta name="keywords" content="onetree, coding agents, AI agents, git, working tree, worktree alternative, multi-agent, path claims, commit broker, compare-and-swap, merge queue, Claude Code, Codex">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <link rel="canonical" href="https://eliascodefi.github.io/onetree/">
@@ -14,7 +14,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="onetree">
 <meta property="og:title" content="onetree: your agents, one tree, no worktrees">
-<meta property="og:description" content="Several coding agents working at the same time in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.">
+<meta property="og:description" content="Several coding agents working at the same time in one git clone and one working tree: a private git index for each agent, claims on the files it writes, a broker that checks every commit, and your test suite as the referee.">
 <meta property="og:url" content="https://eliascodefi.github.io/onetree/">
 <meta property="og:image" content="https://eliascodefi.github.io/onetree/assets/social-preview.png">
 <meta property="og:image:width" content="1280">
@@ -22,7 +22,7 @@
 <meta property="og:image:alt" content="The onetree logo above the line: Your agents. One tree. No worktrees.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="onetree: your agents, one tree, no worktrees">
-<meta name="twitter:description" content="Several coding agents in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.">
+<meta name="twitter:description" content="Several coding agents in one git clone and one working tree: a private git index for each agent, claims on the files it writes, a broker that checks every commit, and your test suite as the referee.">
 <meta name="twitter:image" content="https://eliascodefi.github.io/onetree/assets/social-preview.png">
 <script type="application/ld+json">
 {
@@ -56,7 +56,7 @@
       "downloadUrl": "https://github.com/EliasCodeFI/onetree",
       "license": "https://www.apache.org/licenses/LICENSE-2.0",
       "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
-      "description": "A command-line tool that lets several coding agents share one git clone and one working tree, with private indexes, path claims, a fail-closed commit broker and the test suite as merge referee."
+      "description": "A command-line tool that lets several coding agents share one git clone and one working tree, with a private git index for each agent, claims on the files it writes, a broker that checks every commit, and the test suite as referee."
     },
     {
       "@type": "ImageObject",
@@ -74,7 +74,7 @@
       "contentUrl": "https://eliascodefi.github.io/onetree/assets/onetree-landing-path-light.svg",
       "encodingFormat": "image/svg+xml",
       "description": "Animated diagram of a onetree landing. A candidate commit built from a session's private index passes four steps in order (claims audit, payload gate, test referee, compare-and-swap) before it becomes a commit on the branch main. One candidate with an unclaimed path is refused at the audit, and of two racing candidates one wins and the other is rebuilt and tried again.",
-      "caption": "Step 1: A candidate is built from the private index. onetree land builds a candidate commit from the session's private index. The shared index and the working tree are not touched. A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session's index. Step 2: Four steps before the branch moves. Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A. Step 3: Fail-closed: one unclaimed path refuses it all. The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch. A token marked B starts from the index. The index now lists a second file, src/db.py, marked \"not claimed\". The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged. Step 4: A race has exactly one winner. When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled \"moved head: rebuilt on the new head, tried again\", passes all four steps again and becomes the next commit on main, after C. Step 5: What reaches the branch. Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with."
+      "caption": "Step 1: A candidate is built from the private index. onetree land builds a candidate commit from the session's private index. The shared index and the working tree are not touched. A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session's index. Step 2: Four steps before the branch moves. Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A. Step 3: One unclaimed path refuses it all. If one changed path was not claimed by this session, the whole candidate is refused. Nothing reaches the branch. A token marked B starts from the index. The index now lists a second file, src/db.py, marked \"not claimed\". The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged. Step 4: A race has exactly one winner. When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled \"moved head: rebuilt on the new head, tried again\", passes all four steps again and becomes the next commit on main, after C. Step 5: What reaches the branch. Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with."
     },
     {
       "@type": "FAQPage",
@@ -114,14 +114,6 @@
         },
         {
           "@type": "Question",
-          "name": "Does onetree stop one agent from overwriting another agent's unstaged file?",
-          "acceptedAnswer": {
-            "@type": "Answer",
-            "text": "No. onetree guards the git layer: a change to a path a session did not claim cannot land, and unexplained branch movements are detected and block later landings. A working-tree command that moves no ref can still erase another session's unstaged work without being detected."
-          }
-        },
-        {
-          "@type": "Question",
           "name": "Does onetree work on Windows?",
           "acceptedAnswer": {
             "@type": "Answer",
@@ -134,14 +126,6 @@
           "acceptedAnswer": {
             "@type": "Answer",
             "text": "A Python script, commit_payload.py, that the repository's operator supplies, reviews and admits by its SHA-256 digest with onetree gate --admit. The broker runs a private copy of the admitted bytes on every candidate commit and lands only on a CLEAN verdict. onetree does not ship a gate, and a repository with no admitted gate refuses every landing."
-          }
-        },
-        {
-          "@type": "Question",
-          "name": "Is onetree faster or cheaper than git worktrees?",
-          "acceptedAnswer": {
-            "@type": "Answer",
-            "text": "onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen, and no measured run exists yet."
           }
         }
       ]
@@ -252,7 +236,7 @@ footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
       <a href="#install">Install</a>
       <a href="#quick-start">Quick start</a>
       <a href="#commands">Commands</a>
-      <a href="#limits">Limits</a>
+      <a href="#limits">Good to know</a>
       <a href="#faq">FAQ</a>
       <a class="gh" href="https://github.com/EliasCodeFI/onetree">GitHub</a>
     </nav>
@@ -268,7 +252,7 @@ footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
     </picture>
   </h1>
   <p class="tag">Your agents. One tree. No worktrees.</p>
-  <p class="lead">onetree lets several coding agents work at the same time in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.</p>
+  <p class="lead">onetree lets several coding agents work at the same time in one git clone and one working tree: a private git index for each agent, claims on the files it writes, a broker that checks every commit, and your test suite as the referee.</p>
   <div class="cta">
     <a class="btn primary" href="#install">Install</a>
     <a class="btn" href="#how">See how it works</a>
@@ -311,15 +295,15 @@ footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
 
 <section id="mechanism" aria-labelledby="mech-h">
   <div class="wrap">
-    <h2 id="mech-h">Four parts, all in the git layer</h2>
-    <p class="sub">onetree is a command-line tool. Its state lives in the repository's own <code>.git</code> directory; the working tree stays free of state files. The contract is <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>, and every guarantee ships with a test that was seen failing before its guard existed.</p>
+    <h2 id="mech-h">Four parts, all in git</h2>
+    <p class="sub">onetree is a command-line tool with no server. Its state lives in the repository's own <code>.git</code> directory, so your working tree stays free of extra files. The details are in <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md">docs/DESIGN.md</a>.</p>
     <div class="grid">
-      <div class="card"><span class="n">1</span><h3>Private index per session</h3><p>Every session stages into its own git index. Staging never collides, because no two sessions share an index. The working tree is shared; the staging layer is not.</p></div>
-      <div class="card"><span class="n">2</span><h3>Path claims</h3><p><code>onetree claim</code> takes an exclusive write claim on each path. A refusal names the current holder in a form a program can read. A relative, missing or out-of-repository path is a typed error, never a silent allow.</p></div>
-      <div class="card"><span class="n">3</span><h3>Commit broker</h3><p><code>onetree land</code> is the only landing path. It audits the claims, builds the commit from the session's index, runs the payload gate the operator admitted, checks the claims are still held, and moves the branch by compare-and-swap.</p></div>
-      <div class="card"><span class="n">4</span><h3>Test referee</h3><p>Before the branch moves, the test command you configure runs on a temporary checkout of the candidate. A red or timed-out candidate is refused.</p></div>
+      <div class="card"><span class="n">1</span><h3>Private index per agent</h3><p>Every agent session stages into its own git index, so staging never collides. The working tree is shared; the staging area is not.</p></div>
+      <div class="card"><span class="n">2</span><h3>Claims</h3><p><code>onetree claim</code> gives a session the exclusive right to write a file. Asking for a file someone else holds is refused, and the refusal names the holder.</p></div>
+      <div class="card"><span class="n">3</span><h3>Commit broker</h3><p><code>onetree land</code> is the only way into the shared branch. It checks the claims, builds the commit from the session's own index, runs the payload gate you admitted, and moves the branch only if nobody moved it in the meantime.</p></div>
+      <div class="card"><span class="n">4</span><h3>Test referee</h3><p>Before the branch moves, your test command runs on a temporary checkout of the change. If the tests fail or time out, the change is refused.</p></div>
     </div>
-    <p class="sub" style="margin-top:28px">All coordination state is an append-only event log on a dedicated ref, <code>refs/onetree/wal</code>, written with plain git plumbing. The broker is a role, not a daemon: the landing code itself enforces every invariant, so correctness never depends on a long-lived process.</p>
+    <p class="sub" style="margin-top:28px">Everything onetree records goes into an append-only log on the git ref <code>refs/onetree/wal</code>.</p>
   </div>
 </section>
 
@@ -338,7 +322,7 @@ footer nav { display: flex; gap: 18px; flex-wrap: wrap; }
     <ol class="steps">
 <li><strong>A candidate is built from the private index.</strong> onetree land builds a candidate commit from the session&#x27;s private index. The shared index and the working tree are not touched. <span class="shows">A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session&#x27;s index.</span></li>
 <li><strong>Four steps before the branch moves.</strong> Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. <span class="shows">The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A.</span></li>
-<li><strong>Fail-closed: one unclaimed path refuses it all.</strong> The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch. <span class="shows">A token marked B starts from the index. The index now lists a second file, src/db.py, marked &quot;not claimed&quot;. The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged.</span></li>
+<li><strong>One unclaimed path refuses it all.</strong> If one changed path was not claimed by this session, the whole candidate is refused. Nothing reaches the branch. <span class="shows">A token marked B starts from the index. The index now lists a second file, src/db.py, marked &quot;not claimed&quot;. The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged.</span></li>
 <li><strong>A race has exactly one winner.</strong> When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. <span class="shows">Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled &quot;moved head: rebuilt on the new head, tried again&quot;, passes all four steps again and becomes the next commit on main, after C.</span></li>
 <li><strong>What reaches the branch.</strong> Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. <span class="shows">The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with.</span></li>
 </ol>
@@ -437,17 +421,14 @@ onetree release "$PWD/src/api.py"</code></pre>
 
 <section id="limits" aria-labelledby="limits-h">
   <div class="wrap">
-    <h2 id="limits-h">What onetree does not do</h2>
-    <p class="note"><strong>No performance claims.</strong> onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen in <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/PREREGISTRATION.md">docs/PREREGISTRATION.md</a>, and no measured run exists yet.</p>
+    <h2 id="limits-h">Good to know</h2>
     <ul class="limits">
-      <li><strong>It does not isolate runtime resources.</strong> Claims are write claims on repository paths. Two sessions that bind the same port or change the same database interfere exactly as they would without onetree.</li>
-      <li><strong>It is one host, one clone, no daemon, no network.</strong> Pushes to a remote are outside the broker.</li>
-      <li><strong>It guards the git layer only.</strong> What git does not record, onetree does not see. A working-tree command that moves no ref, such as <code>git checkout -- &lt;path&gt;</code> or <code>git restore</code>, can erase another session's unstaged work without being detected. Protection is detection and refusal of later landings, not prevention.</li>
-      <li><strong>It is not a sandbox.</strong> Sessions, the referee and the payload gate run as the same user.</li>
-      <li><strong>It needs POSIX.</strong> Windows is unsupported for the landing path.</li>
-      <li><strong>The referee refuses; it does not diagnose.</strong> A red result names a conflicting pair only when that pair was shown to fail.</li>
+      <li>Claims cover files in the repository. They do not keep agents apart at run time: two agents that use the same port or database still meet there.</li>
+      <li>onetree works on one machine and one clone. Pushing to GitHub or another remote is up to you.</li>
+      <li>It protects what git records. A command that changes files without git recording it, such as <code>git checkout -- &lt;file&gt;</code>, is not caught.</li>
+      <li>Linux only.</li>
     </ul>
-    <p>The full list, each statement tied to a record, is <a href="https://github.com/EliasCodeFI/onetree/blob/main/LIMITATIONS.md">LIMITATIONS.md</a>.</p>
+    <p>Something not working as you expect? <a href="https://github.com/EliasCodeFI/onetree/issues">Open an issue</a>.</p>
   </div>
 </section>
 
@@ -463,14 +444,10 @@ onetree release "$PWD/src/api.py"</code></pre>
       <dd>No. The broker is a role, not a daemon: the landing code itself enforces every invariant through compare-and-swap on git refs and an append-only log on <code>refs/onetree/wal</code>.</dd>
       <dt>Which coding agents does onetree work with?</dt>
       <dd>Any process that can run a command-line tool can be a session. The session id is given with <code>--session</code> or read from the environment variables <code>ONETREE_SESSION_ID</code>, <code>CODEX_THREAD_ID</code> or <code>CLAUDE_SESSION_ID</code>.</dd>
-      <dt>Does onetree stop one agent from overwriting another agent's unstaged file?</dt>
-      <dd>No. onetree guards the git layer: a change to a path a session did not claim cannot land, and unexplained branch movements are detected and block later landings. A working-tree command that moves no ref can still erase another session's unstaged work without being detected.</dd>
       <dt>Does onetree work on Windows?</dt>
       <dd>No. The landing path needs POSIX process groups. onetree is developed and tested on Linux.</dd>
       <dt>What is the payload gate?</dt>
       <dd>A Python script, <code>commit_payload.py</code>, that the repository's operator supplies, reviews and admits by its SHA-256 digest with <code>onetree gate --admit</code>. The broker runs a private copy of the admitted bytes on every candidate commit and lands only on a <code>CLEAN</code> verdict. onetree does not ship a gate, and a repository with no admitted gate refuses every landing.</dd>
-      <dt>Is onetree faster or cheaper than git worktrees?</dt>
-      <dd>onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen, and no measured run exists yet.</dd>
     </dl>
   </div>
 </section>
@@ -482,7 +459,6 @@ onetree release "$PWD/src/api.py"</code></pre>
     <nav aria-label="Project links">
       <a href="https://github.com/EliasCodeFI/onetree">GitHub</a>
       <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md">Design</a>
-      <a href="https://github.com/EliasCodeFI/onetree/blob/main/LIMITATIONS.md">Limitations</a>
       <a href="https://github.com/EliasCodeFI/onetree/blob/main/CONTRIBUTING.md">Contributing</a>
       <a href="https://github.com/EliasCodeFI/onetree/blob/main/SECURITY.md">Security</a>
       <a href="llms.txt">llms.txt</a>

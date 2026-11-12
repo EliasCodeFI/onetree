@@ -4,13 +4,13 @@
 
 onetree is a command-line tool, not a service: one host, one clone, no daemon, no network. Its state is an append-only event log kept in the repository itself, on the ref `refs/onetree/wal`.
 
-- Status: pre-release, version 0.0.1a0. onetree makes no speed, cost or throughput claims: its benchmark protocol is frozen and no measured run exists yet.
+- Status: pre-release, version 0.0.1a0. Problems and questions go to https://github.com/EliasCodeFI/onetree/issues
 - Needs: Linux, Python 3.11 or newer, and Git. No other dependencies. Windows is not supported.
 - Install: onetree is not on PyPI, and `pip install onetree` does not install this project. Install it from its repository with `uv tool install git+https://github.com/EliasCodeFI/onetree`, or `pipx install git+https://github.com/EliasCodeFI/onetree`, or, inside a virtual environment, `python -m pip install git+https://github.com/EliasCodeFI/onetree`. Check the installation with `onetree status`, which prints `onetree 0.0.1a0 (phase: gate-3-dogfood)`.
 - Commands: `onetree status`, `session`, `claim`, `check`, `narrow`, `release`, `land`, `gate`, `protect`, `reconcile`, `wal`, `autosave` and `gc`. Every command accepts `--json` and then writes exactly one JSON object to standard output.
 - Session identity: `--session <id>`, or one of the environment variables `ONETREE_SESSION_ID`, `CODEX_THREAD_ID` and `CLAUDE_SESSION_ID`.
 - A payload gate is required: a Python script, `commit_payload.py`, that the repository's operator supplies and admits with `onetree gate --admit`. onetree does not ship one, and a repository with no admitted gate refuses every landing.
-- Limits: onetree guards the git layer only. It does not isolate ports, databases or other runtime resources, it is not a sandbox, and a working-tree command that moves no ref can still erase another session's unstaged work without being detected.
+- Good to know: claims cover repository files, not ports, databases or other things agents share at run time; onetree works on one machine and one clone, and pushing to a remote is up to you; a command that changes files without git recording it, such as `git checkout -- <file>`, is not caught.
 - Licence: Apache-2.0. Source: https://github.com/EliasCodeFI/onetree
 
 How onetree works, in seven steps (the same steps as the animated diagram in the README):
@@ -27,7 +27,7 @@ What `onetree land` does before a branch moves, in five steps (the second animat
 
 1. **A candidate is built from the private index.** onetree land builds a candidate commit from the session's private index. The shared index and the working tree are not touched.
 2. **Four steps before the branch moves.** Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event.
-3. **Fail-closed: one unclaimed path refuses it all.** The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch.
+3. **One unclaimed path refuses it all.** If one changed path was not claimed by this session, the whole candidate is refused. Nothing reaches the branch.
 4. **A race has exactly one winner.** When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again.
 5. **What reaches the branch.** Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was.
 
@@ -35,7 +35,6 @@ What `onetree land` does before a branch moves, in five steps (the second animat
 
 - [README](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/README.md): what onetree is, how to install it, a quick start and the command list
 - [Design contract](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/DESIGN.md): the mechanism, the state model and the invariants
-- [Limitations](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/LIMITATIONS.md): what onetree does not guarantee, each statement tied to a record
 - [Diagram descriptions](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/assets/DIAGRAMS.md): both animated diagrams described step by step in words
 - [Web page as Markdown](https://eliascodefi.github.io/onetree/index.html.md): the project's web page in Markdown
 
@@ -43,11 +42,8 @@ What `onetree land` does before a branch moves, in five steps (the second animat
 
 - [Contributing](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/CONTRIBUTING.md): how to contribute
 - [Security policy](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/SECURITY.md): how to report a vulnerability privately
-- [How AI tools were used](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/AI_USAGE.md): the record of AI use in building this repository
 - [License](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/LICENSE): Apache License 2.0
 
 ## Optional
 
 - [Demo](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/DEMO.md): a local run with synthetic workers against a new sample repository
-- [Benchmark preregistration](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/PREREGISTRATION.md): the frozen benchmark protocol
-- [Prior art](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/PRIOR-ART.md): the projects this design learned from

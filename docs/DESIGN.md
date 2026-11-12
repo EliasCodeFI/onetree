@@ -1,7 +1,27 @@
-# onetree design — Gate 1 contract
+# onetree design
 
-N agent sessions, one clone, one working tree. Four elements make that safe;
-this document is the implementation contract for the first two rounds.
+Several agent sessions, one clone, one working tree. Four parts make that safe. This document is
+the technical contract: what the code guarantees and what the tests check. It is precise rather
+than easy; the [README](../README.md) explains the same mechanism in plain words.
+
+## Words used here
+
+- **Session**: one agent working in the clone, identified by a session id.
+- **Index**: git's staging area. Every session has its own.
+- **Claim**: a session's exclusive right to write one path.
+- **Payload**: the paths a landing changes. **Candidate**: the commit built for a landing.
+- **Broker**: the code behind `onetree land`, the only way a change reaches the shared branch.
+- **Payload gate**: a script the repository's operator supplies and admits; it checks every
+  candidate before it lands.
+- **Referee**: the operator's test command, run on the candidate before the branch moves.
+- **WAL**: the write-ahead log, an append-only event log kept on the ref `refs/onetree/wal`.
+- **CAS**: compare-and-swap; the branch moves only if nobody moved it since the candidate was
+  built.
+- **Fence**: the check, at the moment of landing, that the session still holds its claims.
+- **Train**: a candidate together with the candidates queued ahead of it.
+- **Baseline** and **epoch**: the state of the shared branch that `onetree protect` records; each
+  protection or reconciliation starts a new epoch.
+- **Adoption**: the operator's explicit acceptance of a landing the WAL did not record.
 
 ## Mechanism
 
@@ -35,24 +55,21 @@ this document is the implementation contract for the first two rounds.
    - land: compare-and-swap `update-ref` on the target branch; on a moved
      head, re-parent the built tree and retry; exactly one racer wins per
      attempt, losers retry cleanly.
-4. **Test referee** (Round B). Before the ref moves, the candidate is tested
+4. **Test referee.** Before the ref moves, the candidate is tested
    atop everything queued ahead of it (the exact train). A red train names
    a conflicting pair only when that pair was demonstrated to fail;
    otherwise it reports the demonstrated failing combination or explicitly
    unresolved localization. Red and timed-out candidates remain refused.
-   Minimality and localization-cost claims require supporting evidence
-   (see `docs/ROUND-B-AMENDMENT.md`). Plus: Git-layer detection of unexplained
+   Claims that a reported combination is minimal, or about the cost of finding
+   it, require supporting evidence. Plus: Git-layer detection of unexplained
    ref transitions recorded in the reflog of a protected shared clone (`switch`,
    `checkout <branch>`, destructive `reset`, `stash`, a bare commit), with
    persistent refusal of subsequent landings. Working-tree operations that move
    no ref leave no reflog transition and are NOT detected: `checkout -- <path>`,
    `restore`, `read-tree -u`, `checkout-index` erase unstaged peer work
    unobserved (measured 2026-09-10). This does not prevent the external
-   operation or recover erased unstaged work; the measured boundary and
-   evidence-loss residuals are explicit in `docs/ROUND-B.md`.
-   A typed rejection
-   contract that names exactly the invalidated paths so a session repairs
-   minimally.
+   operation or recover erased unstaged work. A refusal names exactly the paths it invalidated, so a
+   session can repair only those.
 
 ## State model
 
@@ -76,7 +93,8 @@ operator reason, the prior epoch id and violation, and a new observed baseline
 after claims and pending intents are clear. Earlier epochs remain in the WAL;
 ordinary protection and recovery cannot perform this operation. Reconciliation
 does not repair branch or file state and does not dismiss other WAL/branch
-divergence. The operator workflow is in `ROUND-WORKSPACE-RECONCILIATION.md`.
+divergence. The operator runs it as
+`onetree reconcile --expected-epoch <current protection event id> --reason <text>`.
 `adopted` records the operator's explicit
 acceptance of a broker landing the WAL did not record; every other kind is
 written by the broker itself. The working tree stays pristine — no state files
@@ -113,7 +131,13 @@ branch audit neither reports it nor adopts it again. The current writer still
 writes `adopted` at version 2 and refuses to append a version-1 document;
 every other version/kind disagreement, every version above the reader's, and
 every malformed document are refused as above. No other kind has a historical
-version (task 70, `ROUND-LEGACY-ADOPTION.md`).
+version.
+
+A WAL event that is valid JSON but cannot be decoded within the running
+interpreter's limits (integer conversion or nesting depth) is refused as
+`wal_corrupt` with `reason: "json_decode_limit"` and the event's commit id;
+`onetree wal --json` then exits with status 2. The reason says the event could not
+be decoded under the current settings, not that its stored JSON is invalid.
 
 Each event records an actor string. Session operations use their session id;
 explicit adoption records the literal `operator`. That adoption actor is a
@@ -140,10 +164,10 @@ warnings and traces unrelated to refs cannot deny every OneTree command. The
 storage reconciliation carries that decision for files refs; reftable retains
 its explicit broken-branch diagnostic guard.
 
-## Invariants — each ships with a red-first fixture
+## Invariants
 
-A fixture must be observed FAILING before its guard exists; a test that has
-never failed is not evidence.
+Each invariant ships with a test that was observed failing before its guard
+existed; a test that has never failed is not evidence.
 
 - **INV1** No landing whose payload contains an unclaimed path.
 - **INV2** No landing after fence loss (claim reclaimed, session dead).
@@ -178,10 +202,8 @@ never failed is not evidence.
   back to the overall minimum). Adopted-record verification uses the same
   bounded exact-membership reduction. Raw parsing is skipped only when the
   message contains no CR byte; horizontal trimming can otherwise expose a raw
-  terminal CR even when line splitting did not remove one. The measured
-  predicate and deliberate exclusion of key-alias configurations that rename
-  unrelated markers are recorded in `docs/ROUND-AF10.md`; the bounded large
-  folded-input fixture is recorded in `docs/ROUND-AF11.md`.
+  terminal CR even when line splitting did not remove one. Key-alias
+  configurations that rename unrelated markers are deliberately excluded.
 - **INV9** No candidate becomes visible on a target branch or in a WAL intent
   unless the source-admitted commit-payload gate echoed and audited that exact
   candidate and exact path set CLEAN. The gate runs from a read-only private
@@ -209,25 +231,15 @@ never failed is not evidence.
   exit without reaping it and reaps only after that signal, so the group it
   signals is always the gate's own. A descendant that calls `setsid` has left the
   group and is outside that contract, and a successful gate's descendants are not
-  signalled (POSIX only; `docs/ROUND-GATE-GROUP.md`).
+  signalled (POSIX only).
   The gate's complete report and admitted source digest are retained in the
   intent, or in a classified gate-refusal event. Landed and recovered records
   refer to that immutable carrier. Hook suite evidence, advisories and allowed
   NO_COMPANION outcomes remain visible; historical records without evidence
-  are explicitly unrecorded. The receipt and replay contract is recorded in
-  `docs/ROUND-GATE-EVIDENCE.md`.
+  are explicitly unrecorded.
 
-## Non-goals for Round A
+## Not in scope
 
-Train referee, branch-op guards, and rejection contract are Round B. Signing
-implementation, multi-host sync, and any daemon are later gates. No runtime
-dependencies at any point.
-
-## Prior art informing this design
-
-safegit (per-invocation index isolation + CAS ref landing) · agentlocks (lease
-fencing, staged-vs-locked verification) · Flightdeck (server-executed scoped
-commits + post-commit audit) · mergetrain (exact-train testing, conflict
-bisection) · grite/brat (refs-based append-only WAL, actor identity, janitor
-role, daemon-optional correctness). See the launch PRIOR-ART document for the
-full survey and credits.
+Event signing, synchronisation between hosts, and a daemon are not implemented. There are no
+runtime dependencies at any point. The projects this design learned from are credited in the
+[README](../README.md#credits).

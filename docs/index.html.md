@@ -1,8 +1,8 @@
 # onetree
 
-> Your agents. One tree. No worktrees. onetree lets several coding agents work at the same time in one git clone and one working tree: private indexes, path claims, a fail-closed commit broker, and your test suite as the referee.
+> Your agents. One tree. No worktrees. onetree lets several coding agents work at the same time in one git clone and one working tree: a private git index for each agent, claims on the files it writes, a broker that checks every commit, and your test suite as the referee.
 
-Pre-release 0.0.1a0 · Python 3.11+ · Linux · zero runtime dependencies · no daemon · Apache-2.0 ·
+Pre-release 0.0.1a0 · Python 3.11+ · Linux · zero runtime dependencies · no server · Apache-2.0 ·
 [Source on GitHub](https://github.com/EliasCodeFI/onetree)
 
 ```sh
@@ -12,7 +12,7 @@ uv tool install git+https://github.com/EliasCodeFI/onetree
 ## How onetree works
 
 The usual way to run several coding agents on one repository is one git worktree per agent and a
-merge at the end. onetree is the other design: all sessions share one checkout, and the coordination
+merge at the end. onetree is the other design: all agents share one checkout, and the coordination
 a merge would do afterwards happens before the edit and at the commit.
 
 ![Animated diagram of onetree. Three coding agents share one git working tree. Each has a private index, claims the files it will write, and lands through a commit broker that audits the claims, runs a payload gate and the test suite, and then moves the branch.](assets/how-onetree-works-light.svg)
@@ -27,28 +27,23 @@ What the animation shows, a 34-second loop in seven steps:
 6. **A red candidate stays out.** If the tests fail on the candidate, the landing is refused. The branch does not move, and the refusal is recorded. *In the picture:* Agent B tries to land. Its candidate passes the claims audit and the payload gate, but the test referee turns red: the tests fail on the candidate. The candidate is marked refused, a crossed-out circle shows that no commit was added to main, and a refused event is appended to the log.
 7. **One tree, one history.** One clone, one working tree, one linear history. Every claim, landing and refusal is an event in an append-only log kept in git: refs/onetree/wal. *In the picture:* Agent C lands the same way as A: four green steps, and a second new commit, marked C, on main. The final picture: three agents, one working tree, a linear branch carrying the commits of A and C, B's change still waiting in the tree, and an event log with twelve entries.
 
-## Four parts, all in the git layer
+## Four parts, all in git
 
-onetree is a command-line tool. Its state lives in the repository's own `.git` directory; the working
-tree stays free of state files. The contract is
-[docs/DESIGN.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md), and every
-guarantee ships with a test that was seen failing before its guard existed.
+onetree is a command-line tool with no server. Its state lives in the repository's own `.git`
+directory, so your working tree stays free of extra files. The details are in
+[docs/DESIGN.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/DESIGN.md).
 
-1. **Private index per session.** Every session stages into its own git index. Staging never
-   collides, because no two sessions share an index. The working tree is shared; the staging layer is
-   not.
-2. **Path claims.** `onetree claim` takes an exclusive write claim on each path. A refusal names the
-   current holder in a form a program can read. A relative, missing or out-of-repository path is a
-   typed error, never a silent allow.
-3. **Commit broker.** `onetree land` is the only landing path. It audits the claims, builds the
-   commit from the session's index, runs the payload gate the operator admitted, checks the claims
-   are still held, and moves the branch by compare-and-swap.
-4. **Test referee.** Before the branch moves, the test command you configure runs on a temporary
-   checkout of the candidate. A red or timed-out candidate is refused.
+1. **Private index per agent.** Every agent session stages into its own git index, so staging never
+   collides. The working tree is shared; the staging area is not.
+2. **Claims.** `onetree claim` gives a session the exclusive right to write a file. Asking for a
+   file someone else holds is refused, and the refusal names the holder.
+3. **Commit broker.** `onetree land` is the only way into the shared branch. It checks the claims,
+   builds the commit from the session's own index, runs the payload gate you admitted, and moves the
+   branch only if nobody moved it in the meantime.
+4. **Test referee.** Before the branch moves, your test command runs on a temporary checkout of the
+   change. If the tests fail or time out, the change is refused.
 
-All coordination state is an append-only event log on a dedicated ref, `refs/onetree/wal`, written
-with plain git plumbing. The broker is a role, not a daemon: the landing code itself enforces every
-invariant, so correctness never depends on a long-lived process.
+Everything onetree records goes into an append-only log on the git ref `refs/onetree/wal`.
 
 ## What `onetree land` does before a branch moves
 
@@ -61,7 +56,7 @@ What the animation shows, a 32-second loop in five steps:
 
 1. **A candidate is built from the private index.** onetree land builds a candidate commit from the session's private index. The shared index and the working tree are not touched. *In the picture:* A row of boxes runs from left to right: a session with its private index, four numbered steps (claims audit, payload gate, test referee, compare-and-swap) and the branch main. A rail connects them. A token marked A, the candidate commit of Agent A, appears at the session's index.
 2. **Four steps before the branch moves.** Each step can refuse. Only a candidate that passes all four moves the ref. A landing is recorded in the append-only log as an intent and a landed event. *In the picture:* The token A moves along the rail and stops at each step. Each step turns green as the candidate passes it: the claims audit, the payload gate, the test referee (shown working for a moment before it turns green) and the compare-and-swap. The token then moves onto the branch main and becomes a new commit marked A.
-3. **Fail-closed: one unclaimed path refuses it all.** The audit is fail-closed: a payload with one path this session has not claimed is refused as a whole. Nothing reaches the branch. *In the picture:* A token marked B starts from the index. The index now lists a second file, src/db.py, marked "not claimed". The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged.
+3. **One unclaimed path refuses it all.** If one changed path was not claimed by this session, the whole candidate is refused. Nothing reaches the branch. *In the picture:* A token marked B starts from the index. The index now lists a second file, src/db.py, marked "not claimed". The token stops at the first step, the claims audit, which turns red and shows the reason unclaimed_paths. The token is crossed out and disappears. The branch main is unchanged.
 4. **A race has exactly one winner.** When two landings race, the compare-and-swap lets exactly one move the ref. The other is rebuilt on the new head and goes through the steps again. *In the picture:* Two tokens, C and B, travel through the first three steps one behind the other. At the compare-and-swap, C arrives first and becomes a new commit on main. For B the step turns amber: the head has moved. B travels back along a dashed return line labelled "moved head: rebuilt on the new head, tried again", passes all four steps again and becomes the next commit on main, after C.
 5. **What reaches the branch.** Every commit on the branch is the exact candidate that was audited, gated and tested. A refused candidate leaves the branch where it was. *In the picture:* The final picture: all four steps are green and the branch main carries three new commits in the order A, C, B, after the commit it started with.
 
@@ -70,8 +65,7 @@ What the animation shows, a 32-second loop in five steps:
 onetree is pre-release and **is not on PyPI**, so install it from its repository. `pip install
 onetree` does not install this project.
 
-You need Linux, Python 3.11 or newer, and Git. There are no other dependencies. Windows is not
-supported: the landing path needs POSIX process groups.
+You need Linux, Python 3.11 or newer, and Git. There are no other dependencies.
 
 With uv:
 
@@ -104,8 +98,8 @@ To pin an exact version, add a commit to the address:
 
 ## Quick start
 
-**1. Once per repository, as its operator.** Admit a payload gate, name the referee, and optionally
-protect the baseline.
+**1. Once per repository.** Admit a payload gate, name your test command, and optionally protect
+the branch.
 
 ```sh
 cd /path/to/your/repository
@@ -113,8 +107,8 @@ cd /path/to/your/repository
 # The payload gate is a Python script you supply and have reviewed. onetree does not ship one.
 onetree gate --admit /absolute/path/to/commit_payload.py
 
-# Your test command is the referee. It is parsed as quoted arguments, without a shell, and runs in
-# a temporary checkout of the candidate with a narrow environment (default time limit: 300 seconds).
+# Your test command is the referee. It runs without a shell, in a temporary checkout of each
+# change (default time limit: 300 seconds).
 git config onetree.referee "/absolute/path/to/python -m pytest -q"
 
 # Optional: record the branch, the referee and the gate as the protected baseline.
@@ -141,14 +135,13 @@ A session lives as long as the process it was registered for, and for at most 24
 starts a new shell for every command names its own long-lived process instead, with
 `onetree session --pid <pid>`.
 
-A session that asks for a path another session holds gets an error that names the holder, for
-example `onetree: claim refused; held by agent-a`. With `--json` the error object has the type
+A session that asks for a file another session holds gets an error that names the holder, for
+example `onetree: claim refused; held by agent-a`. With `--json` the error has the type
 `claim_conflict` and lists the paths and the holders.
 
-To see it work without your own repository, `python -m onetree.demo` runs independent worker
-processes against a new sample repository it creates: a real claim refusal first, then landings
-through the broker. It needs the payload gate you supply and a new output directory; the options are
-in [docs/DEMO.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/DEMO.md).
+To see it work without your own repository, `python -m onetree.demo` runs several worker processes
+against a new sample repository: a claim refusal first, then landings through the broker. See
+[docs/DEMO.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/DEMO.md).
 
 ## Commands
 
@@ -162,7 +155,7 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 | `onetree check <path>...` | Check one or more absolute existing paths; exit status 1 when another live session holds one. |
 | `onetree narrow <parent> <path>...` | Atomically retain descendants of a held path. |
 | `onetree release [<path>...]` | Release selected paths or all held paths. |
-| `onetree land -m <message>` | Audit and compare-and-swap-land the session index. |
+| `onetree land -m <message>` | Audit the session index and land it on the branch. |
 | `onetree gate [--admit <file>]` | Inspect or admit the repository's commit payload gate. |
 | `onetree protect` | Protect the current shared branch baseline. |
 | `onetree reconcile` | Explicitly accept an inspected workspace baseline. |
@@ -170,27 +163,17 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 | `onetree autosave save\|list\|restore\|status` | Save, list or restore snapshots of claimed working bytes. |
 | `onetree gc` | Append a stale-session and stale-claim collection event. |
 
-## What onetree does not do
+## Good to know
 
-onetree makes no speed, cost or throughput claims. Its benchmark protocol is frozen in
-[docs/PREREGISTRATION.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/PREREGISTRATION.md),
-and no measured run exists yet.
+- Claims cover files in the repository. They do not keep agents apart at run time: two agents that
+  use the same port or database still meet there.
+- onetree works on one machine and one clone. Pushing to GitHub or another remote is up to you.
+- It protects what git records. A command that changes files without git recording it, such as
+  `git checkout -- <file>`, is not caught.
+- Linux only.
 
-- **It does not isolate runtime resources.** Claims are write claims on repository paths. Two
-  sessions that bind the same port or change the same database interfere exactly as they would
-  without onetree.
-- **It is one host, one clone, no daemon, no network.** Pushes to a remote are outside the broker.
-- **It guards the git layer only.** What git does not record, onetree does not see. A working-tree
-  command that moves no ref, such as `git checkout -- <path>` or `git restore`, can erase another
-  session's unstaged work without being detected. Protection is detection and refusal of later
-  landings, not prevention.
-- **It is not a sandbox.** Sessions, the referee and the payload gate run as the same user.
-- **It needs POSIX.** Windows is unsupported for the landing path.
-- **The referee refuses; it does not diagnose.** A red result names a conflicting pair only when
-  that pair was shown to fail.
-
-The full list, each statement tied to a record, is
-[LIMITATIONS.md](https://github.com/EliasCodeFI/onetree/blob/main/LIMITATIONS.md).
+Something not working as you expect?
+[Open an issue](https://github.com/EliasCodeFI/onetree/issues).
 
 ## Questions
 
@@ -211,11 +194,6 @@ itself enforces every invariant through compare-and-swap on git refs and an appe
 a session. The session id is given with `--session` or read from the environment variables
 `ONETREE_SESSION_ID`, `CODEX_THREAD_ID` or `CLAUDE_SESSION_ID`.
 
-**Does onetree stop one agent from overwriting another agent's unstaged file?** No. onetree guards
-the git layer: a change to a path a session did not claim cannot land, and unexplained branch
-movements are detected and block later landings. A working-tree command that moves no ref can still
-erase another session's unstaged work without being detected.
-
 **Does onetree work on Windows?** No. The landing path needs POSIX process groups. onetree is
 developed and tested on Linux.
 
@@ -223,9 +201,6 @@ developed and tested on Linux.
 supplies, reviews and admits by its SHA-256 digest with `onetree gate --admit`. The broker runs a
 private copy of the admitted bytes on every candidate commit and lands only on a `CLEAN` verdict.
 onetree does not ship a gate, and a repository with no admitted gate refuses every landing.
-
-**Is onetree faster or cheaper than git worktrees?** onetree makes no speed, cost or throughput
-claims. Its benchmark protocol is frozen, and no measured run exists yet.
 
 ---
 

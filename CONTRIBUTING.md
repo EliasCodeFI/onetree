@@ -5,23 +5,23 @@ change.
 
 ## Before you write code
 
-Read `docs/DESIGN.md` for the mechanism and `LIMITATIONS.md` for what onetree deliberately does not
-do. For anything larger than a fix, open an issue first and say what you want to change and why.
+Read [`docs/DESIGN.md`](docs/DESIGN.md) for the mechanism. For anything larger than a fix, open an
+issue first and say what you want to change and why.
 
 ## The rules a change has to meet
 
-These are the project's non-negotiables (`AGENTS.md` has them for coding agents):
+These are the project's rules (`AGENTS.md` has them for coding agents):
 
 1. **No runtime dependencies.** Development tools go in the `dev` extra only.
-2. **Every CLI subcommand supports `--json`**: exactly one JSON object on stdout and nothing else
-   on stdout.
-3. **Red first.** Every guarantee ships with a known-bad fixture that was seen failing before the
-   guard existed. Say in the pull request which test failed on the code before your change, and
-   show its output. A test that has never failed is not evidence.
-4. **Enforcement lives in the git layer**, never only in a harness hook.
-5. **The benchmark protocol in `docs/PREREGISTRATION.md` is frozen.** A change to it is a labelled
-   amendment, committed before any measured run it affects.
-6. **Adverse results are published.** If onetree loses on an axis, the axis is reported.
+2. **Every command supports `--json`**: exactly one JSON object on standard output and nothing else
+   there.
+3. **Test first.** Every guarantee comes with a test that was seen failing before the code that
+   makes it pass existed. Say in the pull request which test failed on the code before your
+   change, and show its output. A test that has never failed proves nothing.
+4. **Enforcement lives in git**, never only in a hook of some agent tool.
+5. **The benchmark protocol in [`docs/PREREGISTRATION.md`](docs/PREREGISTRATION.md) is frozen.** A
+   change to it is a labelled amendment, committed before any measured run it affects.
+6. **Bad results are published.** If onetree loses on some measure, that measure is reported.
 
 ## Setting up and checking
 
@@ -40,11 +40,14 @@ four commands on Python 3.11, 3.12 and 3.13, and a pull request needs all of the
 
 ## Pull requests
 
-- One change per pull request, with a description of what was wrong, what changed, and the red and
-  green test output.
+- One change per pull request, with a description of what was wrong, what changed, and the test
+  output before and after.
 - Do not weaken or delete an existing test to make a change pass.
 - If an AI coding tool wrote or helped write the change, say which one in the description.
-  `AI_USAGE.md` records how this repository itself was built.
+
+Some code comments cite development records as `docs/ROUND-*.md`. Those records were removed from
+the tree on 2026-11-12; they are in the
+[development history](https://github.com/EliasCodeFI/onetree/tree/546094fbbb3f70a9123e0e2fd1d86fecaa4e4336/docs).
 
 ## Licence of contributions
 
@@ -54,4 +57,4 @@ There is no separate contributor agreement.
 
 ## Security
 
-Do not report a vulnerability in an issue or a pull request: see `SECURITY.md`.
+Do not report a vulnerability in an issue or a pull request: see [`SECURITY.md`](SECURITY.md).
