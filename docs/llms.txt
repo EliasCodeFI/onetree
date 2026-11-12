@@ -35,13 +35,12 @@ What `onetree land` does before a branch moves, in five steps (the second animat
 
 - [README](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/README.md): what onetree is, how to install it, a quick start and the command list
 - [Design contract](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/DESIGN.md): the mechanism, the state model and the invariants
-- [Diagram descriptions](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/assets/DIAGRAMS.md): both animated diagrams described step by step in words
 - [Web page as Markdown](https://eliascodefi.github.io/onetree/index.html.md): the project's web page in Markdown
 
 ## Project
 
-- [Contributing](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/CONTRIBUTING.md): how to contribute
-- [Security policy](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/SECURITY.md): how to report a vulnerability privately
+- [Contributing](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/.github/CONTRIBUTING.md): how to contribute
+- [Security policy](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/.github/SECURITY.md): how to report a vulnerability privately
 - [License](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/LICENSE): Apache License 2.0
 
 ## Optional

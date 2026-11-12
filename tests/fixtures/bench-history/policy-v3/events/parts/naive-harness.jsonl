@@ -1,4 +1,0 @@
-{"detail": {}, "disk_bytes": 0, "disk_detail": {}, "duration_s": 0.0, "kind": "setup", "system": "naive", "t": 0.0, "writer": null}
-{"complete": true, "ended": 9.0, "exitcodes": [0], "kind": "run", "started": 0.5, "system": "naive", "t": 9.0, "writer": null}
-{"after": "run_end", "checkout": "main", "index": "main", "kind": "observed", "paths": {"corpus/f000.txt": {"file": ["61a5954d73da"], "index": []}, "corpus/f001.txt": {"file": ["b3f610eef1cc"], "index": []}}, "system": "naive", "t": 9.5, "writer": null}
-{"disk_bytes": 0, "disk_detail": {}, "head": "c1", "kind": "final", "system": "naive", "t": 10.0, "tokens_by_path": {}, "unrecorded_commits": [], "writer": null}

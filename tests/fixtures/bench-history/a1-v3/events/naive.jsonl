@@ -1,7 +1,0 @@
-{"detail": {}, "disk_bytes": 0, "disk_detail": {}, "duration_s": 0.0, "kind": "setup", "system": "naive", "t": 0.0, "writer": null}
-{"attempt": 1, "content_sha256": "c20cb48f713e0e3638e084b55359c73007f42c0ecfcc1e66c1c5e0779f1baa0a", "kind": "write", "path": "corpus/f000.txt", "system": "naive", "t": 1.0, "task": 0, "token": "5a8c67bb65b6", "write_id": "w0-t0-a1-p0", "writer": 0}
-{"attempt": 1, "content_sha256": "76e2fd0eb1f4b0d43e209d30762e4b0f6bca434d946ffa7300efe385e0a206c2", "kind": "write", "path": "corpus/f001.txt", "system": "naive", "t": 2.0, "task": 0, "token": "7000f236102c", "write_id": "w1-t0-a1-p0", "writer": 1}
-{"attempt": 1, "commit": "c0", "green": null, "kind": "landed", "payload": [{"blob": "b", "content_sha256": "c20cb48f713e0e3638e084b55359c73007f42c0ecfcc1e66c1c5e0779f1baa0a", "path": "corpus/f000.txt", "tokens": ["5a8c67bb65b6"]}], "system": "naive", "t": 5.0, "task": 0, "write_ids": ["w0-t0-a1-p0"], "writer": 0}
-{"attempt": 1, "commit": "c1", "green": null, "kind": "landed", "payload": [{"blob": "b", "content_sha256": "76e2fd0eb1f4b0d43e209d30762e4b0f6bca434d946ffa7300efe385e0a206c2", "path": "corpus/f001.txt", "tokens": ["7000f236102c"]}], "system": "naive", "t": 6.0, "task": 0, "write_ids": ["w1-t0-a1-p0"], "writer": 1}
-{"complete": true, "ended": 9.0, "exitcodes": [0], "kind": "run", "started": 0.5, "system": "naive", "t": 9.0, "writer": null}
-{"disk_bytes": 0, "disk_detail": {}, "head": "c1", "kind": "final", "system": "naive", "t": 10.0, "tokens_by_path": {}, "writer": null}

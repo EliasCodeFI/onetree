@@ -1,3 +1,0 @@
-{"detail": {}, "disk_bytes": 0, "disk_detail": {}, "duration_s": 0.0, "kind": "setup", "system": "naive", "t": 0.0, "writer": null}
-{"complete": true, "ended": 9.0, "exitcodes": [0], "kind": "run", "started": 0.5, "system": "naive", "t": 9.0, "writer": null}
-{"disk_bytes": 0, "disk_detail": {}, "head": "c1", "kind": "final", "system": "naive", "t": 10.0, "tokens_by_path": {}, "writer": null}

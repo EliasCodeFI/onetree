@@ -5,8 +5,8 @@ change.
 
 ## Before you write code
 
-Read [`docs/DESIGN.md`](docs/DESIGN.md) for the mechanism. For anything larger than a fix, open an
-issue first and say what you want to change and why.
+Read [`docs/DESIGN.md`](../docs/DESIGN.md) for the mechanism. For anything larger than a fix, open
+an issue first and say what you want to change and why.
 
 ## The rules a change has to meet
 
@@ -19,9 +19,6 @@ These are the project's rules (`AGENTS.md` has them for coding agents):
    makes it pass existed. Say in the pull request which test failed on the code before your
    change, and show its output. A test that has never failed proves nothing.
 4. **Enforcement lives in git**, never only in a hook of some agent tool.
-5. **The benchmark protocol in [`docs/PREREGISTRATION.md`](docs/PREREGISTRATION.md) is frozen.** A
-   change to it is a labelled amendment, committed before any measured run it affects.
-6. **Bad results are published.** If onetree loses on some measure, that measure is reported.
 
 ## Setting up and checking
 

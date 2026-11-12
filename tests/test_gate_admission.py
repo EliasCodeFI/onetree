@@ -13,9 +13,6 @@ import pytest
 from conftest import _CLEAN_PAYLOAD_GATE_SOURCE, GitFixture
 
 from onetree import git as git_module
-from onetree.bench import corpus as corpus_module
-from onetree.bench import runner, systems
-from onetree.bench.corpus import Grid
 from onetree.cli import main
 from onetree.core import Coordinator
 from onetree.errors import PayloadGateError
@@ -354,30 +351,3 @@ def test_unreadable_admission_configuration_is_a_gate_error(
     with pytest.raises(PayloadGateError, match=message):
         repository.payload_gate_admission()
 
-
-def test_the_bench_admits_the_operator_gate_in_its_own_repository(tmp_path: Path) -> None:
-    gate = _gate(tmp_path)
-    digest = hashlib.sha256(gate.read_bytes()).hexdigest()
-    out = tmp_path / "run"
-    (out / "harness").mkdir(parents=True)
-    referee = out / "harness" / "referee_check.py"
-    referee.write_text(systems.REFEREE_SOURCE, encoding="utf-8")
-    grid = Grid(writers=1, tasks=1, files=2, conflict=0.0, jitter_ms=0)
-    corpus = corpus_module.build(grid, 5)
-    settings = runner.Settings(
-        seed=5,
-        grid=grid,
-        systems=("onetree",),
-        gate=gate,
-        message="bench landing\n",
-        deadline_s=60.0,
-        ttl=120.0,
-    )
-    arm, _ = runner.prepare(out, "onetree", corpus, settings, referee, gate_sha256=digest)
-    admission = git_module.Repository(arm.checkout).payload_gate_admission()
-    assert admission == git_module.PayloadGateAdmission(str(gate.resolve()), digest)
-
-    with pytest.raises(PayloadGateError, match="digest named for admission"):
-        runner.prepare(
-            tmp_path / "other", "onetree", corpus, settings, referee, gate_sha256="0" * 64
-        )

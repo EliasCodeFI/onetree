@@ -39,24 +39,50 @@ def invoke(output: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.fixture
-def inputs(tmp_path: Path) -> tuple[Path, Path]:
+def _shipped_gate() -> Path | None:
     gate = Path(
         os.environ.get(
             "ONETREE_TEST_SHIPPED_GATE", str(Path.home() / ".claude/tools/commit_payload.py")
         )
     )
-    if not gate.is_file():
-        if "ONETREE_TEST_SHIPPED_GATE" in os.environ:
-            pytest.fail(f"configured gate is missing: {gate}")
-        pytest.skip("demo integration requires the admitted payload gate")
+    if gate.is_file():
+        return gate
+    if "ONETREE_TEST_SHIPPED_GATE" in os.environ:
+        pytest.fail(f"configured gate is missing: {gate}")
+    return None
+
+
+def _message(tmp_path: Path) -> Path:
     message = tmp_path / "message.txt"
     message.write_text(
         "Demo sample\n\nCo-Authored-By: Codex <codex@example.invalid>\n"
         f"Codex-Session: {_SESSION}\n",
         encoding="utf-8",
     )
-    return gate, message
+    return message
+
+
+@pytest.fixture
+def inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """The shipped payload gate, for the tests that check what that gate itself reports."""
+    gate = _shipped_gate()
+    if gate is None:
+        pytest.skip("demo integration requires the admitted payload gate")
+    return gate, _message(tmp_path)
+
+
+@pytest.fixture
+def any_gate_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """The shipped payload gate when it is installed, else a clean stub gate.
+
+    These tests do not depend on which gate reports CLEAN: docs/DEMO.md states that the demo
+    admits the gate it is given. With the stub they also run where no shipped gate exists.
+    """
+    gate = _shipped_gate()
+    if gate is None:
+        gate = tmp_path / "clean_stub_gate.py"
+        gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
+    return gate, _message(tmp_path)
 
 
 def run_demo(output: Path, inputs: tuple[Path, Path], *extra: str) -> dict[str, Any]:
@@ -67,23 +93,23 @@ def run_demo(output: Path, inputs: tuple[Path, Path], *extra: str) -> dict[str, 
     return report
 
 
-def test_existing_output_is_untouched(tmp_path: Path, inputs: tuple[Path, Path]) -> None:
+def test_existing_output_is_untouched(tmp_path: Path, any_gate_inputs: tuple[Path, Path]) -> None:
     output = tmp_path / "existing"
     output.mkdir()
     marker = output / "keep"
     marker.write_bytes(b"unchanged")
-    report = run_demo(output, inputs)
+    report = run_demo(output, any_gate_inputs)
     assert not report["ok"]
     assert report["error"]["type"] == "FileExistsError"
     assert list(output.iterdir()) == [marker]
     assert marker.read_bytes() == b"unchanged"
 
 
-def test_symlink_output_is_untouched(tmp_path: Path, inputs: tuple[Path, Path]) -> None:
+def test_symlink_output_is_untouched(tmp_path: Path, any_gate_inputs: tuple[Path, Path]) -> None:
     output = tmp_path / "link"
     target = tmp_path / "absent"
     output.symlink_to(target, target_is_directory=True)
-    report = run_demo(output, inputs)
+    report = run_demo(output, any_gate_inputs)
     assert not report["ok"]
     assert output.is_symlink()
     assert not target.exists()
@@ -121,12 +147,12 @@ def _admitted(gate: Path) -> dict[str, str]:
 
 def test_any_supplied_clean_gate_is_admitted_and_succeeds(
     tmp_path: Path,
-    inputs: tuple[Path, Path],
+    any_gate_inputs: tuple[Path, Path],
 ) -> None:
     # docs/DEMO.md: the demo admits the gate it is given and does not check which one.
     gate = tmp_path / "stub_gate.py"
     gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
-    report = run_demo(tmp_path / "sample", (gate, inputs[1]), "--workers", "2")
+    report = run_demo(tmp_path / "sample", (gate, any_gate_inputs[1]), "--workers", "2")
     assert report["ok"], report
     assert report["gate"] == _admitted(gate)
     assert all("commit" in worker["land"] for worker in report["workers"])
@@ -134,11 +160,11 @@ def test_any_supplied_clean_gate_is_admitted_and_succeeds(
 
 def test_a_gate_without_a_clean_verdict_never_succeeds(
     tmp_path: Path,
-    inputs: tuple[Path, Path],
+    any_gate_inputs: tuple[Path, Path],
 ) -> None:
     gate = tmp_path / "silent_gate.py"
     gate.write_text("raise SystemExit(0)\n", encoding="utf-8")
-    report = run_demo(tmp_path / "sample", (gate, inputs[1]), "--workers", "2")
+    report = run_demo(tmp_path / "sample", (gate, any_gate_inputs[1]), "--workers", "2")
     assert not report["ok"]
     assert report["gate"] == _admitted(gate)
     errors = [worker["error"] for worker in report["workers"] if "error" in worker]
@@ -174,9 +200,11 @@ def test_other_session_identity_is_refused_by_real_gate(
     )
 
 
-def test_missing_gate_does_not_create_output(tmp_path: Path, inputs: tuple[Path, Path]) -> None:
+def test_missing_gate_does_not_create_output(
+    tmp_path: Path, any_gate_inputs: tuple[Path, Path]
+) -> None:
     output = tmp_path / "sample"
-    report = run_demo(output, (tmp_path / "missing", inputs[1]))
+    report = run_demo(output, (tmp_path / "missing", any_gate_inputs[1]))
     assert not report["ok"]
     assert not output.exists()
 
@@ -186,11 +214,11 @@ def test_missing_gate_does_not_create_output(tmp_path: Path, inputs: tuple[Path,
 )
 def test_invalid_limits_are_json_failures(
     tmp_path: Path,
-    inputs: tuple[Path, Path],
+    any_gate_inputs: tuple[Path, Path],
     args: tuple[str, str],
 ) -> None:
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, *args)
+    report = run_demo(output, any_gate_inputs, *args)
     assert not report["ok"]
     assert not output.exists()
 
@@ -201,9 +229,11 @@ def test_argument_error_is_json(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["error"]["type"] == "ValueError"
 
 
-def test_deadline_retains_failed_evidence(tmp_path: Path, inputs: tuple[Path, Path]) -> None:
+def test_deadline_retains_failed_evidence(
+    tmp_path: Path, any_gate_inputs: tuple[Path, Path]
+) -> None:
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, "--timeout", "0.000001")
+    report = run_demo(output, any_gate_inputs, "--timeout", "0.000001")
     assert not report["ok"]
     assert report["error"]["type"] == "TimeoutError"
     assert all(worker["exitcode"] is not None for worker in report["workers"])
@@ -212,12 +242,12 @@ def test_deadline_retains_failed_evidence(tmp_path: Path, inputs: tuple[Path, Pa
 
 def test_sample_violation_is_refused_by_real_referee(
     tmp_path: Path,
-    inputs: tuple[Path, Path],
+    any_gate_inputs: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output = tmp_path / "sample"
     output.mkdir()
-    gate, message = inputs
+    gate, message = any_gate_inputs
     demo._setup(output, gate, 2, 30)
     for name in _IDENTITY_NAMES:
         monkeypatch.delenv(name, raising=False)

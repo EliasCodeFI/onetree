@@ -23,15 +23,12 @@ make it disappear.
    before the guard existed (red-first). A test that has never failed is not
    evidence.
 4. Enforcement lives in the git layer, never only in harness hooks.
-5. The benchmark protocol in `docs/PREREGISTRATION.md` is frozen; changes are
-   labeled amendments committed BEFORE any measured run they affect.
-6. Adverse results publish. If onetree loses on an axis, the axis is reported.
 
 ## Repository layout
 
 - `src/onetree/` — the package (Python ≥3.11, typed, mypy --strict).
 - `tests/` — pytest suite; coverage gate enforced in CI.
-- `docs/PREREGISTRATION.md` — frozen benchmark protocol.
+- `docs/` — the design contract, the demo, and the project's web page.
 
 
 <!-- BEGIN CODEX PR REVIEW RULES v1 -->

@@ -9,3 +9,8 @@ dist/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Placeholders that coding-agent sandboxes create; agents read AGENTS.md.
+.claude/
+.codex/
+.mcp.json

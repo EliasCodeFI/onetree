@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from coverage import Coverage, CoverageData
-from test_demo import inputs as inputs
+from test_demo import any_gate_inputs as any_gate_inputs
 from test_demo import run_demo
 
 from onetree import demo
@@ -33,7 +33,7 @@ def _recorded(paths: set[Path], pid: int, measured: Path) -> set[int]:
 
 
 def test_worker_execution_is_present_in_collected_data(
-    tmp_path: Path, inputs: tuple[Path, Path],
+    tmp_path: Path, any_gate_inputs: tuple[Path, Path],
 ) -> None:
     collector = Coverage.current()
     if collector is None:
@@ -42,7 +42,7 @@ def test_worker_execution_is_present_in_collected_data(
     pattern = data_file.name + ".*"
     before = set(data_file.parent.glob(pattern))
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, "--workers", "2")
+    report = run_demo(output, any_gate_inputs, "--workers", "2")
     assert report["ok"], report
     new = set(data_file.parent.glob(pattern)) - before
 

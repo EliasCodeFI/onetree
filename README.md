@@ -148,7 +148,7 @@ onetree 0.0.1a0 (phase: gate-3-dogfood)
 
 To pin an exact version, add a commit to the address, for example
 `git+https://github.com/EliasCodeFI/onetree@<commit>`. To work on onetree itself, see
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+[`CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 
 ## Quick start
 
@@ -234,13 +234,12 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works, in detail.
 - [`docs/DEMO.md`](docs/DEMO.md): the local demo.
-- [`docs/assets/DIAGRAMS.md`](docs/assets/DIAGRAMS.md): the two animations on this page, in words.
 - [`docs/llms.txt`](docs/llms.txt): a short summary for language models.
 
 ## Contributing and security
 
-Issues and pull requests are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md). Report a
-vulnerability privately, as [`SECURITY.md`](SECURITY.md) describes, not in an issue.
+Issues and pull requests are welcome: see [`CONTRIBUTING.md`](.github/CONTRIBUTING.md). Report a
+vulnerability privately, as [`SECURITY.md`](.github/SECURITY.md) describes, not in an issue.
 
 ## Credits
 
