@@ -28,7 +28,8 @@ make it disappear.
 
 - `src/onetree/` — the package (Python ≥3.11, typed, mypy --strict).
 - `tests/` — pytest suite; coverage gate enforced in CI.
-- `docs/` — the design contract, the demo, and the project's web page.
+- `docs/` — the design contract and the project's web page.
+- `plugins/onetree/` and `.claude-plugin/` — the Claude Code plugin and its marketplace entry.
 
 
 <!-- BEGIN CODEX PR REVIEW RULES v1 -->

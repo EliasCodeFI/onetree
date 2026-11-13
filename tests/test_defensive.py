@@ -197,7 +197,7 @@ def _expose_intent(
             "tree": tree,
             "session_generation": session.generation,
             # The lander this intent names is gone -- a pid no process holds --
-            # which is what makes the intent recoverable at all. Round AF2 asks
+            # which is what makes the intent recoverable at all. Recovery asks
             # liveness of the landing, not of the session that started it.
             "lander": {"pid": 999_999_999, "start": 1},
             "fences": [
@@ -265,7 +265,7 @@ def test_wal_document_version_tracks_the_event_kind() -> None:
     assert Wal._validate_document(dict(protected), oid="fixture") == protected
     assert Wal._validate_document(dict(adopted), oid="fixture") == adopted
 
-    # ``adopted`` v=1 is the one recognised historical version (task 70): readable
+    # ``adopted`` v=1 is the one recognised historical version: readable
     # as a legacy record, never writable by the current writer.
     assert Wal._validate_document({**adopted, "v": 1}, oid="fixture") == {**adopted, "v": 1}
     with pytest.raises(WalCorruptError, match="does not match its kind"):
@@ -638,7 +638,7 @@ def test_head_ref_reports_a_failed_symbolic_ref_as_a_failure_not_as_detached(
     with pytest.raises(GitError, match="detached"):
         repository.head_ref()
     assert repository.symbolic_head() is None
-    # A real input reaches the arm (Round BF3 DUO: it was proven against a fake only):
+    # A real input reaches the arm, not only a fake:
     # HEAD naming a ref git refuses to resolve. The repository still opens.
     (git_repo.root / ".git" / "HEAD").write_text("ref: refs/heads/a..b\n", encoding="utf-8")
     reopened = Repository(git_repo.root)

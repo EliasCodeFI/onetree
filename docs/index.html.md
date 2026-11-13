@@ -180,9 +180,9 @@ A session that asks for a file another session holds gets an error that names th
 example `onetree: claim refused; held by agent-a`. With `--json` the error has the type
 `claim_conflict` and lists the paths and the holders.
 
-To see it work without your own repository, `python -m onetree.demo` runs several worker processes
-against a new sample repository: a claim refusal first, then landings through the broker. See
-[docs/DEMO.md](https://github.com/EliasCodeFI/onetree/blob/main/docs/DEMO.md).
+To see it work without your own repository, `python -m onetree.demo --output /tmp/onetree-demo` runs
+several worker processes against a new sample repository it creates in that folder: a claim refusal
+first, then landings through the broker and the standard gate. The result is in `report.json` there.
 
 ## Commands
 

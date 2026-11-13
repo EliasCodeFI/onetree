@@ -455,7 +455,7 @@ onetree release "$PWD/src/api.py"</code></pre>
     <p><code>land -a</code> stages exactly the files the session holds, so other agents' unfinished edits in the shared tree stay out of the commit. It first moves the session to the branch's tip, keeping its claims, so work lands cleanly after other agents have landed.</p>
     <p>A session lives as long as the process it was registered for, and for at most 24 hours by default (<code>--ttl</code>). That process is the parent of <code>onetree session</code>, normally your shell; in Claude Code it is Claude Code itself. A harness that starts a new shell for every command names its own long-lived process instead, with <code>onetree session --pid &lt;pid&gt;</code>.</p>
     <p>A session that asks for a path another session holds gets an error that names the holder, for example <code>onetree: claim refused; held by agent-a</code>. With <code>--json</code> the error object has the type <code>claim_conflict</code> and lists the paths and the holders.</p>
-    <p>To see it work without your own repository, <code>python -m onetree.demo</code> runs independent worker processes against a new sample repository it creates: a real claim refusal first, then landings through the broker. The options are in <a href="https://github.com/EliasCodeFI/onetree/blob/main/docs/DEMO.md">docs/DEMO.md</a>.</p>
+    <p>To see it work without your own repository, <code>python -m onetree.demo --output /tmp/onetree-demo</code> runs independent worker processes against a new sample repository it creates in that folder: a real claim refusal first, then landings through the broker and the standard gate. The result is in <code>report.json</code> there.</p>
   </div>
 </section>
 

@@ -1,7 +1,7 @@
-"""Task 184: landed-evidence verification reads Git objects in one batch per call.
+"""Landed-evidence verification reads Git objects in one batch per call.
 
 Every mutation and inspection re-verifies the recorded landed and adopted commits
-against Git (task 65). These cases pin the cost of that verification to one Git
+against Git. These cases pin the cost of that verification to one Git
 process per call for ordinary records, and hold the admission semantics fixed for
 the shapes Git may hand back instead of a commit: an object that is absent,
 corrupt, truncated, a blob, or a tag, and a record whose parent, tree or landing
@@ -293,10 +293,10 @@ def test_a_large_ordinary_history_is_read_within_a_bounded_address_space(
 ) -> None:
     """The history walk reduces each raw body as it arrives and keeps none.
 
-    The r1 candidate of this round collected every body of the shared batch
-    read before parsing, so an ordinary history of 256 one-mebibyte messages
-    raised MemoryError under a 160 MiB address space where the published base
-    read it as consistent (owner review, 2026-09-16). The ceiling is the probe
+    A reader that collected every body of the shared batch read before parsing
+    raised MemoryError on an ordinary history of 256 one-mebibyte messages under
+    a 160 MiB address space, where the earlier reader read it as consistent
+    (measured 2026-09-16). The ceiling is the probe
     condition, not a product limit; the eight-commit case is the control that
     the reader itself works under it.
     """
@@ -340,9 +340,9 @@ def test_a_large_ordinary_history_is_read_within_a_bounded_address_space(
 def test_duplicate_filtering_does_not_grow_with_the_request(git_repo: GitFixture) -> None:
     """Deduplication is keyed, not scanned: equality work stays below the input size.
 
-    The r1 candidate tested each name against a growing list, which the owner
-    review measured at 8128, 32640 and 130816 string comparisons for 128, 256
-    and 512 names. The observer below forwards every comparison unchanged and
+    Testing each name against a growing list was measured at 8128, 32640 and
+    130816 string comparisons for 128, 256 and 512 names.
+    The observer below forwards every comparison unchanged and
     proves itself on one true and one false comparison first.
     """
 
@@ -379,10 +379,10 @@ def test_a_tree_header_git_admits_keeps_its_admission(
 
     Git writes a commit whose tree ID is uppercase hexadecimal through ordinary
     ``hash-object -w -t commit`` and it passes ``fsck --strict``; ``show``
-    reports the tree lowercase, and the published base compared that. The r2
-    candidate of this round validated the raw header lowercase-only and refused
-    such a commit with a GitError (owner review, 2026-09-16); r3 normalizes the
-    header. A tree line that is not hexadecimal at all is not a reachable
+    reports the tree lowercase, and the earlier reader compared that. A reader
+    that validated the raw header lowercase-only refused such a commit with a
+    GitError (measured 2026-09-16); this one normalizes the header.
+    A tree line that is not hexadecimal at all is not a reachable
     input: ``update-ref`` refuses to point a branch at such a commit even when
     ``--literally`` has written it.
     """

@@ -1,4 +1,4 @@
-"""CLI contract: every Round A command has single-object JSON output."""
+"""CLI contract: every command has single-object JSON output."""
 
 from __future__ import annotations
 

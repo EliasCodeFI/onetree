@@ -214,7 +214,7 @@ def test_system_and_command_scopes_are_not_the_repositorys(
 ) -> None:
     """The broker drops the environment that would redirect its own `git config`, so no
     test can hand the scope filter a `system` or `command` pair through the front door
-    and the filter's exclusion of both had no fixture that could fail (Round BF3 DUO).
+    and the filter's exclusion of both would have no fixture that could fail.
     Here the redirecting names are admitted into the broker's environment on purpose:
     the pair reaches the filter, and the filter alone must drop it -- a system file is
     exactly the input no environment pop can remove."""
@@ -256,10 +256,10 @@ def test_unreadable_referee_configuration_is_a_typed_refusal(
 ) -> None:
     """A value git cannot hand over as UTF-8 text is a real repository input; the other
     three are streams `git config --null --show-scope` does not produce, and the parser
-    refuses them rather than guessing at pairs (uncovered arms, Round BF3 DUO). The fake
+    refuses them rather than guessing at pairs. The fake
     serves the malformed stream for `onetree.referee` only and "unset" for the timeout,
     so an arm that stops refusing hands the value through instead of tripping the timeout
-    parse (Round BF4 DUO: one shared stream made every arm's red an "invalid referee
+    parse (one shared stream would make every arm's red an "invalid referee
     timeout" refusal, and the fixture red only on the message). The odd-field arm is the
     exception: without it the strict `zip` raises an untyped `ValueError`, so that arm
     turns a crash into the typed refusal rather than an acceptance."""

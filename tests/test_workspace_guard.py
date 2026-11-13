@@ -464,8 +464,7 @@ def test_recover_keeps_a_real_divergence_beside_an_unreadable_setting(
     reported = {item["kind"]: item["detail"] for item in caught.value.details["divergences"]}
     assert set(reported) == {"landed_not_on_target", "referee_config"}
     assert detail in reported["referee_config"]
-    # The row recovery records carries the same two items, the setting's detail included
-    # (Round BF3 DUO: the error was asserted, the row was not).
+    # The row recovery records carries the same two items, the setting's detail included.
     events = coordinator.wal.read().events
     assert len(events) == events_before + 1
     row = events[-1]
@@ -492,9 +491,9 @@ def test_recover_cli_human_mode_names_every_divergence(
     git_repo: GitFixture, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The JSON payload carried both items; the human register said only that the branch
-    and the WAL disagree (Round BF3 DUO). Each line carries the commit and operation its
+    and the WAL disagree. Each line carries the commit and operation its
     detail means by "this commit": two landings missing from the branch are two
-    different lines, not one line twice (Round BF4 DUO)."""
+    different lines, not one line twice."""
     coordinator = protected(git_repo)
     first = coordinator.land("alpha")
     session = coordinator.register_session("beta", pid=os.getpid())
@@ -532,8 +531,8 @@ def test_recover_row_identity_excludes_the_detail(git_repo: GitFixture) -> None:
     """One `branch_diverged` row per distinct divergence set, where a set is identified
     by kind, target, commit and operation: the detail text is not part of it. A set that
     recurs with a new detail is not recorded again; the row keeps the detail first
-    observed while the live error carries the fresh one (`_divergence_key`, Round BF4
-    DUO). A row per detail would grow the WAL with every rewording of one condition."""
+    observed while the live error carries the fresh one (`_divergence_key`). A row per
+    detail would grow the WAL with every rewording of one condition."""
     coordinator = protected(git_repo)
     landed = coordinator.land("alpha")
     git_repo.git("update-ref", "refs/heads/main", git_repo.base, landed.commit)
@@ -558,15 +557,14 @@ def test_recover_row_identity_excludes_the_detail(git_repo: GitFixture) -> None:
 
 def test_recover_row_identity_includes_the_commit(git_repo: GitFixture) -> None:
     """The other half of the identity: two divergences of one kind on one target that
-    differ in the commit alone are two sets, each recorded (Round BF5 DUO: a key of kind
-    and target alone left the suite green while the second divergence went unrecorded).
+    differ in the commit alone are two sets, each recorded (a key of kind and target
+    alone would leave the suite green while the second divergence went unrecorded).
     The input that separates two sets by the commit alone is adoption. A broker
     candidate's operation is a function of its commit (the trailer is in the message),
     but `wal --adopt` records one witness operation per commit and admits the same
     operation across commits, so two adopted siblings share an operation and differ in
-    the commit. Round BF6's shape differed in both halves and could not tell either half
-    from the other; no shipped input separates two sets by the operation alone (Round BF6
-    DUO)."""
+    the commit. A shape that differs in both halves could not tell either half from the
+    other; no shipped input separates two sets by the operation alone."""
     coordinator = Coordinator(git_repo.root)
     operation = "0123456789abcdef" * 2
     tree = coordinator.repo.git_text("show", "-s", "--format=%T", git_repo.base)
@@ -626,11 +624,11 @@ def test_recover_cli_human_mode_keeps_each_item_on_one_line(
     """A detail that carries line breaks (a `workspace_changed` detail embeds git's stderr,
     which can be several lines) is still one stderr line per item; the fragment would
     otherwise start a line of its own at column 0. No shipped producer of such a detail
-    was demonstrated (Round BF5 DUO), so the input is synthetic: the reflog-switch read
+    was demonstrated, so the input is synthetic: the reflog-switch read
     raising a git failure whose message carries every boundary `str.splitlines` honours
     -- the eleven of its own documentation, LF, CR, CRLF, VT, FF, FS, GS, RS, NEL, LINE
-    SEPARATOR and PARAGRAPH SEPARATOR -- so a collapse of any subset fails it (Round BF6
-    and BF7 DUOs: four of the eleven left a four-break collapse green)."""
+    SEPARATOR and PARAGRAPH SEPARATOR -- so a collapse of any subset fails it (four of the
+    eleven would leave a four-break collapse green)."""
     coordinator = protected(git_repo)
     coordinator.land("alpha")
     boundaries = ["\n", "\r", "\r\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
@@ -667,10 +665,10 @@ def test_cli_human_mode_keeps_the_summary_on_one_line(
     synthetic: `.git/config` includes a path git expands per operator while the broker's
     environment has no HOME, so the broker's own git dies before any command runs and the
     GitError carries git's two-line diagnostic; without the collapse the `fatal:` line
-    started at column 0 as if it were a second message (Round BF6 DUO). The include path
+    started at column 0 as if it were a second message. The include path
     itself carries a NEL, which git passes through its stderr as it does every non-ASCII
     byte, so the line has a break that is not a newline and a collapse of the newline
-    alone fails the line reader (Round BF7 DUO). JSON carries the message as git wrote
+    alone fails the line reader. JSON carries the message as git wrote
     it."""
     git_repo.git("config", "include.path", "~/ref\x85ee.gitconfig")
     monkeypatch.delenv("HOME", raising=False)
@@ -696,22 +694,22 @@ def test_include_path_resolved_per_operator_is_loud_and_lands_nowhere_under_the_
     git_repo: GitFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`.git/config` may include a path git expands per operator (`~`): the setting is the
-    repository's, its content is whatever each peer's HOME holds. Measured 2026-09-10
-    (Round BF3 and BF4 DUOs, task #164): a peer whose HOME reads another referee is
+    repository's, its content is whatever each peer's HOME holds. Measured 2026-09-10:
+    a peer whose HOME reads another referee is
     refused by the epoch comparison; the peer whose HOME matches is refused by the
     payload gate, whose git children run without HOME and cannot expand the include.
     Nobody lands while the include is per-operator, and nothing is silent. What the gate
     refusal looks like is the gate's: this suite's exact-output stub dies on its git
     call, so the broker sees a gate that wrote to stderr (`PayloadGateError`, the stub's
-    traceback retained, no WAL row); the shipped gate returns DEGRADED naming the include
-    and the broker refuses `payload_gate_degraded` with a WAL row -- the estate-gate
-    variant in test_estate_gate_admission.py asserts that shape. A mechanism that refuses
+    traceback retained, no WAL row); a real gate that strips HOME from its git children
+    returns DEGRADED naming the include and the broker refuses `payload_gate_degraded`
+    with a WAL row. A mechanism that refuses
     such includes by name flips both. HOME already reaches the broker's own git; the
     environments without it are the gate child's and the referee's clone. Admitting HOME
     to the gate child's allowlist flips the stub-gate arm only -- the stub then says CLEAN
     and the referee stage's HOME-less `git clone --shared` refuses `referee_error` on the
-    same include (Round BF5 DUO) -- while the shipped gate strips HOME from its own git
-    children whatever it receives, so its arm stays (task #164)."""
+    same include -- while a gate that strips HOME from its own git children whatever it
+    receives keeps its arm."""
     homes: dict[str, Path] = {}
     for peer, command in (("alpha", "/bin/true"), ("beta", "/bin/false")):
         homes[peer] = tmp_path / peer
@@ -857,7 +855,7 @@ def test_path_form_checkouts_erase_peer_work_without_a_reflog_transition(
 
 @pytest.mark.parametrize("shape", ["routine", "emptied"])
 def test_reflog_expiry_quarantines_an_unmoved_workspace(git_repo: GitFixture, shape: str) -> None:
-    """The two shapes task #151 records, each asserting the branch of the guard it reaches.
+    """Two shapes of reflog expiry, each asserting the branch of the guard it reaches.
 
     `routine`: an entry older than `gc.reflogExpire` (90 days) sits inside the recorded
     prefix and default expiry removes it, so the prefix as recorded is gone ("continuity

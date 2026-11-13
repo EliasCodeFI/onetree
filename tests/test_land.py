@@ -1,4 +1,4 @@
-"""Round A landing invariants, including real races and process death."""
+"""Landing invariants, including real races and process death."""
 
 from __future__ import annotations
 
@@ -420,7 +420,7 @@ def test_inv7_de_ordered_protocol_leaves_an_unrecorded_landing_that_is_detected(
 ) -> None:
     """RED control: move the branch before recording the intent, then die.
 
-    This is the shape Round A's two-ref transaction produced when SIGKILL fell
+    This is the shape an earlier two-ref transaction produced when SIGKILL fell
     between Git's two loose-ref renames. The shipped order cannot reach it --
     every window in the matrix above reports no divergence -- and when it is
     reached anyway, inspection and recovery must both name it.
@@ -453,3 +453,39 @@ def test_inv7_de_ordered_protocol_leaves_an_unrecorded_landing_that_is_detected(
         if event.kind == "refused" and event.data.get("reason") == "branch_diverged"
     ]
     assert recorded == []
+
+
+def test_crash_instrument_forwards_calls_without_fault_configuration(
+    git_repo: GitFixture,
+    kill_git: KillGit,
+) -> None:
+    result = subprocess.run(
+        [str(kill_git.executable), "-C", str(git_repo.root), "interpret-trailers", "--parse"],
+        input="Subject\n\nCaller-Trailer: retained\n",
+        capture_output=True,
+        text=True,
+        env={"LC_ALL": "C"},
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "Caller-Trailer: retained\n"
+    assert not kill_git.state.exists()
+
+
+@pytest.mark.parametrize("name", [
+    "ONETREE_TEST_KILL_REF", "ONETREE_TEST_KILL_STATE",
+    "ONETREE_TEST_KILL_NTH", "ONETREE_TEST_KILL_MODE",
+])
+def test_crash_instrument_rejects_partial_fault_configuration(
+    kill_git: KillGit, name: str,
+) -> None:
+    result = subprocess.run(
+        [str(kill_git.executable), "--version"],
+        capture_output=True,
+        text=True,
+        env={"LC_ALL": "C", name: "armed"},
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unbound variable" in result.stderr
+    assert not kill_git.state.exists()

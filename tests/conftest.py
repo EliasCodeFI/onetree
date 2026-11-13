@@ -1,4 +1,4 @@
-"""Git-backed fixtures for Round A invariant tests."""
+"""Git-backed fixtures for onetree's invariant tests."""
 
 from __future__ import annotations
 
@@ -375,8 +375,8 @@ def git_repo(tmp_path: Path, clean_commit_payload_gate: Path | None) -> GitFixtu
         text=True,
     )
     fixture = GitFixture(root=root, base="")
-    fixture.git("config", "user.name", "Round A Tests")
-    fixture.git("config", "user.email", "round-a@example.invalid")
+    fixture.git("config", "user.name", "onetree tests")
+    fixture.git("config", "user.email", "tests@example.invalid")
     if clean_commit_payload_gate is not None:
         admit_gate(root, clean_commit_payload_gate)
     fixture.write("a.txt", "a0\n")

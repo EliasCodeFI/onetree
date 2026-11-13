@@ -47,7 +47,7 @@ WAL_READER_VERSION = max(_KIND_VERSIONS.values())
 EVENT_KINDS = frozenset(_KIND_VERSIONS)
 # Historical versions a reader still accepts for a kind, on read only. The
 # 9d2ef3b writer released ``adopted`` at v=1 with a scalar ``operation`` that
-# comma-joined every landing trailer value of the adopted commit (task 70).
+# comma-joined every landing trailer value of the adopted commit.
 # Such a record is verified under that writer's semantics by the coordinator
 # and is never written again: the current writer refuses it.
 # ``workspace_protect`` v3 and ``workspace_reconcile`` v4 baselines predate payload gate
@@ -415,7 +415,7 @@ class Wal:
         width = self.repo.oid_length // 2
         events: list[EventRecord] = []
         # `ls-tree` refuses a commit or tree whose bytes do not hash to its name, while
-        # `cat-file --batch` returns them unchecked (task 194 identity probe), so every
+        # `cat-file --batch` returns them unchecked (measured), so every
         # certified object's name is recomputed here. The batch also spools to a temporary
         # file the sequential reader never opens, so an OSError declines the read.
         try:

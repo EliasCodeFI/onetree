@@ -1,8 +1,7 @@
 """Task views: isolated linked worktrees, recoverable checkpoints, broker proposals.
 
 Each guarantee here was observed failing against a known-bad variant of
-``onetree.task_workspace`` before the guard existed; the variants and their
-failures are recorded in ``docs/ROUND-TASK-WORKSPACE-SPIKE.md``.
+``onetree.task_workspace`` before the guard existed.
 """
 
 from __future__ import annotations

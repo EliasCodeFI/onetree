@@ -1,7 +1,7 @@
-"""Task 194: a certified canonical WAL read starts the same Git processes however long the log is.
+"""A certified canonical WAL read starts the same Git processes however long the log is.
 
 ``Wal.read`` ran ``ls-tree`` and ``cat-file`` once per event, 2E + 2 processes for E events
-(task 66 R5, re-measured by the task 194 census). The reader now puts a batched read of the
+(measured, and measured again). The reader now puts a batched read of the
 canonical chain in front of its unchanged sequential path. The constant count is claimed only
 for a read that path certifies: a declined read starts the sequential reader's processes plus
 the batch reads it made before declining. The brief's contracts hold for every read: the
@@ -327,7 +327,7 @@ def _shape(root: Path, shape: str) -> None:
     elif shape in {"commit-without-message", "uppercase-tree-header"}:
         tree = _git(root, "rev-parse", f"{commits[1]}^{{tree}}")
         header = tree.upper() if shape == "uppercase-tree-header" else tree
-        identity = "Round A Tests <round-a@example.invalid> 1700000000 +0000"
+        identity = "onetree tests <tests@example.invalid> 1700000000 +0000"
         body = f"tree {header}\nparent {commits[0]}\nauthor {identity}\ncommitter {identity}\n"
         if shape == "uppercase-tree-header":
             body += "\nuppercase tree header\n"

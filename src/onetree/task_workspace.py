@@ -1,4 +1,4 @@
-"""Per-task isolated working views with recoverable checkpoints (opt-in spike).
+"""Per-task isolated working views with recoverable checkpoints (opt-in, experimental).
 
 A task view is a detached linked Git worktree of the primary clone, placed in a
 directory outside the primary working tree. Its state is preserved only as

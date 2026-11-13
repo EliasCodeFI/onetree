@@ -1,7 +1,9 @@
 """Synthetic local writers; only Git and WAL evidence can establish completion.
 
-The supplied output directory must be new. Evidence is retained on failure, and
-synthetic actors never represent independent agent seats or API expenditure.
+    python -m onetree.demo --output /tmp/onetree-demo
+
+The output directory must be new. Evidence is retained on failure. Without
+--commit-payload the demo admits onetree's standard gate in the sample repository.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from typing import Any, NoReturn, TextIO
 from onetree.core import Coordinator
 from onetree.errors import ClaimConflictError, OnetreeError
 from onetree.git import Repository
+from onetree.initialize import install_standard_gate
 
 _SAMPLE_CHECK = """from pathlib import Path
 import sys
@@ -34,6 +37,9 @@ for number in range(int(sys.argv[1])):
     valid = valid and content in ("initial\\n", f"worker {number}\\n")
 raise SystemExit(0 if valid else 1)
 """
+
+
+DEFAULT_MESSAGE = "onetree demo: a synthetic worker lands its file\n"
 
 
 class DemoError(RuntimeError):
@@ -50,7 +56,9 @@ def _write(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _setup(output: Path, gate: Path, workers: int, timeout: float) -> Coordinator:
+def _setup(
+    output: Path, gate: Path | None, workers: int, timeout: float
+) -> tuple[Coordinator, Path]:
     repo_path = output / "repo"
     repo_path.mkdir()
     Repository._invoke(repo_path, ["init", "--initial-branch=main"], check=True)
@@ -71,11 +79,13 @@ def _setup(output: Path, gate: Path, workers: int, timeout: float) -> Coordinato
     command = shlex.join([sys.executable, "check_sample.py", str(workers)])
     repo.git("config", "onetree.referee", command)
     repo.git("config", "onetree.refereeTimeout", str(timeout))
+    if gate is None:
+        gate, _ = install_standard_gate(repo)
     repo.admit_payload_gate(gate)
     coordinator = Coordinator(repo_path)
     coordinator.register_session("demo-controller", pid=os.getpid(), ttl=timeout + 60)
     coordinator.protect_workspace("demo-controller")
-    return coordinator
+    return coordinator, gate
 
 
 def _worker(
@@ -206,7 +216,7 @@ def _verify(coordinator: Coordinator, records: list[dict[str, Any]]) -> dict[str
 
 def run(
     output: Path,
-    gate: Path,
+    gate: Path | None,
     message: str,
     *,
     workers: int,
@@ -225,7 +235,7 @@ def run(
             raise ValueError("timeout must be finite and positive")
         if not message.strip():
             raise ValueError("the operator's commit message must not be empty")
-        if not gate.is_absolute() or not gate.is_file():
+        if gate is not None and (not gate.is_absolute() or not gate.is_file()):
             raise ValueError("commit-payload must name an absolute gate file")
         # mkdir, without resolve or exist_ok, also refuses dangling symlinks.
         output.mkdir()
@@ -234,7 +244,7 @@ def run(
         report["output"] = str(output)
         _write(output / "demo.json", {"synthetic": True, "controller_pid": os.getpid()})
         (output / "workers").mkdir()
-        coordinator = _setup(output, gate, workers, timeout)
+        coordinator, gate = _setup(output, gate, workers, timeout)
         admission = coordinator.repo.payload_gate_admission()
         report["gate"] = None if admission is None else admission.payload()
         context = multiprocessing.get_context("spawn")
@@ -319,8 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     json_mode = "--json" in arguments
     parser = _Parser(description="Run synthetic local writers in a new sample repository")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--commit-payload", required=True, type=Path)
-    parser.add_argument("--message-file", required=True, type=Path)
+    parser.add_argument("--commit-payload", type=Path)
+    parser.add_argument("--message-file", type=Path)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--json", action="store_true")
@@ -329,7 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         report = run(
             args.output,
             args.commit_payload,
-            args.message_file.read_text(encoding="utf-8"),
+            (
+                DEFAULT_MESSAGE
+                if args.message_file is None
+                else args.message_file.read_text(encoding="utf-8")
+            ),
             workers=args.workers,
             timeout=args.timeout,
             progress=sys.stderr if json_mode else sys.stdout,

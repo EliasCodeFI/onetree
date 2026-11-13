@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import GitFixture, admit_gate
+from conftest import GitFixture
 from test_cli import _json_call
 from test_defensive import _expose_intent
 from test_payload_gate import _register_and_stage, _write_gate
@@ -82,85 +81,6 @@ def test_exact_gate_evidence_survives_the_call(
     else:
         assert refused.value.details["gate_receipt"] == receipt
         assert git_repo.oid() == git_repo.base
-
-
-@pytest.mark.parametrize("case", ["no_companion", "green", "red"])
-def test_real_hook_gate_evidence(
-    git_repo: GitFixture,
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-    case: str,
-) -> None:
-    configured = os.environ.get("ONETREE_TEST_ESTATE_GATE")
-    if configured is None:
-        pytest.skip("requires explicit ONETREE_TEST_ESTATE_GATE")
-    gate = Path(configured).resolve(strict=True)
-    admitted = admit_gate(git_repo.root, gate)
-    for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID"):
-        monkeypatch.delenv(name, raising=False)
-    identity = "11111111-1111-4111-8111-111111111111"
-    monkeypatch.setenv("CODEX_THREAD_ID", identity)
-    coordinator = Coordinator(git_repo.root, commit_payload=gate)
-    session = coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
-    coordinator.claim("alpha", [str(git_repo.root)])
-    # Producer: commit_payload.py's admitted selftest fixtures at lines7759-7783
-    # and10685-10691; the companion reads the hook and fails when its answer is wrong.
-    git_repo.write("hooks/demo.js", "module.exports = { ok: true };\n")
-    paths = ["hooks/demo.js"]
-    if case != "no_companion":
-        git_repo.write(
-            "hooks/demo.test.mjs",
-            (
-                "import { createRequire } from 'node:module';\n"
-                "const hook = createRequire(import.meta.url)('./demo.js');\n"
-                f"const ok = hook.ok === {'true' if case == 'green' else 'false'};\n"
-                'console.log(ok ? "2/2 passed, 0 failed" : "0/2 passed, 2 failed");\n'
-                "process.exit(ok ? 0 : 1);\n"
-            ),
-        )
-        paths.append("hooks/demo.test.mjs")
-    git_repo.stage(session.index_path, *paths)
-    message = (
-        f"Hook evidence\n\nCo-Authored-By: Codex <noreply@openai.com>\nCodex-Session: {identity}\n"
-    )
-    if case == "red":
-        with pytest.raises(LandingRefusedError):
-            coordinator.land("alpha", message=message)
-        receipt = coordinator.inspect_wal().events[-1].data["gate_receipt"]
-        assert git_repo.oid() == git_repo.base
-    else:
-        result = coordinator.land("alpha", message=message)
-        receipt = result.gate_receipt
-    assert receipt is not None
-    report = receipt["report"]
-    request.node.user_properties.extend(
-        [
-            ("gate", str(gate)),
-            ("source_sha256", receipt["gate_source_sha256"]),
-            ("report", str(report)),
-            ("implementation", str(git_module.__file__)),
-        ]
-    )
-    assert set(report) == {
-        "candidate",
-        "repository",
-        "staged_files",
-        "findings",
-        "degraded",
-        "advisories",
-        "hook_suites",
-        "hook_suite_state",
-        "source_acceptance",
-        "verdict",
-    }
-    assert report["source_acceptance"] is None
-    assert report["hook_suite_state"] == "evaluated"
-    assert {row["status"] for row in report["hook_suites"]} == {
-        {"no_companion": "NO_COMPANION", "green": "GREEN", "red": "RED"}[case]
-    }
-    assert report["verdict"] == ("REFUSE" if case == "red" else "CLEAN")
-    assert report["hook_suites"][0]["runtime"] == "sandboxed"
-    assert receipt["gate_source_sha256"] == admitted
 
 
 def test_recovery_links_original_receipt_without_reauditing(

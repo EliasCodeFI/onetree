@@ -1,4 +1,4 @@
-"""Payload-gate process-group lifetime on timeout (task 142).
+"""Payload-gate process-group lifetime on timeout.
 
 The gate runs as the leader of its own process group. When the broker's wait on it
 times out, the whole group is killed, so a descendant the gate forked cannot outlive a

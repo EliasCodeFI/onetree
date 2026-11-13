@@ -1,12 +1,10 @@
-"""Task 70: persisted legacy ``adopted`` records (schema version 1) stay readable.
+"""Persisted legacy ``adopted`` records (schema version 1) stay readable.
 
 The 9d2ef3b writer recorded adoption at ``v: 1`` with one scalar ``operation``
 that joined every ``Onetree-Operation`` trailer value of the adopted commit
 with commas; a single trailer whose value itself contains a comma produced
-the same scalar. The current reader refused every such record at the version
-check, so a repository adopted under that writer could not be opened at all
-(``/anvil/scratch/onetree-legacy-adoption-20260916/results.jsonl``, and the
-fresh persisted reproduction in this round's evidence directory).
+the same scalar. A reader that refused every such record at the version
+check could not open a repository adopted under that writer at all.
 
 Contract under test. A ``v: 1`` ``adopted`` document is read as a historical
 record and verified against the commit it names under the historical
@@ -24,19 +22,14 @@ recorded is still reported and adoptable.
 Fixtures write the legacy document with Git plumbing, byte for byte the
 shape the historical writer persisted (six document keys, five data keys,
 ``v: 1``); the current writer cannot produce it, which the writer case
-asserts. One case replays the actual 9d2ef3b writer when its extracted
-source is present on this host and skips otherwise.
+asserts.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from conftest import GitFixture
@@ -47,7 +40,6 @@ from onetree.errors import GitError, WalCorruptError
 from onetree.git import _legacy_landing_operation
 from onetree.wal import WAL_REF, Wal
 
-_HISTORICAL_WRITER = Path("/anvil/scratch/onetree-legacy-adoption-20260916/legacy/src")
 _FIRST, _SECOND = "a" * 32, "b" * 32
 #: Trailer values the historical fixtures used, keyed by shape, and the scalar
 #: the 9d2ef3b writer persisted for each. Repeated and literal-comma store
@@ -281,42 +273,6 @@ def test_malformed_legacy_data_stays_refused(git_repo: GitFixture) -> None:
     _persist(git_repo, document)
     with pytest.raises(WalCorruptError, match="adopted event has unexpected fields"):
         Coordinator(git_repo.root).inspect_wal()
-
-
-@pytest.mark.skipif(
-    not (_HISTORICAL_WRITER / "onetree" / "cli.py").is_file(),
-    reason="the extracted 9d2ef3b writer is not present on this host",
-)
-@pytest.mark.parametrize("shape", sorted(_SHAPES))
-def test_actual_historical_writer_output_opens_with_the_current_reader(
-    git_repo: GitFixture,
-    shape: str,
-) -> None:
-    """Provenance: the record the real 9d2ef3b CLI persists, not a hand-built one."""
-    values, scalar = _SHAPES[shape]
-    commit = _legacy_commit(git_repo, values)
-    environment = {**os.environ, "PYTHONPATH": str(_HISTORICAL_WRITER)}
-    environment.pop("ONETREE_COMMIT_PAYLOAD", None)
-    # The historical writer is the instrument here, not the product under
-    # measurement: keep the subprocess coverage collector from reading its
-    # source as ``onetree``, which would fold 9d2ef3b's lines into the gate.
-    environment.pop("COVERAGE_PROCESS_CONFIG", None)
-    environment.pop("COVERAGE_PROCESS_START", None)
-    argv = [sys.executable, "-B", "-m", "onetree.cli", "wal", "--repo", str(git_repo.root)]
-    adopted = subprocess.run(
-        [*argv, "--adopt", "--json"],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert adopted.returncode == 0, (adopted.stdout, adopted.stderr)
-    document = json.loads(git_repo.git("show", f"{WAL_REF}:event.json").stdout)
-    assert document["v"] == 1
-    assert document["data"]["operation"] == scalar
-    report = Coordinator(git_repo.root).inspect_wal()
-    assert report.consistent
-    assert report.events[0].data["commit"] == commit
 
 
 #: The 9d2ef3b trailer-block subset, exercised directly on raw messages so the

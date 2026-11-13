@@ -1,4 +1,4 @@
-"""Gate 2 task 16: real submitter death in the referee-era windows.
+"""Real submitter death in the referee-era windows.
 
 Every case forks a lander that runs ``Coordinator.land`` for real and is
 SIGKILLed from outside, by this test, while it sits in one named window. The
@@ -267,7 +267,7 @@ def test_death_during_the_referee_leaves_no_trace_and_cleans_the_referee(
     # One cleanup scope spans the whole lifetime of both spawned processes: the
     # lander from its fork, and the referee from the moment its marker can
     # exist. Any assertion that fails in between exits through the reap of both,
-    # with its own failure preserved (task 172).
+    # with its own failure preserved.
     process = _fork_lander(git_repo, "alpha", None, log, scratch)
     running: dict[str, Any] | None = None
     try:

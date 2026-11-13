@@ -56,7 +56,7 @@ def _append_raw(wal: Wal, value: bytes, session: SessionInfo) -> str:
     parent = wal.head()
     assert parent is not None
     commit = wal.repo.git(
-        "commit-tree", tree, "-p", parent, input_bytes=b"task203 input fixture\n"
+        "commit-tree", tree, "-p", parent, input_bytes=b"input fixture\n"
     ).stdout.strip().decode("ascii")
     wal.repo.git("update-ref", WAL_REF, commit, parent)
     return commit

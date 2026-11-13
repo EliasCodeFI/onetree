@@ -45,7 +45,7 @@ class InitResult:
         }
 
 
-def _install_standard_gate(repo: Repository) -> tuple[Path, bool]:
+def install_standard_gate(repo: Repository) -> tuple[Path, bool]:
     """Write the packaged gate's bytes to the repository's copy; True when they changed."""
 
     target = standard_gate_path(repo)
@@ -97,7 +97,7 @@ def initialize(
         admission = repo.admit_payload_gate(gate)
         gate_state, gate_path = "admitted", admission.path
     elif admitted is None or admitted.path == standard:
-        path, changed = _install_standard_gate(repo)
+        path, changed = install_standard_gate(repo)
         repo.admit_payload_gate(path)
         gate_state = "standard" if admitted is None else ("updated" if changed else "standard")
         gate_path = str(path)

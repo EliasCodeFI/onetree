@@ -20,7 +20,6 @@ from onetree.errors import LandingRefusedError
 
 _IDENTITY_NAMES = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
 _SESSION = "44444444-4444-4444-8444-444444444444"
-_OTHER_SESSION = "55555555-5555-4555-8555-555555555555"
 
 
 def invoke(output: Path, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -39,19 +38,6 @@ def invoke(output: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _shipped_gate() -> Path | None:
-    gate = Path(
-        os.environ.get(
-            "ONETREE_TEST_SHIPPED_GATE", str(Path.home() / ".claude/tools/commit_payload.py")
-        )
-    )
-    if gate.is_file():
-        return gate
-    if "ONETREE_TEST_SHIPPED_GATE" in os.environ:
-        pytest.fail(f"configured gate is missing: {gate}")
-    return None
-
-
 def _message(tmp_path: Path) -> Path:
     message = tmp_path / "message.txt"
     message.write_text(
@@ -63,31 +49,20 @@ def _message(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def inputs(tmp_path: Path) -> tuple[Path, Path]:
-    """The shipped payload gate, for the tests that check what that gate itself reports."""
-    gate = _shipped_gate()
-    if gate is None:
-        pytest.skip("demo integration requires the admitted payload gate")
-    return gate, _message(tmp_path)
-
-
-@pytest.fixture
 def any_gate_inputs(tmp_path: Path) -> tuple[Path, Path]:
-    """The shipped payload gate when it is installed, else a clean stub gate.
-
-    These tests do not depend on which gate reports CLEAN: docs/DEMO.md states that the demo
-    admits the gate it is given. With the stub they also run where no shipped gate exists.
-    """
-    gate = _shipped_gate()
-    if gate is None:
-        gate = tmp_path / "clean_stub_gate.py"
-        gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
+    """A clean stub gate and a message file: the demo admits whatever gate it is given."""
+    gate = tmp_path / "clean_stub_gate.py"
+    gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
     return gate, _message(tmp_path)
 
 
-def run_demo(output: Path, inputs: tuple[Path, Path], *extra: str) -> dict[str, Any]:
-    gate, message = inputs
-    result = invoke(output, "--commit-payload", str(gate), "--message-file", str(message), *extra)
+def run_demo(output: Path, inputs: tuple[Path, Path] | None, *extra: str) -> dict[str, Any]:
+    """Run the demo; ``inputs`` None runs it as a newcomer would, with its own gate and message."""
+    named: tuple[str, ...] = ()
+    if inputs is not None:
+        gate, message = inputs
+        named = ("--commit-payload", str(gate), "--message-file", str(message))
+    result = invoke(output, *named, *extra)
     report: dict[str, Any] = json.loads(result.stdout)
     assert result.returncode == (0 if report["ok"] else 1), result.stderr
     return report
@@ -115,13 +90,12 @@ def test_symlink_output_is_untouched(tmp_path: Path, any_gate_inputs: tuple[Path
     assert not target.exists()
 
 
-def test_real_workers_land_with_conflict_evidence(
-    tmp_path: Path,
-    inputs: tuple[Path, Path],
-) -> None:
+def test_real_workers_land_with_conflict_evidence(tmp_path: Path) -> None:
+    # No gate and no message named: the demo admits onetree's standard gate on its own.
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, "--workers", "2")
+    report = run_demo(output, None, "--workers", "2")
     assert report["ok"], report
+    assert report["gate"]["path"].endswith("/onetree/standard-gate/commit_payload.py")
     assert report["synthetic"] is True
     workers = report["workers"]
     assert len({worker["pid"] for worker in workers}) == 2
@@ -129,11 +103,7 @@ def test_real_workers_land_with_conflict_evidence(
     assert workers[1]["conflict"]["type"] == "claim_conflict"
     assert len({worker["land"]["commit"] for worker in workers}) == 2
     for worker in workers:
-        advisories = worker["land"]["gate_receipt"]["report"]["advisories"]
-        assert any(
-            f"Codex-Session equals CODEX_THREAD_ID ({_SESSION})" in advisory
-            for advisory in advisories
-        ), advisories
+        assert worker["land"]["gate_receipt"]["report"]["verdict"] == "CLEAN"
     assert report["wal"]["consistent"] is True
     assert report["wal"]["pending_intents"] == 0
     assert report["wal"]["active_claims"] == []
@@ -149,7 +119,7 @@ def test_any_supplied_clean_gate_is_admitted_and_succeeds(
     tmp_path: Path,
     any_gate_inputs: tuple[Path, Path],
 ) -> None:
-    # docs/DEMO.md: the demo admits the gate it is given and does not check which one.
+    # The demo admits the gate it is given and does not check which one.
     gate = tmp_path / "stub_gate.py"
     gate.write_text(_CLEAN_PAYLOAD_GATE_SOURCE, encoding="utf-8")
     report = run_demo(tmp_path / "sample", (gate, any_gate_inputs[1]), "--workers", "2")
@@ -173,31 +143,6 @@ def test_a_gate_without_a_clean_verdict_never_succeeds(
         "commit payload gate did not emit one UTF-8 JSON value"
     }
     assert all("land" not in worker for worker in report["workers"])
-
-
-def test_other_session_identity_is_refused_by_real_gate(
-    tmp_path: Path,
-    inputs: tuple[Path, Path],
-) -> None:
-    gate, message = inputs
-    message.write_text(
-        message.read_text(encoding="utf-8").replace(_SESSION, _OTHER_SESSION),
-        encoding="utf-8",
-    )
-    report = run_demo(tmp_path / "sample", (gate, message), "--workers", "2")
-    assert not report["ok"]
-    errors = [worker["error"] for worker in report["workers"] if "error" in worker]
-    assert errors
-    for error in errors:
-        assert error["reason"] == "payload_gate_refused"
-        assert [row["kind"] for row in error["findings"]] == ["identity-other-session"]
-    assert all("land" not in worker for worker in report["workers"])
-    events = report["wal"]["events"]
-    assert not [event for event in events if event["event"] in {"land_intent", "landed"}]
-    assert any(
-        event["event"] == "refused" and event["data"].get("reason") == "payload_gate_refused"
-        for event in events
-    )
 
 
 def test_missing_gate_does_not_create_output(
@@ -224,7 +169,7 @@ def test_invalid_limits_are_json_failures(
 
 
 def test_argument_error_is_json(tmp_path: Path) -> None:
-    result = invoke(tmp_path / "sample")
+    result = invoke(tmp_path / "sample", "--no-such-option")
     assert result.returncode == 1
     assert json.loads(result.stdout)["error"]["type"] == "ValueError"
 
@@ -289,12 +234,9 @@ def test_mismatched_worker_phase_is_rejected() -> None:
         child.close()
 
 
-def test_missing_worker_result_cannot_mean_success(
-    tmp_path: Path,
-    inputs: tuple[Path, Path],
-) -> None:
+def test_missing_worker_result_cannot_mean_success(tmp_path: Path) -> None:
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, "--workers", "2")
+    report = run_demo(output, None, "--workers", "2")
     assert report["ok"], report
     records = report["workers"]
     records[1].pop("phase")
@@ -302,12 +244,9 @@ def test_missing_worker_result_cannot_mean_success(
         demo._verify(Coordinator(output / "repo"), records)
 
 
-def test_commit_substitution_is_not_completion_evidence(
-    tmp_path: Path,
-    inputs: tuple[Path, Path],
-) -> None:
+def test_commit_substitution_is_not_completion_evidence(tmp_path: Path) -> None:
     output = tmp_path / "sample"
-    report = run_demo(output, inputs, "--workers", "2")
+    report = run_demo(output, None, "--workers", "2")
     assert report["ok"], report
     records = report["workers"]
     records[0]["land"]["intent"] = "not-the-recorded-intent"

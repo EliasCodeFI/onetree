@@ -1,9 +1,8 @@
-"""Round AF2: what recovery may touch, and what it is allowed to call clean.
+"""What recovery may touch, and what it is allowed to call clean.
 
 Every test here pairs a guard with the known-bad input it was built for. Where
 the bad input can be produced in-process the control lives in the test and is
-asserted to produce the defect; where it cannot, the mutation is named in
-docs/ROUND-AF2.md with the fixture it turns red.
+asserted to produce the defect.
 """
 
 from __future__ import annotations
@@ -74,8 +73,8 @@ def _repository_with_ref_backend(tmp_path: Path, ref_format: str) -> GitFixture:
         text=True,
     )
     fixture = GitFixture(root=root, base="")
-    fixture.git("config", "user.name", "Round AF3 Tests")
-    fixture.git("config", "user.email", "round-af3@example.invalid")
+    fixture.git("config", "user.name", "Recovery Tests")
+    fixture.git("config", "user.email", "recovery@example.invalid")
     _admit_fixture_gate(root)
     fixture.write("a.txt", "a0\n")
     fixture.write("b.txt", "b0\n")
@@ -290,7 +289,7 @@ def _pending_intent(
         ],
     }
     if tagless:
-        # Every intent written before Round AF2 looks like this.
+        # Every intent written before landers were recorded looks like this.
         del data["lander"]
     intent = coordinator.wal.document("land_intent", "alpha", data)
     snapshot = coordinator.wal.read()
@@ -739,11 +738,11 @@ def test_an_unrecorded_landing_survives_the_routine_act_that_used_to_mask_it(
     git_repo: GitFixture,
     order: str,
 ) -> None:
-    """Found by both verification seats, in two independent reproductions.
+    """Found in two independent reproductions.
 
     The scan excluded every position the WAL had ever seen, and a crash-left
     commit becomes such a position the moment anyone registers on top of it or
-    lands above it. Detection therefore expired through ordinary use. AF6
+    lands above it. Detection therefore expired through ordinary use. onetree
     refuses those acts until explicit adoption, so they cannot mask the fact.
     """
 
@@ -2738,7 +2737,7 @@ def test_a_pruned_landed_object_names_the_restore_path_before_recovery_can_audit
 def test_probing_a_diverged_repository_records_one_refusal_per_divergence(
     git_repo: GitFixture,
 ) -> None:
-    """Historical name: AF6 now refuses before writing even one probe event."""
+    """Historical name: onetree now refuses before writing even one probe event."""
 
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
@@ -2810,7 +2809,7 @@ def test_a_locked_target_branch_closes_the_intent_written_ahead_of_it(
 
 
 # --------------------------------------------------------------------------
-# Suspicions carried by the verification seats
+# Suspicions carried by independent review
 # --------------------------------------------------------------------------
 
 
@@ -3088,7 +3087,7 @@ def test_a_dead_session_still_bars_recovery_from_touching_a_live_landers_intent(
 def test_an_intent_with_no_lander_recorded_falls_back_to_its_session(
     git_repo: GitFixture,
 ) -> None:
-    """Every intent written before this round looks like this, so it must work."""
+    """Every intent written before landers were recorded looks like this, so it must work."""
 
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     coordinator = Coordinator(git_repo.root)
@@ -3120,7 +3119,7 @@ def test_an_intent_with_no_lander_recorded_falls_back_to_its_session(
 
 
 # --------------------------------------------------------------------------
-# Round AF4 -- a falsifiable landing bar, and crash states that classify
+# A falsifiable landing bar, and crash states that classify
 # --------------------------------------------------------------------------
 
 
@@ -3277,8 +3276,8 @@ def test_a_crash_left_landing_is_found_under_any_number_of_hand_commits(
 ) -> None:
     """The scan floor's depth was never the defect; the floor was.
 
-    Lead (c) measured the mask at one permitted hand commit and the floor moved
-    down one generation; AF3b then measured the same mask at two and at three.
+    The mask was measured at one permitted hand commit and the floor moved down
+    one generation; the same mask was then measured at two and at three.
     A floor a fixed genealogical distance below first sight is defeated by that
     many hand commits, so the class only closes when the audit stops excluding
     history it has never read.
@@ -3313,7 +3312,7 @@ def test_page_boundaries_never_drop_the_commit_they_land_on(
     git_repo: GitFixture,
     hand_commits: int,
 ) -> None:
-    """AF4's former pagination offsets remain inside the complete audit."""
+    """The former pagination offsets remain inside the complete audit."""
 
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
@@ -3556,7 +3555,7 @@ def test_land_warnings_reach_both_cli_output_modes(
 
 
 # --------------------------------------------------------------------------
-# Round AF5 -- predicates sized to the defect, not the old fixture
+# Predicates sized to the defect, not the old fixture
 # --------------------------------------------------------------------------
 
 
@@ -3680,7 +3679,7 @@ def test_an_absent_wal_stays_absent_under_two_thousand_ordinary_ref_writes(
     tmp_path: Path,
     ref_format: str,
 ) -> None:
-    """Historical name; AF6 raises the measured sweep to 2,500 attempts."""
+    """Historical name; the measured sweep is now 2,500 attempts."""
 
     git_repo = _repository_with_ref_backend(tmp_path, ref_format)
     repository = Repository(git_repo.root)
@@ -4178,8 +4177,8 @@ def test_primary_repository_shapes_are_not_misclassified_as_linked_worktrees(
         text=True,
     )
     separate = GitFixture(separate_work, "")
-    separate.git("config", "user.name", "Round AF6 Tests")
-    separate.git("config", "user.email", "round-af6@example.invalid")
+    separate.git("config", "user.name", "Separate Tests")
+    separate.git("config", "user.email", "separate@example.invalid")
     separate.write("a.txt", "a\n")
     separate.git("add", "a.txt")
     separate.git("commit", "--quiet", "-m", "baseline")

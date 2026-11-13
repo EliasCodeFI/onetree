@@ -1,4 +1,4 @@
-"""Round A coordination state, claims, payload audit, and CAS landing."""
+"""Coordination state, claims, payload audit, and CAS landing."""
 
 from __future__ import annotations
 
@@ -1907,7 +1907,7 @@ class Coordinator:
     ) -> LandResult:
         """Audit, then land write-ahead: intent, branch CAS, landed mark.
 
-        Round A moved the branch and the WAL in one ``update-ref --stdin``
+        An earlier design moved the branch and the WAL in one ``update-ref --stdin``
         transaction. On the files ref backend that transaction is not
         crash-atomic: Git commits the two loose refs as two sequential renames,
         branch first, so a death between them leaves the candidate on the branch
@@ -2769,16 +2769,15 @@ class Coordinator:
         *and its entire ancestry*. The WAL has audited none of that ancestry, so
         any non-empty floor hides an unbounded amount of history behind one
         commit. That makes a floor unsound by construction rather than merely
-        shallow, and two rounds measured the same class at successive depths:
-        lead (c) found a crash-left landing masked by one permitted hand commit
-        below first sight, and the round after it found the grandparent floor
-        that replaced it masked by two and by three. A fixed genealogical
+        shallow, and the same class was measured at successive depths: a
+        crash-left landing masked by one permitted hand commit below first
+        sight, and then a grandparent floor masked by two and by three. A fixed genealogical
         distance d is always defeated by d hand commits, so the depth was never
         the defect.
 
-        Retreating to the honest boundary is not available either: lead (c)
-        settled that the commit below the WAL's first sighting of a branch is in
-        scope, and that is precisely the history a first-sight floor drops. What
+        Retreating to the honest boundary is not available either: the commit
+        below the WAL's first sighting of a branch is in scope, and that is
+        precisely the history a first-sight floor drops. What
         is left is the empty floor. The history walk is one streamed Git process,
         so a complete walk costs linear traversal rather than repeated pages.
 

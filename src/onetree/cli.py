@@ -723,8 +723,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else ""
             )
             # The summary is one line whatever break the message carries: a GitError
-            # carries git's stderr, two lines for an include git cannot expand (Round
-            # BF6 DUO), and git passes non-ASCII breaks through (Round BF7 DUO).
+            # carries git's stderr, two lines for an include git cannot expand, and git
+            # passes non-ASCII breaks through.
             sys.stderr.write(f"onetree: {_one_line(str(error))}{suffix}\n")
             recording_error = error.details.get("recording_error")
             if recording_error is not None:
@@ -732,11 +732,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  refusal recording failed ({_one_line(str(recording_error['type']))}): "
                     f"{_one_line(str(recording_error['message']))}\n"
                 )
-            # Each divergence names what the operator must reconcile; a second item
-            # beside the branch divergence (an unreadable referee setting) was reported
-            # in the JSON payload only (Round BF3 DUO). The detail says "this commit";
-            # the commit and operation it means are printed with it, one line per item
-            # whatever the detail carries (Round BF4 DUO).
+            # Each divergence names what the operator must reconcile, including a second
+            # item beside the branch divergence (an unreadable referee setting). The
+            # detail says "this commit"; the commit and operation it means are printed
+            # with it, one line per item whatever the detail carries.
             for item in divergences:
                 where = [
                     f"{name} {item[name]}"
@@ -748,8 +747,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  {item['kind']} at {item['target']}: "
                     f"{_one_line(str(item['detail']))}{suffix_text}\n"
                 )
-            # A degraded gate names what it could not audit; the rows were in the WAL
-            # row and the JSON payload only (Round BF7 DUO).
+            # A degraded gate names what it could not audit, here as well as in the WAL
+            # row and the JSON payload.
             for row in error.details.get("degraded") or []:
                 sys.stderr.write(f"  degraded: {_one_line(str(row))}\n")
         return error.exit_code

@@ -1,4 +1,4 @@
-"""Small typed wrappers around the Git plumbing used by Round A."""
+"""Small typed wrappers around the Git plumbing onetree uses."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ _GIT_COMMON_OPTIONS = (
 LANDING_TRAILER = "Onetree-Operation"
 _LANDING_TRAILER_BYTES = LANDING_TRAILER.lower().encode("ascii")
 # The 9d2ef3b writer's trailer-block subset, kept verbatim so a legacy adopted
-# record (task 70) is verified under exactly the semantics that wrote it.
+# record is verified under exactly the semantics that wrote it.
 # These feed ``_legacy_landing_operation`` only, never the audit parser.
 _LEGACY_TRAILER_LINE = re.compile(rb"(?P<key>[A-Za-z0-9-]+)[ \t]*:[ \t]*(?P<value>.*)")
 _LEGACY_GENERATED_TRAILER_PREFIXES = (b"Signed-off-by: ", b"(cherry picked from commit ")
@@ -715,7 +715,7 @@ class Repository:
             # Each of these names redirects or extends what `git config` returns,
             # and what git itself does, from outside the repository. GIT_CONFIG
             # alone was measured demoting a configured red referee to
-            # `not_configured` and landing the candidate (Round B DUO, 2026-09-10).
+            # `not_configured` and landing the candidate (2026-09-10).
             # The referee read keeps only the `local` and `worktree` scopes, so
             # the command scope these names add is filtered there too; GIT_CONFIG
             # is different: it redirects the `git config` command itself, so its
@@ -1109,8 +1109,8 @@ class Repository:
             raise GitError("HEAD is detached; pass a branch ref", operation="symbolic-ref")
         if result.returncode != 0:
             # Any other exit is git failing to answer, not an answer of "detached"
-            # (Round BF2 DUO: a malformed GIT_CONFIG_COUNT environment was reported as
-            # a detached HEAD).
+            # (a malformed GIT_CONFIG_COUNT environment was once reported as a detached
+            # HEAD).
             detail = result.stderr.decode("utf-8", errors="replace").strip()
             raise GitError(f"cannot read HEAD: {detail}", operation="symbolic-ref")
         reference = result.stdout.decode("ascii", errors="strict").strip()

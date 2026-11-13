@@ -1,4 +1,4 @@
-"""Round AF: ref corruption, branch-versus-WAL divergence, locks, and residue."""
+"""Ref corruption, branch-versus-WAL divergence, locks, and residue."""
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ def test_corrupt_wal_ref_is_refused_instead_of_reading_as_an_empty_healthy_wal(
     }
     _write_ref(git_repo, WAL_REF, values[shape])
 
-    # RED control: the probe Round A relied on cannot tell this ref from an
+    # RED control: the probe an earlier reader relied on cannot tell this ref from an
     # absent one. Both exit 1, so `missing_ok` read the corruption as "no WAL",
     # and every claim question was then answered over an empty log.
     corrupt = git_repo.git(
@@ -401,7 +401,7 @@ def test_a_landed_event_that_disagrees_with_its_intent_refuses_replay(
 ) -> None:
     """Write-ahead ordering removed the adjacency rule; agreement replaces it.
 
-    Round A could require the landed commit to sit directly on its intent,
+    An earlier design could require the landed commit to sit directly on its intent,
     because one transaction wrote both. The branch CAS now sits between them and
     an unrelated append may legitimately intervene, so the landed event has to
     be pinned to its intent field by field instead.
@@ -585,7 +585,7 @@ def test_a_crashed_overlay_leaves_residue_that_gc_reclaims(git_repo: GitFixture)
     coordinator.repo.git("read-tree", git_repo.base, index=temporary)
     assert temporary.exists()
 
-    # Nothing swept it before Round AF; the owner is this live process, so gc
+    # The owner of this index is this live process, so gc
     # must still refuse to touch it.
     assert coordinator.gc("collector").removed_temp_indexes == 0
     assert temporary.exists()

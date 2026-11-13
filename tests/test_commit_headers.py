@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
+import shlex
+import sys
+from pathlib import Path
 
 import pytest
 from conftest import GitFixture
 from test_wal_verify_cost import ref_repo as ref_repo
 
+from onetree import git as git_module
 from onetree.core import Coordinator
 from onetree.errors import GitError
 
@@ -107,3 +111,39 @@ def test_public_oid_validation_stays_canonical(ref_repo: GitFixture) -> None:
     assert uppercase != ref_repo.base
     with pytest.raises(GitError, match="malformed"):
         repository.validate_oid(uppercase)
+
+
+@pytest.mark.parametrize("channel", ["local", "global", "system", "environment"])
+def test_landing_message_does_not_execute_configured_trailer_commands(
+    git_repo: GitFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+) -> None:
+    marker = tmp_path / "trailer-command-ran"
+    script = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    key = "trailer.Onetree-Operation.cmd"
+    if channel == "local":
+        git_repo.git("config", key, command)
+    elif channel == "environment":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", key)
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", command)
+    else:
+        config = tmp_path / "injected.gitconfig"
+        git_repo.git("config", "--file", str(config), key, command)
+        monkeypatch.setenv(f"GIT_CONFIG_{channel.upper()}", str(config))
+        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+
+    git_repo.git(
+        "interpret-trailers", "--trailer", "Onetree-Operation: control",
+        input_text="Control\n",
+    )
+    assert marker.read_text() == "ran"
+    marker.unlink()
+    repository = git_module.Repository(git_repo.root)
+    message = repository.landing_message("Control", "a" * 32, "b" * 32, "admission")
+    assert "Onetree-Operation:" in message
+    assert f"Onetree-Operation: {'a' * 32}" in message
+    assert not marker.exists()

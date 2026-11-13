@@ -240,9 +240,9 @@ gate on each change as `python -I -S commit_payload.py commit <commit> --repo <r
 and lands the change only when the gate answers `CLEAN`. `onetree gate --admit <file>` admits
 another gate at any time.
 
-**A demo without your own repository.** `python -m onetree.demo` runs several worker processes
-against a new sample repository: a claim refusal first, then landings through the broker. See
-[`docs/DEMO.md`](docs/DEMO.md).
+**A demo without your own repository.** `python -m onetree.demo --output /tmp/onetree-demo` runs
+several worker processes against a new sample repository it creates in that folder: a claim refusal
+first, then landings through the broker and the standard gate. The result is in `report.json` there.
 
 ## Commands
 
@@ -281,7 +281,6 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 ## Documentation
 
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works, in detail.
-- [`docs/DEMO.md`](docs/DEMO.md): the local demo.
 - [`docs/llms.txt`](docs/llms.txt): a short summary for language models.
 
 ## Contributing and security

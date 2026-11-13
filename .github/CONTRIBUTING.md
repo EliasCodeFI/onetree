@@ -42,10 +42,6 @@ four commands on Python 3.11, 3.12 and 3.13, and a pull request needs all of the
 - Do not weaken or delete an existing test to make a change pass.
 - If an AI coding tool wrote or helped write the change, say which one in the description.
 
-Some code comments cite development records as `docs/ROUND-*.md`. Those records were removed from
-the tree on 2026-11-12; they are in the
-[development history](https://github.com/EliasCodeFI/onetree/tree/546094fbbb3f70a9123e0e2fd1d86fecaa4e4336/docs).
-
 ## Licence of contributions
 
 onetree is licensed under the Apache License, Version 2.0. Under section 5 of that licence, a

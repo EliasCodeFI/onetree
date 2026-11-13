@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from conftest import _CLEAN_PAYLOAD_GATE_SOURCE, GATE_GIT_LITERAL, GitFixture, admit_gate
 
+import onetree
 from onetree import git as git_module
 from onetree.cli import main
 from onetree.core import Coordinator
@@ -758,9 +759,9 @@ def test_cli_human_mode_names_what_a_degraded_gate_could_not_audit(
 ) -> None:
     """A degraded gate's rows name what it could not audit. They were in the WAL row and
     the JSON payload only; human mode said `commit payload gate degraded the candidate`
-    and nothing more (Round BF7 DUO). Each row is one stderr line under the summary
+    and nothing more. Each row is one stderr line under the summary
     whatever break it carries, and a row's own spacing stays: a path with two spaces is
-    that path (Round BF8; the earlier rendering collapsed every whitespace run). The gate
+    that path (an earlier rendering collapsed every whitespace run). The gate
     is scripted; the first row is the shipped gate's text for a per-operator include, with
     the newline git's diagnostic carries."""
     row = (
@@ -1460,55 +1461,21 @@ def test_payload_gate_child_is_not_reachable_through_the_dynamic_loader(
     assert "LD_AUDIT" not in received
 
 
-_DEFAULT_SHIPPED_GATE = Path.home() / ".claude" / "tools" / "commit_payload.py"
-"""Where the operator's real gate lives when nobody names one.
+def test_the_gate_onetree_ships_admits_a_benign_landing(git_repo: GitFixture) -> None:
+    """onetree's own standard gate, admitted in this repository, admits a benign landing.
 
-That artifact is not in this repository, so the only run that can exercise it is a run on a
-machine that HAS it. A checkout with no estate beside it skips because the check genuinely
-cannot run there -- not because nobody exported anything.
-"""
-
-
-def test_the_shipped_payload_gate_admits_a_benign_landing(
-    git_repo: GitFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The operator's real gate, admitted in this repository, admits a benign landing.
-
-    Every other test in this module runs a purpose-built gate, so a constructed child
-    environment is never tested against a gate that actually uses one: an environment that
-    starves the real gate would pass every stub in this file.
-
-    The gate exercised is `_DEFAULT_SHIPPED_GATE`, or whatever ONETREE_TEST_SHIPPED_GATE
-    names instead. An ABSENT default artifact skips, because the check genuinely cannot run
-    here; a default path that EXISTS but is not a regular file fails, because a malformed
-    estate is not the same condition as no estate; and a variable naming a missing file
-    fails, because someone stated an intent that cannot be met.
+    Every other test in this module runs a purpose-built gate, so the child environment the
+    broker builds is never tested against a real gate: an environment that starves a real
+    gate would pass every stub in this file.
     """
 
-    configured = os.environ.get("ONETREE_TEST_SHIPPED_GATE", "")
-    gate = Path(configured) if configured else _DEFAULT_SHIPPED_GATE
-    if not gate.is_file():
-        if configured:
-            pytest.fail(f"ONETREE_TEST_SHIPPED_GATE names no regular file: {gate}")
-        if gate.exists():
-            pytest.fail(f"the default gate path exists but is not a regular file: {gate}")
-        pytest.skip(f"no shipped gate to exercise at {gate}")
-
+    gate = Path(onetree.__file__).with_name("standard_gate.py")
+    assert gate.is_file(), gate
     coordinator = _register_and_stage(
-        git_repo, "alpha", "shipped gate integration\n", commit_payload=gate
+        git_repo, "alpha", "standard gate integration\n", commit_payload=gate
     )
-    native_id = "11111111-1111-4111-8111-111111111111"
-    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
-    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
-    monkeypatch.setenv("CODEX_THREAD_ID", native_id)
-    landed = coordinator.land(
-        "alpha",
-        message=(
-            "Shipped gate integration\n\n"
-            "Co-Authored-By: Codex <codex@example.invalid>\n"
-            f"Codex-Session: {native_id}\n"
-        ),
-    )
+    landed = coordinator.land("alpha", message="Standard gate integration\n")
 
     assert git_repo.oid() == landed.commit
+    assert landed.gate_receipt is not None
+    assert landed.gate_receipt["report"]["verdict"] == "CLEAN"

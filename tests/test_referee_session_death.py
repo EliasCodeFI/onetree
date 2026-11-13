@@ -1,4 +1,4 @@
-"""Gate 2 task 16, remaining axes: session-body death and death inside commit_tree.
+"""Submitter death, remaining axes: session-body death and death inside commit_tree.
 
 ``test_referee_crash_windows.py`` kills a landing incarnation whose session
 body is the test process, so every window there ends with a live session and
@@ -223,7 +223,7 @@ def test_session_body_death_in_each_window_leaves_a_dead_session_the_broker_name
             _wait_for(lambda: window in _phases(log), f"the body to reach {window}")
         _kill(process)
         if window == "referee":
-            # Production cleanup (task 171) owns the referee once its lander is gone.
+            # Production cleanup owns the referee once its lander is gone.
             _wait_for(lambda: not _alive(int(running["pid"])), "referee cleanup", timeout=5)
             _wait_for(lambda: not list(scratch.glob("onetree-referee-*")),
                       "scratch cleanup", timeout=5)

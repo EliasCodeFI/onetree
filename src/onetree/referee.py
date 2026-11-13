@@ -48,10 +48,10 @@ def configuration(repo: Repository) -> tuple[str | None, float]:
     (`Repository._environment`), so its git does read the system file and this filter is
     what drops that value.
     Measured 2026-09-10: an effective-scope read ran a global red referee the repository
-    never configured and put a global timeout into the epoch (Round BF DUO); a `--local`
-    read skipped `[include]` and `config.worktree` and demoted a repository-configured
-    red referee to `not_configured` (Round BF2 DUO); the `system` exclusion had no fixture
-    that could fail, because no test could hand this filter a `system` pair (Round BF3 DUO).
+    never configured and put a global timeout into the epoch; a `--local` read skipped
+    `[include]` and `config.worktree` and demoted a repository-configured red referee to
+    `not_configured`; and the `system` exclusion needs a fixture that hands this filter a
+    `system` pair, or no test of it can fail.
     """
     values: list[str | None] = []
     for key in ("onetree.referee", "onetree.refereeTimeout"):

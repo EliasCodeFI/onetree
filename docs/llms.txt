@@ -45,7 +45,3 @@ What `onetree land` does before a branch moves, in five steps (the second animat
 - [Contributing](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/.github/CONTRIBUTING.md): how to contribute
 - [Security policy](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/.github/SECURITY.md): how to report a vulnerability privately
 - [License](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/LICENSE): Apache License 2.0
-
-## Optional
-
-- [Demo](https://raw.githubusercontent.com/EliasCodeFI/onetree/main/docs/DEMO.md): a local run with synthetic workers against a new sample repository

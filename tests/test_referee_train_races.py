@@ -1,7 +1,7 @@
-"""Gate 2 task 17: two submitters race under referee train order.
+"""Two submitters race under referee train order.
 
 INV3 established that two real lander processes racing on one target produce
-one first-attempt winner and land both payloads. Round B established, with
+one first-attempt winner and land both payloads. Earlier tests established, with
 callbacks inside one process, that a stale audit is invalidated by the WAL CAS
 and that a retry rebuilds and re-tests against the new target. Neither shows
 the composition: that the losing *process* of a real race rebuilds its
@@ -24,7 +24,7 @@ on a gate the test opens at a chosen moment: after the winner has landed, so
 the loser's retry deterministically sees a landed winner; or with the winner
 parked at ``after_intent``, so the loser deterministically meets a pending
 train. The unordered case releases both together, a real race whose loser
-reaches one of the outcomes the Round B contract allows, and the case asserts
+reaches one of the outcomes the landing contract allows, and the case asserts
 whichever occurred against its own evidence rather than choosing.
 
 Controls. The referee log's ``a``/``b`` fields are read from the candidate

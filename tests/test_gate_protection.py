@@ -450,7 +450,7 @@ def test_the_human_report_names_a_named_gate(
     )
 
 
-# --- fix round 2: a protected intent is bound to the epoch's gate on replay ------------------
+# --- a protected intent is bound to the epoch's gate on replay ------------------
 
 
 def _protected_landing(git_repo: GitFixture) -> tuple[Coordinator, Any]:
@@ -594,7 +594,7 @@ def test_a_b_a_b_admission_flip_during_one_landing_does_not_land(
     }
 
 
-# --- fix round 3: no landing under a protected epoch that names no gate ---------------------
+# --- no landing under a protected epoch that names no gate ---------------------
 
 
 def _unadmit(git_repo: GitFixture) -> None:

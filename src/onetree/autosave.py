@@ -1,7 +1,7 @@
 """Recoverable snapshots of a session's claimed working bytes.
 
 The workspace guard detects erasures that move a ref; path-form checkouts move
-none, so they erase a peer's unstaged work undetected (``docs/ROUND-B.md``).
+none, so they erase a peer's unstaged work undetected.
 Autosave does not detect or prevent that. It makes the bytes a session saved
 under its own claims recoverable afterwards, and nothing more: bytes written
 after the last save are not held anywhere and are reported as such.
@@ -9,8 +9,7 @@ after the last save are not held anywhere and are reported as such.
 Each save is a commit on ``refs/onetree/autosave/<actor>`` whose tree holds the
 present files of the saved scope at their working-tree bytes and modes, and
 whose message records the scope, the deletions and the base. It writes no WAL
-event and touches no index but a temporary one. See
-``docs/ROUND-AUTOSAVE-SPIKE.md`` for the measured boundary and costs.
+event and touches no index but a temporary one.
 """
 
 from __future__ import annotations
