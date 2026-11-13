@@ -8,7 +8,8 @@
 <p align="center"><strong>Your agents. One tree. No worktrees.</strong></p>
 
 <p align="center">
-  Several coding agents working at the same time in one git clone and one working tree:<br>
+  Several coding agents (Claude Code sessions, their subagents, Codex) working at the same time
+  in one git clone and one working tree:<br>
   a private git index for each agent, claims on the files it writes, a broker that checks every
   commit, and your test suite as the referee.
 </p>
@@ -23,6 +24,7 @@
 
 <p align="center">
   <a href="#install">Install</a> ·
+  <a href="#works-with-claude-code-and-codex">Claude Code and Codex</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#commands">Commands</a> ·
@@ -61,6 +63,46 @@
 
 </details>
 
+## Works with Claude Code and Codex
+
+Several Claude Code sessions or subagents on one repository, overwriting each other's files?
+onetree keeps them in one working tree, without a git worktree for each: every file an agent is
+about to edit is claimed for it first, a second agent asking for the same file is told who has
+it, and finished work reaches the branch only after your tests pass.
+
+For Claude Code: [install onetree](#install), set your repository up once, and add the plugin.
+
+```sh
+onetree init --test "python -m pytest -q"     # in your repository, once
+```
+
+```text
+/plugin marketplace add EliasCodeFI/onetree
+/plugin install onetree@onetree
+```
+
+The plugin claims each file before Claude edits it, refuses `git checkout`, `reset`, `stash`,
+`commit` and the other git commands that would erase another agent's work, gives each subagent
+claims of its own, and adds `claim`, `release`, `claims` and `land` tools. Claude lands finished
+work with the `land` tool, which also works when Claude Code's shell sandbox is on.
+
+For Codex: add the same hook to `.codex/hooks.json` in your repository, trust it with `/hooks`,
+and land with `onetree land -a -m "<message>"`.
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "^(apply_patch|Bash)$",
+  "hooks": [{"type": "command", "command": "onetree hook codex pre-tool-use"}]}]}}
+```
+
+### How it compares
+
+| Approach | One working tree | Two agents, one file | Tests before the branch moves | Agents |
+| --- | --- | --- | --- | --- |
+| A git worktree per agent | No, one checkout each | Found later, as a merge conflict | Up to you | Any |
+| Lock hooks ([claude-file-lock](https://github.com/DevsProtein/claude-file-lock), [claude-bulkhead](https://github.com/dooly6276/claude-bulkhead)) | Yes | Second edit refused | No | Claude Code |
+| Claude Code agent teams | Yes | Not prevented: tasks are claimed, files are not | No | Claude Code |
+| **onetree** | Yes | Second edit refused, with the holder's name | Yes, your test command | Claude Code, Codex, any command line |
+
 ## Why one tree
 
 The usual way to run several coding agents on one repository is to give each agent its own git
@@ -84,8 +126,9 @@ repository's own `.git` directory, so your working tree stays free of extra file
 | **Commit broker** | `onetree land` is the only way into the shared branch. It checks that every changed file is claimed by the session, builds the commit from the session's own index, runs the payload gate you admitted, and moves the branch only if nobody moved it in the meantime. If someone did, it rebuilds the commit on top and tries again. | [`test_land.py`](tests/test_land.py) · [`test_payload_gate.py`](tests/test_payload_gate.py) |
 | **Test referee** | Before the branch moves, your test command runs on a temporary checkout of the change. If the tests fail or time out, the change is refused. | [`test_referee.py`](tests/test_referee.py) |
 
-Everything onetree records goes into an append-only log on the git ref `refs/onetree/wal`. The
-details are in [`docs/DESIGN.md`](docs/DESIGN.md).
+Everything onetree records goes into an append-only log on the git ref `refs/onetree/wal` (a
+write-ahead log), and every branch and log update is a compare-and-swap. The details are in
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ### The landing path
 
@@ -152,42 +195,41 @@ To pin an exact version, add a commit to the address, for example
 
 ## Quick start
 
-**1. Once per repository.** Admit a payload gate, name your test command, and optionally protect
-the branch.
+**1. Once per repository.**
 
 ```sh
 cd /path/to/your/repository
-
-# The payload gate is a Python script you supply and have reviewed. onetree does not ship one.
-onetree gate --admit /absolute/path/to/commit_payload.py
-
-# Your test command is the referee. It runs without a shell, in a temporary checkout of each
-# change (default time limit: 300 seconds).
-git config onetree.referee "/absolute/path/to/python -m pytest -q"
-
-# Optional: record the branch, the referee and the gate as the protected baseline.
-onetree protect
+onetree init --test "python -m pytest -q"
 ```
 
-**2. In every agent session.** Register, claim, edit, stage into the private index, land.
+`init` admits onetree's standard payload gate, sets the test command that runs before every
+landing (in a temporary checkout, without a shell, 300 seconds at most by default) and turns on
+the log cache. The standard gate refuses unresolved merge conflict markers, private keys and files
+over 50 MiB. `--gate <file>` admits a gate of your own instead, and `--protect` also refuses
+landings after anyone moves the branch outside onetree.
+
+**2. In every agent session.** The Claude Code plugin does all of this for you. By hand:
 
 ```sh
-export ONETREE_SESSION_ID=agent-a      # or pass --session agent-a to each command
+export ONETREE_SESSION_ID=agent-a      # Claude Code and Codex sessions are recognised without it
 
-onetree session --json                 # registers the session and prints its private index path
-onetree claim "$PWD/src/api.py"        # claims take absolute, existing paths
+onetree session                        # registers the session, once
+onetree claim "$PWD/src/api.py"        # absolute paths; the file may not exist yet
 
 # ... edit src/api.py in the shared working tree ...
 
-GIT_INDEX_FILE=<index path printed by `onetree session`> git add src/api.py
-onetree land -m "api: handle empty input"
+onetree land -a -m "api: handle empty input"
 onetree release "$PWD/src/api.py"
 ```
 
+`land -a` stages exactly the files the session holds, so other agents' unfinished edits in the
+shared tree stay out of the commit. It first moves the session to the branch's tip, keeping its
+claims, so work lands cleanly after other agents have landed.
+
 A session lives as long as the process it was registered for, and for at most 24 hours by default
-(`--ttl`). That process is the parent of `onetree session`, normally your shell. A harness that
-starts a new shell for every command names its own long-lived process instead, with
-`onetree session --pid <pid>`.
+(`--ttl`). That process is the parent of `onetree session`, normally your shell; in Claude Code it
+is Claude Code itself. A harness that starts a new shell for every command names its own
+long-lived process instead, with `onetree session --pid <pid>`.
 
 A session that asks for a file another session holds gets an error that names the holder, for
 example `onetree: claim refused; held by agent-a`. With `--json` the error has the type
@@ -195,7 +237,8 @@ example `onetree: claim refused; held by agent-a`. With `--json` the error has t
 
 **The payload gate.** A repository with no admitted gate refuses every landing. The broker runs the
 gate on each change as `python -I -S commit_payload.py commit <commit> --repo <repository> --json`
-and lands the change only when the gate answers `CLEAN`.
+and lands the change only when the gate answers `CLEAN`. `onetree gate --admit <file>` admits
+another gate at any time.
 
 **A demo without your own repository.** `python -m onetree.demo` runs several worker processes
 against a new sample repository: a claim refusal first, then landings through the broker. See
@@ -207,27 +250,32 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 
 | Command | What it does |
 | --- | --- |
+| `onetree init [--test <command>]` | Set a repository up: payload gate, test command, log cache. |
 | `onetree status` | Report version and build phase. |
 | `onetree session` | Register or inspect a session index. |
-| `onetree claim <path>...` | Claim one or more absolute existing paths. |
-| `onetree check <path>...` | Check one or more absolute existing paths; exit status 1 when another live session holds one. |
+| `onetree claim <path>...` | Claim one or more absolute paths; a file may not exist yet. |
+| `onetree claims` | Show who holds which paths. |
+| `onetree check <path>...` | Check one or more absolute paths; exit status 1 when another live session holds one. |
 | `onetree narrow <parent> <path>...` | Atomically retain descendants of a held path. |
 | `onetree release [<path>...]` | Release selected paths or all held paths. |
-| `onetree land -m <message>` | Audit the session index and land it on the branch. |
+| `onetree land -a -m <message>` | Stage every file the session holds, then audit and land it on the branch. Without `-a`, land what is staged. |
 | `onetree gate [--admit <file>]` | Inspect or admit the repository's commit payload gate. |
 | `onetree protect` | Protect the current shared branch baseline. |
 | `onetree reconcile` | Explicitly accept an inspected workspace baseline. |
 | `onetree wal [--recover]` | Verify and inspect `refs/onetree/wal`; resolve any exposed intent. |
 | `onetree autosave save\|list\|restore\|status` | Save, list or restore snapshots of claimed working bytes. |
 | `onetree gc` | Append a stale-session and stale-claim collection event. |
+| `onetree hook claude\|codex <event>` | Run as a Claude Code or Codex hook (the plugin uses it). |
+| `onetree mcp` | Serve `claim`, `release`, `claims` and `land` to an agent over MCP. |
 
 ## Good to know
 
 - Claims cover files in the repository. They do not keep agents apart at run time: two agents
   that use the same port or database still meet there.
 - onetree works on one machine and one clone. Pushing to GitHub or another remote is up to you.
-- It protects what git records. A command that changes files without git recording it, such as
-  `git checkout -- <file>`, is not caught.
+- Claims guard what goes through the agent's edit tools and through onetree's landing. A shell
+  command that writes a file directly, such as `sed -i`, is not stopped; a landing still refuses
+  any file the session does not hold.
 - Linux only.
 
 ## Documentation

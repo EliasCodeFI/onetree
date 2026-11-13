@@ -38,13 +38,17 @@ def test_inv6_invalid_paths_refuse_and_conflicts_name_holder(
 
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
-    invalid = ["a.txt", str(git_repo.root / "missing.txt"), str(outside)]
+    dangling = git_repo.root / "dangling"
+    dangling.symlink_to(git_repo.root / "nowhere.txt")
+    invalid = ["a.txt", str(dangling), str(outside)]
     reasons: list[str] = []
     for value in invalid:
         with pytest.raises(InvalidPathError) as caught:
             coordinator.check("alpha", value)
         reasons.append(str(caught.value.details["reason"]))
     assert reasons == ["relative", "nonexistent", "outside_repository"]
+    # A file that does not exist yet is not invalid: a session claims it before creating it.
+    assert coordinator.check("alpha", str(git_repo.root / "missing.txt")).blocked is False
 
     claimed = coordinator.claim("alpha", [str(git_repo.root / "a.txt")])
     assert [claim.path for claim in claimed.claims] == ["a.txt"]

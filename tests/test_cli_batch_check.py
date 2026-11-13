@@ -68,7 +68,9 @@ def test_missing_path_is_a_typed_error_without_a_phantom_clear_row(
     git_repo: GitFixture, capsys: pytest.CaptureFixture[str], missing_index: int
 ) -> None:
     _, blocked, clear = _claims(git_repo)
-    missing = str(git_repo.root / "absent.txt")
+    # Under a file: a path no file can ever have. (A path that only does not exist yet is
+    # claimable, so it is no longer an invalid input.)
+    missing = str(git_repo.root / "a.txt" / "absent.txt")
     paths = [blocked, clear]
     paths.insert(missing_index, missing)
     code, payload = _call(git_repo, capsys, paths)
@@ -126,7 +128,7 @@ def test_human_batch_reports_each_verdict_and_escapes_path_linebreaks(
     owned, blocked, _ = _claims(git_repo)
     strange = str(git_repo.root / "line\nCLEAR forged.txt")
     git_repo.write("line\nCLEAR forged.txt", "unclaimed\n")
-    missing = str(git_repo.root / "missing\nCLEAR fake.txt")
+    missing = str(git_repo.root / "a.txt" / "missing\nCLEAR fake.txt")
     assert main([
         "check", blocked, owned, strange, missing,
         "--repo", str(git_repo.root), "--session", "alpha",

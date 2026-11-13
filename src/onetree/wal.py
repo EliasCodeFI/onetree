@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from onetree.errors import GitError, RefCorruptError, WalCorruptError
 from onetree.git import Repository
 
 WAL_REF = "refs/onetree/wal"
+#: Repository setting that lets readers keep a copy of the verified log (``onetree init``
+#: sets it). Without it every read verifies the whole chain, as before.
+CACHE_CONFIG_KEY = "onetree.walCache"
+_CACHE_HEADER = b'{"onetree-wal-cache":1}\n'
 
 # ``v`` is the lowest reader version that understands the document's event
 # kind. It is not a version of the document shape: the six keys below have
@@ -112,6 +119,18 @@ class Wal:
 
     def __init__(self, repo: Repository) -> None:
         self.repo = repo
+        self._cache_enabled: bool | None = None
+
+    def cache_enabled(self) -> bool:
+        """Whether the repository lets readers keep a copy of the verified log."""
+
+        if self._cache_enabled is None:
+            result = self.repo.git("config", "--bool", "--get", CACHE_CONFIG_KEY, check=False)
+            self._cache_enabled = result.returncode == 0 and result.stdout.strip() == b"true"
+        return self._cache_enabled
+
+    def cache_path(self) -> Path:
+        return self.repo.git_dir / "onetree" / "cache" / "wal.jsonl"
 
     @staticmethod
     def document(
@@ -218,10 +237,116 @@ class Wal:
                 **error.details,
             ) from error
 
-    def read(self) -> WalSnapshot:
+    def read(self, *, verify: bool = False) -> WalSnapshot:
+        """The whole log, first event to last.
+
+        With the cache setting on (``onetree.walCache``), a reader keeps a copy of the
+        chain it has verified in ``.git/onetree/cache`` and reads from Git only the events
+        appended since. The copy is used only when the log's head descends from the copy's
+        last event by first parents, and every new event is read and checked as a full
+        read checks it; anything else is a full read, which writes a new copy. ``verify``
+        reads and checks the whole chain whatever the setting.
+        """
+
         head = self.head()
         if head is None:
             return WalSnapshot(head=None, events=())
+        if not self.cache_enabled():
+            return self._read_chain(head)
+        if not verify:
+            cached = self._read_cached(head)
+            if cached is not None:
+                return cached
+        snapshot = self._read_chain(head)
+        self._write_cache(snapshot.events, rewrite=True)
+        return snapshot
+
+    def _read_cached(self, head: str) -> WalSnapshot | None:
+        loaded = self._load_cache()
+        if loaded is None:
+            return None
+        events, last = loaded
+        if last == head:
+            return WalSnapshot(head=head, events=events)
+        listed = self.repo.git(
+            "rev-list", "--first-parent", "--reverse", "--parents", head, f"^{last}", check=False
+        )
+        if listed.returncode != 0:
+            return None
+        added = self._read_canonical(head, listed.stdout, last)
+        if added is None or not added.events:
+            return None
+        self._write_cache(added.events, rewrite=False)
+        return WalSnapshot(head=head, events=(*events, *added.events))
+
+    def _load_cache(self) -> tuple[tuple[EventRecord, ...], str] | None:
+        """The cached chain and its last commit, or None when the copy is absent or unsound."""
+
+        try:
+            data = self.cache_path().read_bytes()
+        except OSError:
+            return None
+        if not data.startswith(_CACHE_HEADER) or not data.endswith(b"\n"):
+            return None
+        body = data[len(_CACHE_HEADER) : -1]
+        if not body:
+            return None
+        try:
+            # One JSON value per line; JSON text never holds a raw line break.
+            rows = json.loads(b"[" + body.replace(b"\n", b",") + b"]")
+        except (ValueError, RecursionError):
+            return None
+        events: list[EventRecord] = []
+        previous: str | None = None
+        for row in rows:
+            if (
+                not isinstance(row, list)
+                or len(row) != 3
+                or not isinstance(row[0], str)
+                or not isinstance(row[1], list)
+                or not isinstance(row[2], dict)
+            ):
+                return None
+            parents = tuple(row[1])
+            if parents != (() if previous is None else (previous,)):
+                return None
+            events.append(EventRecord(oid=row[0], parents=parents, document=row[2]))
+            previous = row[0]
+        if previous is None:
+            return None
+        try:  # the one cached name that reaches a git command line
+            self.repo.validate_oid(previous, label="cached WAL commit")
+        except GitError:
+            return None
+        return tuple(events), previous
+
+    def _write_cache(self, events: Sequence[EventRecord], *, rewrite: bool) -> None:
+        """Store or extend the copy. A copy that cannot be written is simply not kept."""
+
+        lines = b"".join(
+            json.dumps(
+                [event.oid, list(event.parents), dict(event.document)],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\n"
+            for event in events
+        )
+        path = self.cache_path()
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not rewrite:
+                with path.open("ab") as stream:
+                    stream.write(lines)
+                return
+            temporary = path.with_name(f".wal.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                temporary.write_bytes(_CACHE_HEADER + lines)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _read_chain(self, head: str) -> WalSnapshot:
         # Traverse only the candidate chain. ``--parents`` still exposes every
         # parent on a merge commit, so the exact-parent check below refuses it
         # without first attempting to parse the unrelated side history as WAL.
@@ -256,17 +381,22 @@ class Wal:
             raise WalCorruptError("WAL traversal did not end at the ref head", head=head)
         return WalSnapshot(head=head, events=tuple(events))
 
-    def _read_canonical(self, head: str, output: bytes) -> WalSnapshot | None:
+    def _read_canonical(
+        self, head: str, output: bytes, previous: str | None = None
+    ) -> WalSnapshot | None:
         """The snapshot the sequential reader in ``read`` would return, or None.
 
         A snapshot is returned only for a chain whose every record has the canonical shape
         the writer produces; anything else is None, and the sequential reader decides it over
         the same head and history, keeping its per-record commit, exact tree, document, object
-        identity, ordering and typed failure contracts. Nothing is retained across calls.
+        identity, ordering and typed failure contracts. Nothing is retained across calls
+        unless the repository turns the cache on (see ``read``).
+
+        With ``previous``, the rows must continue a chain that ends at that commit, and only
+        their events are returned: the cache's extension, held to the same checks.
         """
 
         rows: list[tuple[str, tuple[str, ...]]] = []
-        previous: str | None = None
         for raw_line in output.splitlines():
             try:
                 fields = raw_line.decode("ascii", errors="strict").split()

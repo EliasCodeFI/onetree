@@ -125,18 +125,27 @@ def test_missing_release_preserves_pending_landing_fences(git_repo: GitFixture) 
 
 
 def test_claim_and_check_still_refuse_a_missing_path(git_repo: GitFixture) -> None:
+    """A missing path that no file can have is refused; one that does not exist yet is claimable."""
+
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
-    missing = str(git_repo.root / "missing.txt")
+    dangling = git_repo.root / "dangling"
+    dangling.symlink_to(git_repo.root / "nowhere.txt")
     before = coordinator.wal.read().head
-    for operation in (
-        lambda: coordinator.claim("alpha", [missing]),
-        lambda: coordinator.check("alpha", missing),
+    for missing, reason in (
+        (str(git_repo.root / "a.txt" / "missing.txt"), "unresolvable"),
+        (str(dangling), "nonexistent"),
+        (str(git_repo.root / "gone" / ".." / "missing.txt"), "nonexistent"),
     ):
         with pytest.raises(InvalidPathError) as refused:
-            operation()
-        assert refused.value.details["reason"] == "nonexistent"
+            coordinator.claim("alpha", [missing])
+        assert refused.value.details["reason"] == reason
+        with pytest.raises(InvalidPathError) as refused:
+            coordinator.check("alpha", missing)
+        assert refused.value.details["reason"] == reason
     assert coordinator.wal.read().head == before
+    created_later = str(git_repo.root / "missing.txt")
+    assert coordinator.claim("alpha", [created_later]).claims[0].path == "missing.txt"
 
 
 @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="requires POSIX access checks")

@@ -57,6 +57,25 @@ def collect_isolated_interpreters() -> Iterator[None]:
         patcher.setattr(subprocess, "Popen", measured)
         yield
 
+@pytest.fixture(autouse=True)
+def no_agent_session_environment() -> Iterator[None]:
+    """Start every test outside any agent session, so a suite run inside Claude Code or Codex
+    behaves as it does in CI. Tests that need one of these names set it themselves. The patcher
+    is this fixture's own, for the reason `clean_commit_payload_gate` gives."""
+
+    with pytest.MonkeyPatch.context() as patcher:
+        for name in (
+            "ONETREE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_SESSION_ID",
+            "CLAUDE_PID",
+            "CLAUDE_PROJECT_DIR",
+        ):
+            patcher.delenv(name, raising=False)
+        yield
+
+
 _GIT_EXECUTABLE = shutil.which("git") or "git"
 
 _GATE_CHILD_SEARCH_PATH = os.pathsep.join(entry for entry in os.defpath.split(os.pathsep) if entry)

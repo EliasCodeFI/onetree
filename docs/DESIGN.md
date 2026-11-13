@@ -31,8 +31,11 @@ than easy; the [README](../README.md) explains the same mechanism in plain words
    is not.
 2. **Path claims.** `onetree claim <path>...` takes an exclusive write-claim
    per path for the calling session. A refusal names the current holder,
-   machine-readably. Claims canonicalize to repo-relative paths; a relative,
-   nonexistent, or out-of-repo input is a typed error — never a silent allow.
+   machine-readably. Claims canonicalize to repo-relative paths: the longest
+   existing prefix is resolved strictly, and a tail that does not exist yet is
+   kept as written, so a session can claim a file before it creates it. A
+   relative or out-of-repo input, a `..` or dangling symlink in the missing
+   tail, or a path through a file is a typed error — never a silent allow.
 3. **Commit broker.** `onetree land` is the only landing path:
    - audit: every path in the payload is claimed by the submitting session —
      fail-closed, an unclaimed path refuses the whole payload;
@@ -177,8 +180,8 @@ existed; a test that has never failed is not evidence.
 - **INV5** A landed commit's diff equals the audited payload exactly — no
   foreign hunks, no missing hunks.
 - **INV6** Claim refusals name the holder; path canonicalization rejects
-  relative/nonexistent/out-of-repo inputs with a typed error, never a silent
-  allow.
+  relative, out-of-repo and unresolvable inputs with a typed error, never a
+  silent allow. A path that does not exist yet is claimable.
 - **INV7** Kill the landing process at any point: no partial state survives;
   recovery replays the WAL to a consistent view.
 - **INV8** Landing identity is a set parsed from the raw commit-object message,
@@ -243,3 +246,47 @@ existed; a test that has never failed is not evidence.
 Event signing, synchronisation between hosts, and a daemon are not implemented. There are no
 runtime dependencies at any point. The projects this design learned from are credited in the
 [README](../README.md#credits).
+
+## Agents, sessions and the log cache
+
+**Session ids.** `--session` wins; then `ONETREE_SESSION_ID`, which a person or
+a harness sets on purpose; then the ids agents set for themselves:
+`CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID` and, for setups that export it by
+hand, `CLAUDE_SESSION_ID`. Two different values among the agents' ids are an
+ambiguity error. A session named by `CLAUDE_CODE_SESSION_ID` registers for the
+Claude Code process (`CLAUDE_PID`) unless `--pid` is given, because Claude Code
+runs every shell command in a new shell.
+
+**Renewal.** `Coordinator.renew` moves a session to its target's current tip:
+one WAL append holds a new `session_register` for the same actor, process and
+lease at the tip, and a new `claim` for every path the session held, so no other
+session can take a path in between. The private index is rebuilt from the tip
+with the session's staged changes on paths it holds; staged changes on paths it
+does not hold are dropped. `onetree land -a` renews, stages the working bytes of
+every held path into the private index, and lands.
+
+**Hand-over.** `Coordinator.hand_over` moves every live claim of one session to
+another in one WAL append (a `release` by the giver, then `claim` events by the
+taker). The Claude Code hooks use it when a subagent stops: a subagent claims
+under `<session id>.<agent id>`, and its files pass to its session, which lands
+them.
+
+**Hooks and the MCP server.** `onetree hook claude|codex <event>` reads the
+agent's hook JSON. In a repository with an admitted gate or a WAL it registers
+the session, claims each file an edit tool is about to write (a claim conflict
+is a PreToolUse `deny` that names the holder), refuses git commands that rewrite
+the shared tree or move the shared branch, snapshots edited files
+(`onetree autosave`) and hands a stopped subagent's claims to its session. An
+error of onetree's own never blocks the agent. `onetree mcp` serves `claim`,
+`release`, `claims` and `land` over MCP on stdio; Claude Code runs it outside
+the command sandbox, where the agent's process is visible, so a session whose
+shell is sandboxed can still claim and land.
+
+**Log cache.** With `onetree.walCache` set to true (`onetree init` sets it), a
+reader keeps the chain it verified in `.git/onetree/cache/wal.jsonl` and reads
+from Git only the events appended since: the copy is used only when the WAL's
+head descends from its last event by first parents, every new event passes the
+same checks as a full read, and anything else is a full read that writes a new
+copy. `onetree wal`, `onetree wal --adopt` and `onetree wal --recover` always
+read and verify the whole chain. The copy is as trustworthy as the rest of
+`.git`: a process that can write it can also rewrite the WAL ref.

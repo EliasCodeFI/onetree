@@ -581,11 +581,15 @@ class Coordinator:
         target: str | None = None,
         *,
         retry_audit: _RetryAudit | None = None,
+        verify: bool = False,
     ) -> WalSnapshot:
-        """Read a WAL for mutation only after auditing the histories it would adopt."""
+        """Read a WAL for mutation only after auditing the histories it would adopt.
+
+        ``verify`` reads the whole chain from Git even where the repository keeps a cache.
+        """
 
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self.wal.read(verify=verify)
             state = self._fold(snapshot)
             self._verify_landed(state)
             heads = self._audit_heads(state, target)
@@ -654,6 +658,16 @@ class Coordinator:
                 return resolved.joinpath(*reversed(suffix))
 
     def _canonical_path(self, raw_path: str, *, for_release: bool = False) -> str:
+        """The repository-relative key of an absolute path.
+
+        The longest existing prefix is resolved strictly, so two spellings of one file
+        (a symlinked directory, ``..``) give one key. A tail that does not exist yet is
+        kept as written: a claim may name a file the session is about to create, and a
+        release may name a claimed file that has since been deleted. ``for_release`` is
+        kept for callers; claims and releases resolve the same way.
+        """
+
+        del for_release
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             raise InvalidPathError(
@@ -662,11 +676,7 @@ class Coordinator:
                 reason="relative",
             )
         try:
-            resolved = (
-                self._resolve_release_path(candidate)
-                if for_release
-                else candidate.resolve(strict=True)
-            )
+            resolved = self._resolve_release_path(candidate)
         except FileNotFoundError as error:
             raise InvalidPathError(
                 "claim path does not exist",
@@ -797,7 +807,9 @@ class Coordinator:
                 raise WalCorruptError("duplicate claim generation", oid=event.oid)
             state.claim_generations.add(generation)
             path = _string(data, "path", event)
-            if path.startswith("/") or ".." in Path(path).parts:
+            # A ".." component, found by splitting on "/" exactly as Path(path).parts would
+            # (which only drops "." and empty components), without building a Path per event.
+            if path.startswith("/") or ".." in path.split("/"):
                 raise WalCorruptError("claim path is not repository-relative", oid=event.oid)
             state.claims[generation] = ClaimInfo(
                 actor=event.actor,
@@ -1617,6 +1629,226 @@ class Coordinator:
             if self._try_append(state, snapshot, (release,)) is not None:
                 return ReleaseResult(released_paths)
         raise GitError("release CAS retry limit exceeded")
+
+    def claims(self) -> tuple[ClaimInfo, ...]:
+        """Every live claim, sorted by path: who holds what. Read-only."""
+
+        return self._fold(self.wal.read()).active_claims(time.time())
+
+    def renew(self, actor: str) -> SessionInfo:
+        """Move the session to its target's current tip and keep its claims, in one append.
+
+        A session's base is fixed when it registers. After a peer lands, the paths the peer
+        changed differ between that base and the branch, and a landing that touches one of
+        them is refused as a payload conflict. Renewing registers the same actor again, for
+        the same process and lease, at the target's current tip, and claims every path it
+        held again under the new session generation. Both go into one WAL append, so no
+        other session can take a path in between. The private index is rebuilt from the
+        tip with the changes the session had staged on paths it holds; staged changes on
+        paths it does not hold are dropped, since no landing could carry them.
+        """
+
+        actor = _validate_actor(actor)
+        for _ in range(MAX_CAS_RETRIES):
+            now = time.time()
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            session = self._active_session(state, actor, now)
+            if session is None:
+                raise IdentityError("session is not active", session=actor)
+            if any(intent.actor == actor for intent in state.pending.values()):
+                raise LandingRefusedError(
+                    "the session has a landing in flight; renew after it ends",
+                    reason="pending_land",
+                    paths=[],
+                )
+            tip = self.repo.resolve_ref(session.target, missing_ok=True)
+            if tip is None:
+                raise GitError("landing target is unborn", reference=session.target)
+            owned = tuple(claim for claim in state.active_claims(now) if claim.actor == actor)
+            baseline = self._session_baseline(state, session)
+            if tip == baseline:
+                return session
+            index = self.repo.ensure_index(actor, baseline)
+            staged = self._changes(
+                self.repo.tree_entries(baseline),
+                self.repo.tree_entries(self.repo.write_tree(index)),
+            )
+            kept = {
+                change.path: change.new
+                for change in staged
+                if any(_covers(claim.path, change.path) for claim in owned)
+            }
+            tree = self.repo.overlay_tree(tip, kept) if kept else tip
+            generation = uuid.uuid4().hex
+            documents: list[Mapping[str, Any]] = [
+                self.wal.document(
+                    "session_register",
+                    actor,
+                    {
+                        "generation": generation,
+                        "pid": session.pid,
+                        "pid_start": session.pid_start,
+                        "expires_at": session.expires_at,
+                        "base": tip,
+                        "target": session.target,
+                        "warnings": list(session.warnings),
+                    },
+                )
+            ]
+            documents.extend(
+                self.wal.document(
+                    "claim",
+                    actor,
+                    {
+                        "path": claim.path,
+                        "generation": uuid.uuid4().hex,
+                        "session_generation": generation,
+                        "expires_at": min(claim.expires_at, session.expires_at),
+                    },
+                )
+                for claim in owned
+            )
+            if self._try_append(state, snapshot, documents) is not None:
+                index = self.repo.ensure_index(actor, tree, reset=True)
+                return SessionInfo(
+                    actor=actor,
+                    generation=generation,
+                    pid=session.pid,
+                    pid_start=session.pid_start,
+                    expires_at=session.expires_at,
+                    base=tip,
+                    target=session.target,
+                    index_path=index,
+                    warnings=session.warnings,
+                )
+        raise GitError("session renewal CAS retry limit exceeded")
+
+    def stage_claimed(self, actor: str) -> tuple[str, ...]:
+        """Stage the working bytes of every path the session holds into its private index.
+
+        Adds, edits and deletions under each claim are staged; ignored files are not.
+        Paths the session does not hold are never touched, so peers' unfinished edits in
+        the shared working tree stay out of its payload. Returns the paths whose staged
+        content differs from the session's baseline: what a landing would carry.
+        """
+
+        actor = _validate_actor(actor)
+        now = time.time()
+        state = self._fold(self.wal.read())
+        session = self._active_session(state, actor, now)
+        if session is None:
+            raise IdentityError("session is not active", session=actor)
+        owned = sorted({claim.path for claim in state.active_claims(now) if claim.actor == actor})
+        baseline = self._session_baseline(state, session)
+        index = self.repo.ensure_index(actor, baseline)
+        if owned:
+            literal = [f":(literal){path}" for path in owned]
+            listed = self.repo.git("ls-files", "-z", "--cached", "--", *literal, index=index).stdout
+            tracked = {
+                item.decode("utf-8", "surrogateescape") for item in listed.split(b"\0") if item
+            }
+            # An ignored path that the index does not track makes `git add` refuse the
+            # whole call, so it is left out here; a tracked one is staged as usual.
+            ignored_output = self.repo.git(
+                "check-ignore",
+                "-z",
+                "--stdin",
+                index=index,
+                input_bytes=b"".join(
+                    path.encode("utf-8", "surrogateescape") + b"\0" for path in owned
+                ),
+                check=False,
+            ).stdout
+            ignored = {
+                item.decode("utf-8", "surrogateescape")
+                for item in ignored_output.split(b"\0")
+                if item
+            }
+            present = [
+                path
+                for path in owned
+                if path not in ignored
+                and (
+                    path == "."
+                    or os.path.lexists(self.repo.root / path)
+                    or path in tracked
+                    or any(item.startswith(f"{path}/") for item in tracked)
+                )
+            ]
+            if present:
+                self.repo.git(
+                    "add", "--all", "--", *(f":(literal){path}" for path in present), index=index
+                )
+        changes = self._changes(
+            self.repo.tree_entries(baseline),
+            self.repo.tree_entries(self.repo.write_tree(index)),
+        )
+        return tuple(change.path for change in changes)
+
+    def hand_over(self, giver: str, taker: str) -> tuple[str, ...]:
+        """Pass every live claim of ``giver`` to ``taker`` in one WAL append.
+
+        Used when a subagent ends: its files pass to the session that will land them, and
+        no third session can take a path in between. Paths ``taker`` already covers are
+        only released. A claim fenced by the giver's own landing in flight stays where it
+        is. Returns the paths that moved.
+        """
+
+        giver = _validate_actor(giver)
+        taker = _validate_actor(taker)
+        if giver == taker:
+            return ()
+        for _ in range(MAX_CAS_RETRIES):
+            now = time.time()
+            snapshot = self._read_wal()
+            state = self._fold(snapshot)
+            receiver = self._active_session(state, taker, now)
+            if receiver is None:
+                raise IdentityError("session is not active", session=taker)
+            fenced = {
+                str(fence.get("claim_generation"))
+                for intent in state.pending.values()
+                for fence in intent.data.get("fences", [])
+                if isinstance(fence, dict)
+            }
+            active = state.active_claims(now)
+            given = tuple(
+                claim
+                for claim in active
+                if claim.actor == giver and claim.generation not in fenced
+            )
+            if not given:
+                return ()
+            held = tuple(claim for claim in active if claim.actor == taker)
+            deadline = self._ttl_deadline(DEFAULT_TTL, now, receiver.expires_at)
+            documents: list[Mapping[str, Any]] = [
+                self.wal.document(
+                    "release",
+                    giver,
+                    {
+                        "generations": [claim.generation for claim in given],
+                        "paths": sorted({claim.path for claim in given}),
+                    },
+                )
+            ]
+            documents.extend(
+                self.wal.document(
+                    "claim",
+                    taker,
+                    {
+                        "path": claim.path,
+                        "generation": uuid.uuid4().hex,
+                        "session_generation": receiver.generation,
+                        "expires_at": deadline,
+                    },
+                )
+                for claim in given
+                if not any(_covers(mine.path, claim.path) for mine in held)
+            )
+            if self._try_append(state, snapshot, documents) is not None:
+                return tuple(sorted({claim.path for claim in given}))
+        raise GitError("hand-over CAS retry limit exceeded")
 
     @staticmethod
     def _changes(
@@ -2566,7 +2798,7 @@ class Coordinator:
         """Inspect without mutating, including states that mutation must refuse."""
 
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self.wal.read(verify=True)
             state = self._fold(snapshot)
             self._verify_landed(state)
             heads = self._audit_heads(state, target)
@@ -2631,7 +2863,7 @@ class Coordinator:
 
         target_ref = None if target is None else self.repo.validate_branch_ref(target)
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self.wal.read()
+            snapshot = self.wal.read(verify=True)
             state = self._fold(snapshot)
             # Every recorded landing is verified before the audit may rely on
             # it; a legacy record in particular counts only once its commit is
@@ -2792,7 +3024,7 @@ class Coordinator:
         repaired = 0
         refused = 0
         for _ in range(MAX_CAS_RETRIES):
-            snapshot = self._read_wal(target)
+            snapshot = self._read_wal(target, verify=True)
             state = self._fold(snapshot)
             documents, batch_repaired, batch_refused, in_flight = self._recovery_documents(
                 state, time.time()

@@ -9,7 +9,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from onetree import __version__, autosave
+from onetree import __version__, agents, autosave
 from onetree.core import CheckResult, Coordinator
 from onetree.errors import (
     IdentityError,
@@ -76,7 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_output(session)
 
-    claim = subparsers.add_parser("claim", help="Claim one or more absolute existing paths.")
+    claim = subparsers.add_parser(
+        "claim", help="Claim one or more absolute paths; a file may not exist yet."
+    )
     claim.add_argument("paths", nargs="+")
     _add_repo(claim)
     _add_actor(claim)
@@ -96,7 +98,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_actor(release)
     _add_output(release)
 
-    check = subparsers.add_parser("check", help="Check one or more absolute existing paths.")
+    check = subparsers.add_parser("check", help="Check one or more absolute paths.")
     check.add_argument("paths", nargs="+")
     _add_repo(check)
     _add_actor(check)
@@ -118,6 +120,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     land.add_argument("-m", "--message", help="Commit message.")
+    land.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help=(
+            "First move the session to the branch's tip (keeping its claims) and stage every "
+            "file it holds; paths it does not hold are never staged."
+        ),
+    )
     _add_output(land)
 
     gate = subparsers.add_parser(
@@ -186,6 +197,39 @@ def _build_parser() -> argparse.ArgumentParser:
         _add_actor(action)
         _add_output(action)
 
+    init = subparsers.add_parser(
+        "init", help="Set a repository up: payload gate, test command, log cache."
+    )
+    _add_repo(init)
+    _add_actor(init)
+    init.add_argument("--test", help='Test command run before every landing, e.g. "pytest -q".')
+    init.add_argument("--gate", metavar="PATH", help="Admit this payload gate instead.")
+    init.add_argument(
+        "--protect",
+        action="store_true",
+        help="Also refuse landings after anyone moves the branch outside onetree.",
+    )
+    _add_output(init)
+
+    claims = subparsers.add_parser("claims", help="Show who holds which paths.")
+    _add_repo(claims)
+    _add_actor(claims)
+    _add_output(claims)
+
+    hook = subparsers.add_parser(
+        "hook", help="Run as a Claude Code or Codex hook (the plugin uses it)."
+    )
+    hook.add_argument("agent", choices=("claude", "codex"))
+    hook.add_argument(
+        "event", choices=("session-start", "pre-tool-use", "post-tool-use", "subagent-stop")
+    )
+
+    mcp = subparsers.add_parser(
+        "mcp", help="Serve claim, release, claims and land to an agent over MCP."
+    )
+    _add_repo(mcp)
+    _add_actor(mcp)
+
     gc = subparsers.add_parser("gc", help="Append a stale-session/claim collection event.")
     _add_repo(gc)
     _add_actor(gc)
@@ -196,18 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def _actor(explicit: str | None) -> str:
     if explicit:
         return explicit
-    candidates = {
-        value
-        for name in ("ONETREE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID")
-        if (value := os.environ.get(name))
-    }
-    if not candidates:
+    found = agents.session_id()
+    if found is None:
         raise IdentityError(
             "session id is required (--session or a supported session environment variable)"
         )
-    if len(candidates) != 1:
-        raise IdentityError("session environment is ambiguous", sessions=sorted(candidates))
-    return candidates.pop()
+    return found
 
 
 def _one_line(text: str) -> str:
@@ -336,7 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "gate" and args.sha256 is not None and args.admit is None:
         parser.error("gate: --sha256 requires --admit")
-    json_output = bool(args.json)
+    json_output = bool(getattr(args, "json", False))
     return_code = 0
     if args.command == "status":
         payload = {
@@ -347,6 +385,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         _emit(payload, json_output, f"onetree {__version__} (phase: gate-3-dogfood)")
         return 0
+    if args.command == "hook":
+        from onetree import hooks
+
+        outcome = hooks.run(args.agent, args.event, sys.stdin.read())
+        sys.stdout.write(outcome.stdout)
+        sys.stderr.write(outcome.stderr)
+        return outcome.code
+    if args.command == "mcp":
+        from onetree import mcp
+
+        try:
+            identity = args.actor or agents.session_id()
+        except IdentityError:
+            identity = None
+        repo = args.repo if args.repo != "." else os.environ.get("CLAUDE_PROJECT_DIR") or "."
+        return mcp.serve(repo, identity, sys.stdin, sys.stdout)
 
     try:
         coordinator = Coordinator(
@@ -354,12 +408,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             commit_payload=getattr(args, "commit_payload", None),
         )
         if args.command == "session":
-            session = coordinator.register_session(
-                _actor(args.actor),
-                pid=args.pid,
-                ttl=args.ttl,
-                target=args.target,
-            )
+            actor = _actor(args.actor)
+            pid = args.pid if args.pid is not None else agents.default_session_pid(actor)
+            try:
+                session = coordinator.register_session(
+                    actor, pid=pid, ttl=args.ttl, target=args.target
+                )
+            except IdentityError as error:
+                if args.pid is None and pid is not None and "not alive" in str(error):
+                    raise IdentityError(
+                        "the Claude Code process is not visible from this shell (a sandbox hides "
+                        "it), so no session can be tied to it here; use the onetree plugin's "
+                        "tools, or run onetree outside the sandbox",
+                        session=actor,
+                        pid=pid,
+                    ) from error
+                raise
             payload = {"ok": True, "session": session.payload()}
             human = f"registered {session.actor}; index {session.index_path}"
             if session.warnings:
@@ -402,7 +466,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             payload = {"ok": True, "workspace": dict(reconciled)}
             human = f"reconciled workspace; epoch {reconciled['epoch']}"
+        elif args.command == "init":
+            from onetree import initialize
+
+            try:
+                operator = _actor(args.actor)
+            except IdentityError:
+                operator = "operator"
+            setup = initialize.initialize(
+                coordinator, operator, tests=args.test, gate=args.gate, protect=args.protect
+            )
+            payload = {"ok": True, "init": setup.payload()}
+            gate_line = {
+                "standard": "the standard gate",
+                "updated": "the standard gate (updated)",
+                "admitted": "the gate you named",
+                "kept": "the gate already admitted",
+            }[setup.gate]
+            human = "\n".join(
+                [
+                    f"onetree is set up in {setup.root}",
+                    f"  payload gate: {gate_line} ({setup.gate_path})",
+                    f"  tests: {setup.tests or 'none'}",
+                    "  log cache: on",
+                    f"  branch protection: {'on' if setup.protected else 'off'}",
+                    *(f"  note: {note}" for note in setup.notes),
+                ]
+            )
+        elif args.command == "claims":
+            try:
+                me: str | None = _actor(args.actor)
+            except IdentityError:
+                me = None
+            held = coordinator.claims()
+            payload = {
+                "ok": True,
+                "claims": [{**claim.payload(), "mine": claim.actor == me} for claim in held],
+            }
+            human = "\n".join(
+                f"{claim.path}  {claim.actor}{'  (you)' if claim.actor == me else ''}"
+                for claim in held
+            ) or "nobody holds a claim"
         elif args.command == "land":
+            if args.all:
+                coordinator.renew(_actor(args.actor))
+                coordinator.stage_claimed(_actor(args.actor))
             land_result = coordinator.land(
                 _actor(args.actor),
                 message=args.message,

@@ -101,7 +101,7 @@ def test_invalid_narrow_batch_preserves_wal(git_repo: GitFixture, case: str) -> 
         "self": [parent],
         "sibling": [str(git_repo.root / "a.txt")],
         "relative": ["nested/c.txt"],
-        "missing": [str(git_repo.root / "nested/missing")],
+        "missing": [str(git_repo.root / "nested/c.txt/missing")],
         "git": [str(git_repo.root / ".git/config")],
         "alias": [str(alias)],
     }[case]

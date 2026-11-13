@@ -1,0 +1,12 @@
+{
+  "name": "onetree",
+  "owner": {"name": "Fastnet Oy"},
+  "description": "onetree for Claude Code: several sessions and subagents in one git working tree.",
+  "plugins": [
+    {
+      "name": "onetree",
+      "source": "./plugins/onetree",
+      "description": "Claims each file before an edit, refuses git commands that erase other agents' work, and lands work through onetree's checks and your tests."
+    }
+  ]
+}

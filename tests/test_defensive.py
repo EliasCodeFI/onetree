@@ -692,7 +692,9 @@ def test_cli_human_errors_and_environment_identity(
     coordinator = Coordinator(git_repo.root)
     coordinator.register_session("alpha", pid=os.getpid(), ttl=300)
     absolute = str(git_repo.root / "a.txt")
-    for name in ("ONETREE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID"):
+    for name in (
+        "ONETREE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"
+    ):
         monkeypatch.delenv(name, raising=False)
 
     assert main(["check", absolute, "--repo", str(git_repo.root)]) == 2
@@ -711,3 +713,15 @@ def test_cli_human_errors_and_environment_identity(
     ambiguous = capsys.readouterr()
     assert '"type": "invalid_identity"' in ambiguous.out
     assert ambiguous.err == ""
+
+    # Claude Code names its session in CLAUDE_CODE_SESSION_ID, and onetree's own variable wins
+    # over any id an agent sets.
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.delenv("CLAUDE_SESSION_ID")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "alpha")
+    assert main(["check", absolute, "--repo", str(git_repo.root)]) == 0
+    assert capsys.readouterr().out == "CLEAR a.txt\n"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "gamma")
+    monkeypatch.setenv("ONETREE_SESSION_ID", "alpha")
+    assert main(["check", absolute, "--repo", str(git_repo.root)]) == 0
+    assert capsys.readouterr().out == "CLEAR a.txt\n"
