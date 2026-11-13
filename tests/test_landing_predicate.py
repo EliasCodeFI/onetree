@@ -185,7 +185,7 @@ def _cases() -> tuple[PredicateCase, ...]:
     return tuple(cases)
 
 
-# This is the vocabulary from the 1,502-shape facts-pass harness. The fixed
+# The vocabulary of the seeded message grammar below. The fixed
 # cases above keep every known defect readable; the seeded grammar below makes
 # the differential test range beyond those defects without a Hypothesis/runtime
 # dependency.

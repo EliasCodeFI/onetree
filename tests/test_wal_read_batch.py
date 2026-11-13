@@ -4,7 +4,7 @@
 (measured, and measured again). The reader now puts a batched read of the
 canonical chain in front of its unchanged sequential path. The constant count is claimed only
 for a read that path certifies: a declined read starts the sequential reader's processes plus
-the batch reads it made before declining. The brief's contracts hold for every read: the
+the batch reads it made before declining. These guarantees hold for every read: the
 per-record commit, exact tree, document, object identity, ordering and typed failures are the
 sequential reader's; object and ref changes are seen by the next call; no trust is cached
 across calls. Which path a read took is observed, never inferred from a passing result: at

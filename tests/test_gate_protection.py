@@ -89,7 +89,7 @@ def _reconcile_and_land(coordinator: Coordinator, git_repo: GitFixture, actor: s
     assert landed.gate_receipt["gate_source_sha256"] == admission.sha256
 
 
-# --- done item 1: admission is protected configuration -------------------------------------
+# --- admission is protected configuration -------------------------------------
 
 
 @pytest.mark.parametrize("change", ["different_gate", "path_key", "sha256_key", "unadmitted"])
@@ -166,7 +166,7 @@ def test_a_baseline_with_a_malformed_gate_record_is_invalid(git_repo: GitFixture
         workspace.validate(baseline, repo, legacy=True)
 
 
-# --- done item 2: a repository protected before this change -------------------------------
+# --- a repository protected before this change -------------------------------
 
 
 def _persist(git_repo: GitFixture, document: Mapping[str, Any]) -> None:
@@ -247,7 +247,7 @@ def test_a_repository_protected_before_admission_verifies_and_brings_it_under_re
     assert reconcile.document["v"] == 5
 
 
-# --- done item 3 (M1): admission changed while a landing is in flight -----------------------
+# --- admission changed while a landing is in flight -----------------------
 
 
 def _self_changing_gate(tmp_path: Path, change: str, other: Path) -> Path:
@@ -314,7 +314,7 @@ def test_an_admission_change_before_the_intent_refuses_that_landing(
     assert git_repo.oid() == before
 
 
-# --- done item 4 (S3): an admitted symlink is repointed ------------------------------------
+# --- an admitted symlink is repointed ------------------------------------
 
 
 def test_a_repointed_admitted_symlink_refuses_until_readmission(
@@ -350,7 +350,7 @@ def test_a_repointed_admitted_symlink_refuses_until_readmission(
     assert git_repo.oid() == landed.commit
 
 
-# --- done item 5 (M2/S4): `onetree gate` applies landing's file rules -----------------------
+# --- `onetree gate` applies landing's file rules -----------------------
 
 
 def _cli(*arguments: str, env: Mapping[str, str] | None = None) -> tuple[int, dict[str, Any]]:

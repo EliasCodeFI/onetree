@@ -131,7 +131,7 @@ Check the installation:
 
 ```console
 $ onetree status
-onetree 0.0.1a0 (phase: gate-3-dogfood)
+onetree 0.0.1a0
 ```
 
 To pin an exact version, add a commit to the address:
@@ -191,7 +191,7 @@ Every command accepts `--json` and then writes exactly one JSON object to standa
 | Command | What it does |
 | --- | --- |
 | `onetree init [--test <command>]` | Set a repository up: payload gate, test command, log cache. |
-| `onetree status` | Report version and build phase. |
+| `onetree status` | Report the version. |
 | `onetree session` | Register or inspect a session index. |
 | `onetree claim <path>...` | Claim one or more absolute paths; a file may not exist yet. |
 | `onetree claims` | Show who holds which paths. |

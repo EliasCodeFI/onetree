@@ -43,7 +43,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="onetree", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    status = subparsers.add_parser("status", help="Report version and build phase.")
+    status = subparsers.add_parser("status", help="Report the version.")
     _add_output(status)
 
     protect = subparsers.add_parser("protect", help="Protect the current shared branch baseline.")
@@ -381,9 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": True,
             "name": "onetree",
             "version": __version__,
-            "phase": "gate-3-dogfood",
         }
-        _emit(payload, json_output, f"onetree {__version__} (phase: gate-3-dogfood)")
+        _emit(payload, json_output, f"onetree {__version__}")
         return 0
     if args.command == "hook":
         from onetree import hooks

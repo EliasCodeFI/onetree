@@ -1,28 +1,26 @@
 # AGENTS.md — how work lands in this repository
 
-This file is read by AI coding agents. It is normative for every session
-working in this clone.
+This file is read by AI coding agents. Every session working in this clone
+follows it.
 
-## Build phases
+## Working in a shared clone
 
-Gate3 dogfood is active in the designated primary shared clone. All development
-landings to its shared branch go through OneTree with the configured referee
-and admitted payload gate. Stage through your session's private index and claim
-every payload path: the broker refuses a payload that contains a path your
-session has not claimed. Bare Git commits to shared refs, branch switches and
-resets in that shared clone are out of contract. A refusal is evidence to
-inspect and resolve; do not reset or reconcile the protected baseline merely to
-make it disappear.
+When several agents share one clone of this repository, every landing goes
+through onetree, with the referee and payload gate the clone has set up. Claim
+every file before you edit it and stage in your session's own index: onetree
+refuses a landing that contains a file your session has not claimed. Do not
+commit to the shared branch directly, switch branches or reset in that clone. A
+refusal is something to read and fix, not something to reset away.
 
-## Non-negotiables
+## Rules
 
 1. Zero runtime dependencies. Dev tooling lives in the `dev` extra only.
 2. Every CLI subcommand supports `--json`: exactly one JSON object on stdout,
    nothing else on stdout.
-3. Every guarantee ships with a known-bad fixture that was observed FAILING
-   before the guard existed (red-first). A test that has never failed is not
-   evidence.
-4. Enforcement lives in the git layer, never only in harness hooks.
+3. Test first: every guarantee comes with a test that was seen failing before
+   the code that makes it pass existed. A test that has never failed proves
+   nothing.
+4. Enforcement lives in git, never only in a hook of some agent tool.
 
 ## Repository layout
 
@@ -45,8 +43,8 @@ These instructions apply only to native Codex pull-request reviews. They do not 
 
 ## Repository-specific checks
 
-- Scope: `src/onetree/core.py`, `src/onetree/git.py`, `src/onetree/wal.py`. Flag a reachable landing that includes unclaimed/foreign payload, overwrites a peer's unrelated tree/index, admits an expired/dead session or stale claim fence, or moves the shared ref without the existing write-ahead intent/CAS/landed evidence. Name the exact candidate, baseline and failed admission transition. Safe exceptions: Disposable tests intentionally use bare Git and unsafe controls; the designated shared-clone dogfood rule does not prohibit these fixtures or ordinary external GitHub operations. Bounded CAS retries after genuine contention are expected.
-- Scope: `src/onetree/core.py`, `src/onetree/git.py`, `src/onetree/wal.py`, `src/onetree/referee.py`, `src/onetree/_referee_supervisor.py`, `src/onetree/workspace.py`. Flag a change that converts malformed/semantically inconsistent WAL or payload/referee evidence, changed protected workspace configuration, red/timeout/error, or unresolved recovery divergence into an admitted landing or silent baseline reset. Safe exceptions: Operator reconciliation/adoption may be explicitly authorized and valid; historical supported event schemas are legitimate. Current referee behavior without a configured command is not automatically a defect outside the configured dogfood path. Claims do not isolate ports/databases/runtime resources, same-user commands are not sandboxed, and Windows is unsupported for the configured POSIX referee path.
+- Scope: `src/onetree/core.py`, `src/onetree/git.py`, `src/onetree/wal.py`. Flag a reachable landing that can include a file its session did not claim, overwrite another session's unrelated work or index, let an expired or dead session or a stale claim land, or move the shared branch without its write-ahead record and compare-and-swap. Name the commit, the base and the check that should have refused it. Not defects: tests that use plain git and unsafe settings on purpose in throwaway repositories, and a bounded number of retries after a real race.
+- Scope: `src/onetree/core.py`, `src/onetree/git.py`, `src/onetree/wal.py`, `src/onetree/referee.py`, `src/onetree/_referee_supervisor.py`, `src/onetree/workspace.py`. Flag a change that turns a broken or inconsistent event log, gate or referee result, a changed protected setting, a failing or timed-out test run, or an unresolved recovery problem into a landing or a silent reset of the shared branch. Not defects: an operator's explicit reconcile or adopt, older event formats onetree still reads, a repository with no referee command, and the known limits: claims do not isolate ports, databases or other runtime resources, commands run by the same user are not sandboxed, and the referee does not run on Windows.
 
 ## Relevant existing checks
 

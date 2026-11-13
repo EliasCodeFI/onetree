@@ -232,7 +232,7 @@ def test_a_refused_candidate_on_the_branch_is_reported_as_divergence(
 def test_permitted_hand_commits_on_the_target_are_not_divergence(
     git_repo: GitFixture,
 ) -> None:
-    """Ordinary Git is still allowed on these branches before the dogfood cutover.
+    """Ordinary Git commits are allowed on these branches.
 
     Divergence detection therefore keys on the landing trailer the broker writes,
     not on the mere presence of a commit the WAL never saw.

@@ -408,7 +408,7 @@ def test_one_changed_byte_refuses_and_readmission_restores_landing(
     git_repo: GitFixture,
     tmp_path: Path,
 ) -> None:
-    """Done item 2: admit, land; change one byte, refuse; re-admit, land again."""
+    """Admit, land; change one byte, refuse; re-admit, land again."""
 
     marker = tmp_path / "executed"
     gate = tmp_path / "operator_gate.py"

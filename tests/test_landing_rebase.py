@@ -157,7 +157,7 @@ def _land(
     return outcome
 
 
-# --- done item 3: an unrelated append no longer re-runs the referee ------------------------
+# --- an unrelated append does not re-run the referee ------------------------
 
 
 @pytest.mark.parametrize("action", ["claim_unrelated", "register_unrelated", "refusal_unrelated"])
@@ -186,7 +186,7 @@ def test_an_unrelated_append_under_protection_keeps_the_tested_candidate(
     )
 
 
-# --- done item 2: changes that must still re-test or refuse --------------------------------
+# --- changes that must still re-test or refuse --------------------------------
 
 
 _SHORT = 3.0  # the referee's "sleep" step outlasts it
@@ -304,7 +304,7 @@ def test_the_raw_protection_append_is_reachable_only_outside_the_broker(
     assert coordinator.inspect_wal().consistent
 
 
-# --- fix round 1: each re-offer condition decides its own case -----------------------------
+# --- each re-offer condition decides its own case -----------------------------
 
 
 def _before_first_offer(coordinator: Coordinator, stimulus: Callable[[Coordinator], None]) -> None:

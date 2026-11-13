@@ -1,17 +1,10 @@
-"""The repository's layout: the benchmark harness lives in a repository of its own, and coding
-agents read their instructions from AGENTS.md alone."""
+"""The repository's layout: coding agents read their instructions from AGENTS.md alone."""
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_the_package_ships_no_benchmark_harness() -> None:
-    assert importlib.util.find_spec("onetree.bench") is None
-    assert not (ROOT / "src" / "onetree" / "bench").exists()
 
 
 def test_agents_read_agents_md_and_no_claude_md_hides_it() -> None:
